@@ -60,12 +60,20 @@ tmux session: agentchain
 
 ## 4. 빠른 시작
 
+**이 템플릿은 프로젝트 종속적이지 않다.** `bootstrap.sh`/`watchdog.sh`를 실행한
+디렉토리가 곧 대상 프로젝트가 된다(세 tmux 창 모두 그 경로에서 시작). 고정하고
+싶으면 `config.env`의 `PROJECT_DIR`을 채우면 된다.
+
 ```bash
-cd agent-command-chain-template
-cp config.env.example config.env   # 필요시 값 수정
-./bootstrap.sh                     # tmux 세션 생성 + sonnet/agy/codex 기동 + RC on
-./watchdog.sh &                    # 워치독 백그라운드 실행 (선택)
-tmux attach -t agentchain          # 직접 들어가서 보고 싶을 때
+# 이 템플릿을 한 번 클론해두고, 작업하려는 프로젝트 디렉토리에서 그 스크립트를
+# 상대/절대 경로로 부르면 된다 — 프로젝트마다 템플릿을 다시 클론할 필요 없음.
+git clone https://github.com/loverspath/agent-command-chain-template.git ~/agent-command-chain-template
+cd ~/agent-command-chain-template && cp config.env.example config.env   # 필요시 값 수정
+
+cd /path/to/your/actual/project      # 지금부터 이 디렉토리가 대상이 된다
+~/agent-command-chain-template/bootstrap.sh    # tmux 세션 생성 + sonnet/agy/codex 기동 + RC on
+~/agent-command-chain-template/watchdog.sh &   # 워치독 백그라운드 실행 (선택)
+tmux attach -t agentchain                      # 직접 들어가서 보고 싶을 때
 ```
 
 ## 5. 알려진 한계 (초안 단계)
@@ -77,9 +85,9 @@ tmux attach -t agentchain          # 직접 들어가서 보고 싶을 때
   `/remote-control` 을 치면 상태 패널(URL, 연결 상태)을 볼 수 있다.
 - **agy → codex 자동 호출은 없다** (위 §2 마지막 항목). Sonnet이 사람 대신
   그 연결을 수동으로 메꾸는 구조다.
-- **agy가 Windows 전용 바이너리일 수 있다.** 2026-09 실측 기준 Antigravity
-  CLI는 Linux 빌드가 없어서, WSL에서 쓰려면 `config.env.example`에 적힌
-  대로 `cmd.exe /c "cd /d C:\...\ && agy.exe ..."` 우회가 필요했다. agy가
-  네이티브 Linux 빌드로 나오면 이 우회는 필요 없어진다.
+- **agy는 네이티브 Linux 빌드가 있다** (`~/.local/bin` 등에 설치되는 형태 —
+  2026-09 실측 확인). `~/.local/bin`이 PATH에 없어도 `bootstrap.sh`가 자체적
+  으로 추가해서 확인하니 신경 안 써도 된다. 정말 Windows 전용 빌드만 있는
+  환경이라면 `config.env.example`의 주석에 적힌 `cmd.exe` 우회를 대신 써라.
 - 인증/쿼터 관리, 헬스 상태머신, 스티키 라우팅은 없음. 필요해지면
   `eraweb-fork/docs/workflows/multi_model_router.md`의 §5를 참고해 확장.
