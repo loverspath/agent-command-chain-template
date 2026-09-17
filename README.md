@@ -30,7 +30,7 @@ Sol에게 직접 보고 안 함" 규칙을 계층 자체로 끌어올린 것).
 tmux session: agentchain
  ├─ window 0 "sonnet": claude 실행, RC on
  ├─ window 1 "agy":    agy CLI 실행 (대화형, 지속)
- └─ window 2 "codex":  codex exec --model gpt-5.6-terra (one-shot, 작업당 종료)
+ └─ window 2 "codex":  codex --model gpt-5.6-terra (대화형, 지속 — `codex exec`는 one-shot이라 안 씀)
 ```
 
 - **push 없음.** tmux는 근본적으로 pull이다. 실시간성이 필요하면
@@ -77,8 +77,9 @@ tmux attach -t agentchain          # 직접 들어가서 보고 싶을 때
   `/remote-control` 을 치면 상태 패널(URL, 연결 상태)을 볼 수 있다.
 - **agy → codex 자동 호출은 없다** (위 §2 마지막 항목). Sonnet이 사람 대신
   그 연결을 수동으로 메꾸는 구조다.
-- `codex exec`는 one-shot이라 놀고 있을 때 watchdog이 계속 재시작을 시도할
-  수 있다 — 낭비는 되지만 위험하진 않다. 신경쓰이면 `CODEX_CMD`를 빈 값으로
-  두고 필요할 때만 수동으로 `tmux send-keys`.
+- **agy가 Windows 전용 바이너리일 수 있다.** 2026-09 실측 기준 Antigravity
+  CLI는 Linux 빌드가 없어서, WSL에서 쓰려면 `config.env.example`에 적힌
+  대로 `cmd.exe /c "cd /d C:\...\ && agy.exe ..."` 우회가 필요했다. agy가
+  네이티브 Linux 빌드로 나오면 이 우회는 필요 없어진다.
 - 인증/쿼터 관리, 헬스 상태머신, 스티키 라우팅은 없음. 필요해지면
   `eraweb-fork/docs/workflows/multi_model_router.md`의 §5를 참고해 확장.

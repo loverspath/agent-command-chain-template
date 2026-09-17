@@ -37,8 +37,6 @@ echo "[$AGY_WINDOW] agy 기동: $AGY_CMD"
 tmux send-keys -t "${SESSION_NAME}:${AGY_WINDOW}" "$AGY_CMD" C-m
 
 echo "[$CODEX_WINDOW] Codex Terra 기동: $CODEX_CMD"
-echo "  (codex exec 는 one-shot이라 프롬프트 없이 켜두면 바로 대기/종료될 수 있다."
-echo "   실제 작업 지시는 이 창에 send-keys 로 프롬프트를 넣어서 다시 실행해라.)"
 tmux send-keys -t "${SESSION_NAME}:${CODEX_WINDOW}" "$CODEX_CMD" C-m
 
 echo ""
