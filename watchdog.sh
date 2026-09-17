@@ -48,6 +48,7 @@ while true; do
   else
     restart_if_dead "$SONNET_WINDOW" "$SONNET_CMD"
     restart_if_dead "$AGY_WINDOW" "$AGY_CMD"
+    restart_if_dead "$CODEX_WINDOW" "$CODEX_CMD"
   fi
   sleep "$WATCHDOG_INTERVAL"
 done

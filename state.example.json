@@ -5,6 +5,7 @@
     "tmux_session": "agentchain",
     "sonnet_window": "sonnet",
     "agy_window": "agy",
+    "codex_window": "codex",
     "rc_enabled": null
   },
   "task": {
@@ -15,7 +16,7 @@
   },
   "routing": {
     "tier2_worker": "codex-terra",
-    "tier3_consult": ["sol", "opus"],
-    "note": "agy가 자체적으로 tier2/3 호출 여부를 판단한다. 이 필드는 참고용 힌트일 뿐 강제 라우팅 규칙이 아니다."
+    "tier3_consult": ["codex-sol", "claude-opus"],
+    "note": "agy는 codex를 자동 호출하지 않는다(MVP 한계). Sonnet이 agy 출력을 보고 codex 창에 수동으로 send-keys 하는 구조 — 이 필드는 참고용 힌트일 뿐 강제 라우팅 규칙이 아니다."
   }
 }

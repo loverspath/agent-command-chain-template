@@ -12,24 +12,25 @@
 | **0. 사용자** | 사람 | 최종 의사결정, 승인 | RC로 Sonnet 세션에 원격 개입 |
 | **1. 감독/디스패치** | Claude Sonnet | 모니터링·감사, 사용자 명령 하달, 루프 관리, RC(원격제어) | 항상 사람과 가장 가까운 지점 |
 | **2. 라우터 겸 워커** | agy (Gemini 3.8 Flash) | 난이도 판단(hard routing) 및 서브에이전트 호출 | Tier 2/3 호출 여부를 agy 스스로 결정 |
-| **2-내부 Tier 2** | Codex Terra | agy가 호출하는 중난이도 작업의 설계 및 직접 수행 | agy 라우팅 안에서 동작, Sonnet과 직접 통신 안 함 |
-| **2-내부 Tier 3** | Sol / Opus | agy 라우팅상 최고난도 문제, 전체 플래닝 상담 | 자문 역할, 구현은 도로 Tier1/2로 위임 |
+| **2-내부 Tier 2** | Codex Terra | 중난이도 작업의 설계 및 직접 수행 | 별도 tmux 창(§2). agy가 자동 호출하진 않음 — 아래 "한계" 참고 |
+| **2-내부 Tier 3** | Sol / Opus | 최고난도 문제, 전체 플래닝 상담 | 상시 창 없음. 필요할 때 codex 창의 커맨드를 `--model gpt-5.6-sol`로 바꿔 send-keys, 또는 claude 쪽은 `--model opus`로 즉석 실행 |
 
-핵심 단순화: **Sonnet은 agy만 상대한다.** Terra/Sol/Opus는 agy 내부 라우팅
-대상이며 Sonnet이 직접 브리지를 걸 필요가 없다 (eraweb-fork 원본의 "Terra는
-agy 보고를 정규화해 Sol에게만 전달, agy는 Sol에게 직접 보고 안 함" 규칙을
-계층 자체로 끌어올린 것).
+핵심 단순화: **Sonnet은 agy와 codex(Terra) 두 창만 직접 본다.** Sol/Opus는
+상시 프로세스가 아니라 필요할 때만 커맨드를 바꿔 일회성으로 부르는 대상
+(eraweb-fork 원본의 "Terra는 agy 보고를 정규화해 Sol에게만 전달, agy는
+Sol에게 직접 보고 안 함" 규칙을 계층 자체로 끌어올린 것).
 
 ## 2. 브리지 설계 — tmux만 사용
 
-두 프로세스(Sonnet CLI, agy CLI)를 **같은 WSL Ubuntu tmux 세션의 서로 다른
-윈도우**에 띄우고, 외부 컨트롤러(사람 또는 Sonnet 자신의 Bash 툴)가
+세 프로세스(Sonnet CLI, agy CLI, Codex CLI)를 **같은 WSL Ubuntu tmux 세션의
+서로 다른 윈도우**에 띄우고, 외부 컨트롤러(사람 또는 Sonnet 자신의 Bash 툴)가
 `tmux send-keys` / `capture-pane` / `pipe-pane`으로 조작한다.
 
 ```
 tmux session: agentchain
  ├─ window 0 "sonnet": claude 실행, RC on
- └─ window 1 "agy":    agy CLI 실행
+ ├─ window 1 "agy":    agy CLI 실행 (대화형, 지속)
+ └─ window 2 "codex":  codex exec --model gpt-5.6-terra (one-shot, 작업당 종료)
 ```
 
 - **push 없음.** tmux는 근본적으로 pull이다. 실시간성이 필요하면
@@ -39,23 +40,30 @@ tmux session: agentchain
 - **폴백은 엄격하지 않다.** 세션/프로세스가 죽으면 watchdog이 그냥
   재시작한다. eraweb-fork의 리스/하트비트/스티키라우팅/핑퐁방지 같은 상태
   머신은 이 MVP에 없다 — 필요해지면 나중에 추가.
+- **agy ↔ codex 연결은 이 템플릿 밖의 일이다.** eraweb-fork에서 agy가
+  Terra/Sol을 실제로 호출하는 로직은 `tools/router/src/adapters/*.ts`(Node
+  프로세스 spawn)에 있었고, 이 MVP는 그 라우터 자체를 빼기로 했다. 그래서
+  codex 창은 agy와 자동 연동되지 않는다 — Sonnet(또는 사람)이 agy 창의
+  출력을 보고 필요하다고 판단하면 codex 창에 직접 send-keys 로 작업을
+  넘기는 구조다. 진짜 "agy가 알아서 codex를 부르는" 자동화가 필요해지면
+  eraweb-fork의 라우터 어댑터를 참고해서 별도로 구현해야 한다.
 
 ## 3. 파일 구성
 
 | 파일 | 역할 |
 |---|---|
-| `bootstrap.sh` | 원클릭: tmux 세션 생성 → sonnet/agy 윈도우 기동 → RC on |
+| `bootstrap.sh` | 원클릭: tmux 세션 생성 → sonnet/agy/codex 윈도우 기동 → RC on |
 | `watchdog.sh` | 세션/프로세스 생존 감시, 죽으면 재시작 (백그라운드 루프) |
-| `config.env` | 세션 이름, 모델, agy 실행 커맨드 등 설정값 |
+| `config.env` | 세션 이름, 모델, agy/codex 실행 커맨드 등 설정값 |
 | `state.example.json` | 최소 상태 스키마 (lite 모드 참고, strict 아님) |
-| `ROLES.md` | 역할별 프롬프트 템플릿 (agy에게 줄 최초 지시문 등) |
+| `ROLES.md` | 역할별 프롬프트 템플릿 (agy/codex에게 줄 최초 지시문 등) |
 
 ## 4. 빠른 시작
 
 ```bash
 cd agent-command-chain-template
 cp config.env.example config.env   # 필요시 값 수정
-./bootstrap.sh                     # tmux 세션 생성 + sonnet/agy 기동 + RC on
+./bootstrap.sh                     # tmux 세션 생성 + sonnet/agy/codex 기동 + RC on
 ./watchdog.sh &                    # 워치독 백그라운드 실행 (선택)
 tmux attach -t agentchain          # 직접 들어가서 보고 싶을 때
 ```
@@ -67,7 +75,10 @@ tmux attach -t agentchain          # 직접 들어가서 보고 싶을 때
   API 키 인증만으로는 안 됨. Team/Enterprise는 조직 Owner가
   claude.ai/admin-settings/claude-code에서 RC를 켜둬야 한다. 세션 안에서
   `/remote-control` 을 치면 상태 패널(URL, 연결 상태)을 볼 수 있다.
-- agy가 Terra/Sol/Opus를 실제로 어떻게 호출하는지는 agy 자체 구현에 위임 —
-  이 템플릿은 그 내부를 건드리지 않는다.
+- **agy → codex 자동 호출은 없다** (위 §2 마지막 항목). Sonnet이 사람 대신
+  그 연결을 수동으로 메꾸는 구조다.
+- `codex exec`는 one-shot이라 놀고 있을 때 watchdog이 계속 재시작을 시도할
+  수 있다 — 낭비는 되지만 위험하진 않다. 신경쓰이면 `CODEX_CMD`를 빈 값으로
+  두고 필요할 때만 수동으로 `tmux send-keys`.
 - 인증/쿼터 관리, 헬스 상태머신, 스티키 라우팅은 없음. 필요해지면
   `eraweb-fork/docs/workflows/multi_model_router.md`의 §5를 참고해 확장.
