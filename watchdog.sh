@@ -15,6 +15,10 @@ PROJECT_DIR="$(cd "$PROJECT_DIR" && pwd)"
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/watchdog.log"
 
+# bootstrap.sh 와 동일한 이유로 Sonnet 재기동 시에도 transcript persistence 를
+# 강제한다 (§bootstrap.sh 주석 참고).
+SONNET_LAUNCH="export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; $SONNET_CMD"
+
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
 }
@@ -49,7 +53,7 @@ while true; do
     log "세션 '$SESSION_NAME' 자체가 없음 — bootstrap.sh 재실행 (cwd: $PROJECT_DIR)"
     PROJECT_DIR="$PROJECT_DIR" ./bootstrap.sh >> "$LOG_FILE" 2>&1
   else
-    restart_if_dead "$SONNET_WINDOW" "$SONNET_CMD"
+    restart_if_dead "$SONNET_WINDOW" "$SONNET_LAUNCH"
     restart_if_dead "$AGY_WINDOW" "$AGY_CMD"
     restart_if_dead "$CODEX_WINDOW" "$CODEX_CMD"
   fi
