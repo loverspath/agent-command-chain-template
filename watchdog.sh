@@ -4,13 +4,20 @@
 # eraweb-fork의 무거운 헬스 상태머신 대신 "죽으면 다시 켠다" 수준).
 set -uo pipefail
 
+INVOKED_DIR="$PWD"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
 # shellcheck disable=SC1091
 source config.env
+PROJECT_DIR="${PROJECT_DIR:-$INVOKED_DIR}"
+PROJECT_DIR="$(cd "$PROJECT_DIR" && pwd)"
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/watchdog.log"
+
+# bootstrap.sh 와 동일한 이유로 Sonnet 재기동 시에도 transcript persistence 를
+# 강제한다 (§bootstrap.sh 주석 참고).
+SONNET_LAUNCH="export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; $SONNET_CMD"
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
@@ -25,8 +32,8 @@ restart_if_dead() {
 
   case "$cur" in
     MISSING)
-      log "윈도우 ${window} 없음 — 새로 생성"
-      tmux new-window -t "$SESSION_NAME" -n "$window"
+      log "윈도우 ${window} 없음 — 새로 생성 (cwd: $PROJECT_DIR)"
+      tmux new-window -t "$SESSION_NAME" -n "$window" -c "$PROJECT_DIR"
       tmux send-keys -t "${SESSION_NAME}:${window}" "$launch_cmd" C-m
       ;;
     bash|zsh|sh|-bash|-zsh|-sh)
@@ -43,10 +50,10 @@ log "워치독 시작 (세션=$SESSION_NAME, 주기=${WATCHDOG_INTERVAL}s)"
 
 while true; do
   if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
-    log "세션 '$SESSION_NAME' 자체가 없음 — bootstrap.sh 재실행"
-    ./bootstrap.sh >> "$LOG_FILE" 2>&1
+    log "세션 '$SESSION_NAME' 자체가 없음 — bootstrap.sh 재실행 (cwd: $PROJECT_DIR)"
+    PROJECT_DIR="$PROJECT_DIR" ./bootstrap.sh >> "$LOG_FILE" 2>&1
   else
-    restart_if_dead "$SONNET_WINDOW" "$SONNET_CMD"
+    restart_if_dead "$SONNET_WINDOW" "$SONNET_LAUNCH"
     restart_if_dead "$AGY_WINDOW" "$AGY_CMD"
     restart_if_dead "$CODEX_WINDOW" "$CODEX_CMD"
   fi
