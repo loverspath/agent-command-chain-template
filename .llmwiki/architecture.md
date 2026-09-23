@@ -1,13 +1,18 @@
 ---
 title: Architecture & Bridge Design
-tags: [architecture, tmux-bridge, 4-tier-command, bootstrap, watchdog]
-related: ["[[INDEX]]", "[[usage]]", "[[known-issues]]"]
-summary: tmux 창 3개 기반 4계층 명령계통(사람/Sonnet/agy/Codex) 설계, pull 기반 관찰/개입 구조, bootstrap 및 watchdog 동작 방식.
+tags: [architecture, tmux-bridge, 4-tier-command, full-push-v2, event-bridge, durable-outbox, watchdog-v2]
+related: ["[[INDEX]]", "[[usage]]", "[[known-issues]]", "[[2026-09-24-sol-v2-push-bridge-11-rounds-review-log]]"]
+summary: tmux 창 3개 기반 4계층 명령계통(사람/Sonnet/agy/Codex) 및 Full-Push 이벤트 통지 브리지 v2(FIFO+asyncRewake, Durable Outbox, 4대 안전망 워치독) 아키텍처 상세.
 ---
 
 # Architecture & Bridge Design
 
-`agent-command-chain-template`는 SQLite 상태머신, 헬스체크 데몬, 프로세스 간 RPC 브로커 같은 복잡한 외부 하네스 없이 **단일 tmux 세션의 3개 윈도우와 표준 터미널 I/O(send-keys, capture-pane, pipe-pane)**만으로 다중 에이전트 명령계통을 형성한다.
+`agent-command-chain-template`는 SQLite 상태머신, 무거운 외부 메시지 브로커 없이 **단일 tmux 세션의 3개 윈도우와 파일 기반 이벤트 통지 브리지(Full-Push v2)**를 통해 고신뢰성의 멀티 에이전트 명령계통을 형성한다.
+
+> [!IMPORTANT]
+> **실행 아키텍처 경로 안내 (v2 기본 권장 / v1 폴백)**
+> - **v2 (기본 권장 경로)**: **Full-Push 이벤트 통지 브리지** (`bootstrap-v2.sh`, `watchdog-v2.sh`, `bin/*`, `adapters/*`). POSIX FIFO + Claude Code `asyncRewake` 훅을 이용한 제로 딜레이 푸시 통지, Durable Outbox 원자적 트랜잭션, 커널 자동 해제형 flock, 그리고 4대 비정상 상태를 전담 복구하는 `watchdog-v2.sh`를 제공합니다.
+> - **v1 (폴백/레거시 경로)**: **순수 tmux pull 브리지** (`bootstrap.sh`, `watchdog.sh`). tmux 화면 캡처(`capture-pane`)와 단순 폴링 방식으로 동작하며, v2 환경 구성이 어렵거나 최소 환경에서의 검증용 폴백으로 완전 보존됩니다. (v1 파일은 절대 삭제되지 않음)
 
 ---
 
@@ -19,30 +24,127 @@ summary: tmux 창 3개 기반 4계층 명령계통(사람/Sonnet/agy/Codex) 설�
        ▼
 [계층 1: 감독/디스패치 (Claude Sonnet)] ────────────── (고난도 플래닝 필요시 일회성 Opus 상담)
        │
-       ├─────────────────────────────────┐ (Sonnet 수동 디스패치 / send-keys)
+       ├─────────────────────────────────┐ (Sonnet 작업 디스패치 / dispatch.sh)
        ▼                                 ▼
 [계층 2: 라우터 겸 워커 (agy)]      [계층 2-내부 Tier 2: 작업 설계·수행 (Codex Terra)]
 (Gemini 3.8 Flash, 일상 작업)       (gpt-5.6-terra, 중난도 설계 및 구현)
        │                                 │
-       └─ (결과 보고 / 한계 명시) ─────────┴─ (필요시 gpt-5.6-sol 커맨드 전환 일회성 상담)
+       └─ (결과 보고 / 이벤트 발행) ──────┴─ (필요시 gpt-5.6-sol 커맨드 전환 일회성 상담)
 ```
 
 | 계층 | 주체 | 실행 환경 / 윈도우 | 주요 역할 | 특징 |
 |---|---|---|---|---|
 | **0. 사용자** | 사람 | 외부 클라이언트 / RC 웹 UI | 최종 의사결정 및 승인 | `claude --remote-control`을 통해 브라우저에서 개입 |
-| **1. 감독/디스패치** | Claude Sonnet | tmux window `sonnet` | 모니터링, 작업 분배, 감사, 사용자 명령 하달 | 항상 사람과 맞닿아 있으며 agy와 codex 창을 모니터링 및 제어 |
-| **2. 라우터 겸 워커** | agy (Gemini 3.8 Flash) | tmux window `agy` | 일상적 프로젝트 구현 및 난이도 판단 | 상시 대화형 지속. 처리 불가 시 "Terra급 작업 필요" 명시 보고 |
-| **2-내부 Tier 2** | Codex Terra | tmux window `codex` | 중난도 작업 설계 및 직접 수행 | 대화형 TUI 모드로 상시 기동 (`codex --model gpt-5.6-terra`) |
+| **1. 감독/디스패치** | Claude Sonnet | tmux window `sonnet` | 모니터링, 작업 분배, 감사, 사용자 명령 하달 | 사람과의 상시 소통 창구. 실질 작업은 스스로 하지 않고 agy/codex에 위임 |
+| **2. 라우터 겸 워커 총괄** | agy (Gemini 3.8 Flash) | tmux window `agy` | 난이도 판단 및 워커 서브에이전트 위임·총괄 | 직접 작업(Read/Bash/Edit) 금지 및 서브에이전트 위임. 상위 인터럽트 수신 대기(responsive state) 유지 |
+| **2-내부 Tier 2** | Codex Terra | tmux window `codex` | 중난도 작업 설계 및 직접 수행 | 단발 어댑터(`adapters/codex-oneshot.sh`) 또는 대화형 TUI 기동 |
 | **2-내부 Tier 3** | Sol / Opus | 상시 창 없음 (필요 시 호출) | 최고난도 문제 및 전체 플래닝 상담 | codex 창의 커맨드를 `gpt-5.6-sol`로 전환하거나, Sonnet 창에서 `--model opus` 일회성 실행 |
-
-> **핵심 설계 결정: 상시 창은 3개만 유지**
-> Sonnet은 오직 `agy`와 `codex`(Terra) 두 창만 직접 관찰한다. Tier 3(Sol/Opus)를 상시 프로세스로 띄우지 않아 리소스 낭비를 줄이고 명령 계통의 혼선을 방지한다.
 
 ---
 
-## 2. 브리지 설계 (tmux Bridge)
+## 2. Full-Push v2 브리지 아키텍처 (기본 권장)
 
-모든 CLI 프로세스는 단일 WSL Ubuntu tmux 세션(`$SESSION_NAME`, 기본값 `agentchain`) 내부에서 실행된다.
+### 2.1 이벤트 통지 및 비동기 기상 흐름
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Sonnet as 계층 1: Claude Sonnet
+    participant Wait as bin/sonnet-event-wait.sh
+    participant FIFO as runtime/event.fifo
+    participant Outbox as runtime/events/{pending,inflight,archive}
+    participant Emit as bin/event-emit.sh
+    participant Task as bin/run-task.sh
+    participant Worker as 워커 (agy / codex)
+    participant Watchdog as watchdog-v2.sh
+
+    Sonnet->>Task: bin/dispatch.sh <worker> "<prompt>"
+    Task->>Worker: adapters/*-oneshot.sh 실행 (flock 획득)
+    Sonnet->>Wait: asyncRewake 대기 진입 (FIFO read)
+    Note over Wait,FIFO: 이벤트 도착 전까지 블로킹 대기
+
+    alt 워커 정상/비정상 종료
+        Worker-->>Task: 프로세스 종료 (exit code)
+        Task->>Emit: bin/event-emit.sh task.done / task.error
+    else 워커 PID 비정상 증발 (Reap)
+        Watchdog->>Emit: PID 소멸 감지 -> task.error 발행
+    end
+
+    Emit->>Outbox: .tmp 생성 후 원자적 mv (pending/event.json)
+    Emit->>FIFO: FIFO 펄스 주입 (timeout 0.2s)
+    FIFO-->>Wait: 펄스 감지 -> exit 2 반환
+    Wait-->>Sonnet: Claude Code 즉시 깨움 (asyncRewake)
+    Sonnet->>Outbox: 이벤트 내용 확인
+    Sonnet->>Outbox: bin/event-ack.sh로 inflight -> archive 이동
+```
+
+### 2.2 POSIX FIFO + Durable Outbox 설계
+
+v2는 메시지 유실 없는 신뢰성을 달성하기 위해 **파일 기반 Durable Outbox 패턴**과 **비동기 POSIX FIFO 펄스**를 결합했습니다.
+
+- **디렉토리 레이아웃 (`$ACC_RUNTIME`)**:
+  - `runtime/events/pending/`: 발행되었으나 아직 Sonnet이 확인하지 않은 이벤트
+  - `runtime/events/inflight/`: 워치독 또는 처리기가 확인 중인 이벤트
+  - `runtime/events/archive/`: 처리가 완료(`event-ack.sh`)되어 보관된 이벤트
+  - `runtime/tasks/<task_id>/`: 작업 명세(`spec.json`), 상태(`state.json`), 실행 로그(`output.log`)
+  - `runtime/workers/`: 워커별 상태 및 터미널 락
+  - `runtime/event.fifo`: Claude Code `asyncRewake` 전용 비동기 시그널 FIFO
+- **원자적 커밋 (Atomic Commit)**: 모든 상태 변경과 이벤트 스풀링은 `.tmp` 임시 파일을 먼저 작성한 후 원자적 `mv`를 통해 수행되므로, 읽는 측에서 부분 기록(torn write)을 읽는 일이 원천 차단됩니다.
+- **데드락 방지 FIFO 펄스**: `bin/event-emit.sh`는 이벤트를 디스크에 안전하게 쓴 후 FIFO에 1바이트 펄스를 보낼 때 `timeout 0.2` 비동기 쓰기를 사용하여 리스너 부재로 인한 송신자 영구 블로킹을 방지합니다.
+
+### 2.3 bin/ 핵심 스크립트 역할
+
+| 스크립트 | 역할 및 핵심 메커니즘 |
+|---|---|
+| **`bin/event-emit.sh`** | **원자적 이벤트 발행기**. Outbox의 `pending/` 디렉토리에 이벤트를 안전하게 원자적 스풀링하고, `event.fifo`에 논블로킹 펄스를 전송하여 대기 중인 리스너를 깨웁니다. `outbox.lock` flock을 통해 동시 발행 경쟁을 보호합니다. |
+| **`bin/sonnet-event-wait.sh`** | **Claude Code `asyncRewake` 전용 리스너**. `runtime/event.fifo`를 감시하다가 펄스가 들어오거나 미확인 pending 이벤트가 감지되면 exit code `2`를 반환하여 Claude Code를 즉각 기상시킵니다. |
+| **`bin/event-ack.sh`** | **이벤트 완료 처리기**. Sonnet이 확인한 이벤트를 `archive/` 디렉토리로 원자적으로 이동시키고 FIFO에 남은 잔여 펄스를 드레인하여 중복 기상을 방지합니다. |
+| **`bin/dispatch.sh`** | **작업 디스패처**. 고유 작업 ID를 발급하고 `runtime/tasks/<task_id>/spec.json` 명세를 생성한 뒤, 워커 tmux 창에 `bin/run-task.sh` 1줄 실행 명령을 주입합니다. |
+| **`bin/run-task.sh`** | **워커 프로세스 러너**. 터미널 소유권 락(`terminal.lock`)을 획득하고 작업 상태를 `running`으로 전이한 뒤, 지정된 어댑터를 실행합니다. 실행 완료 시 성공/실패 여부에 따라 `task.done` 또는 `task.error` 이벤트를 원자적으로 발행합니다. |
+| **`adapters/agy-oneshot.sh`** | **agy 단발 실행 어댑터**. Antigravity CLI를 비대화형 단발 모드로 구동하여 명세된 프롬프트를 수행합니다. |
+| **`adapters/codex-oneshot.sh`** | **Codex 단발 실행 어댑터**. `codex exec` 기반으로 단발성 설계/코딩 작업을 수행합니다. |
+
+### 2.4 커널 자동 해제형 Terminal Ownership Flock 및 Worker Lease
+
+분산 락이나 파일 기반 PID 플래그는 프로세스가 `SIGKILL`을 맞거나 OS 비정상 종료 시 Stale Lock으로 남아 시스템이 영구 고착되는 취약점이 있습니다. v2는 이를 해결하기 위해 **Linux 커널 레벨 `flock`**을 도입했습니다:
+
+1. **커널 레벨 자동 수거**:
+   - `bin/run-task.sh`는 작업 시작 시 `flock -n`으로 대상 터미널의 FD 락을 잡습니다.
+   - 프로세스가 정상 종료되든, `kill -9`로 즉사하든, 커널이 프로세스 테이블을 정리하면서 해당 열린 FD(File Descriptor)를 자동으로 닫고 락을 즉각 해제합니다.
+2. **단일 결정적 Terminal ID**:
+   - 경쟁 조건 및 식별자 불일치 방지를 위해 워커별 터미널 ID를 `${task_id}-terminal` 고정 규칙으로 일원화했습니다.
+3. **`flock --close` 자가 래퍼**:
+   - 셸 스크립트에서 fork된 자식 프로세스가 부모의 FD를 상속받아 락을 의도치 않게 계속 쥐고 있는 버그를 방지하기 위해, `exec flock -n -E 0 --close ...` 자가 래퍼 패턴을 적용하여 자식 프로세스 포크 시 락 FD가 상속되지 않도록 원천 차단했습니다.
+
+### 2.5 watchdog-v2.sh의 4대 안전망
+
+`watchdog-v2.sh`는 60초 주기로 백그라운드에서 동작하며, 분산 에이전트 시스템에서 발생 가능한 4대 비정상 상태를 전담 감시하고 복구합니다:
+
+```
+                  watchdog-v2.sh (4대 안전망)
+                               │
+   ┌───────────────────┬───────┴───────────┬───────────────────┐
+   ▼                   ▼                   ▼                   ▼
+[1. 세션/Sonnet 증발] [2. PID 증발 Reap] [3. Deadline/Stall] [4. 브리지 정체 해소]
+tmux 세션 부재 시    running인데 PID 소멸  DEFAULT_TASK_TIMEOUT ACK 타임아웃(10분)
+bootstrap-v2 재실행   원자적 fail+이벤트   초과 경고/알림 발행  초과 이벤트 pending 복구
+```
+
+1. **세션 / Sonnet 증발 감시**:
+   - tmux 세션 자체가 파괴되었거나 Sonnet 프로세스가 종료된 경우, `bootstrap-v2.sh`를 자동 호출하여 환경을 복구합니다.
+2. **PID 증발 비정상 작업 원자적 수거 (Reap)**:
+   - 작업 상태가 `running`인데 기록된 워커 PID가 프로세스 테이블에 존재하지 않는 경우(crash, OOM 등), 상태 변수(`state_committed`)를 안전하게 초기화하고 작업을 `error`로 전이시키며 `task.error` 이벤트를 발행합니다. 작업이 확실히 커밋된 경우에만 워커의 `busy` 상태를 해제하여 데이터 일관성을 보장합니다.
+3. **Deadline 및 Stall 초과 감시**:
+   - **Deadline**: 작업 실행 시간이 `DEFAULT_TASK_TIMEOUT`(기본 1800초/30분)을 초과하면 `task.deadline_exceeded` 이벤트를 발행하고 `deadline.notified` 플래그를 원자적으로 생성하여 중복 알림을 방지합니다.
+   - **Stall**: 워커 출력 로그(`output.log`)가 `NO_OUTPUT_WARN_SECONDS`(기본 900초/15분) 동안 1바이트도 갱신되지 않으면 무응답 스톨 경고를 기록합니다.
+4. **브리지 정체 해소 (ACK Timeout Recovery)**:
+   - `inflight` 상태로 전환된 이벤트가 `EVENT_ACK_TIMEOUT`(기본 600초/10분) 동안 Sonnet에 의해 ACK 처리되지 않으면, 상위 세션 일시 지연으로 판단하고 이벤트를 다시 `pending`으로 롤백 인계하여 영구 분실을 방지합니다.
+
+---
+
+## 3. tmux 브리지 (v1, 폴백/레거시)
+
+v1 아키텍처는 추가적인 FIFO나 Outbox 없이 순수 tmux 내부 기능만을 활용하는 최소형 브리지입니다.
 
 ```
 tmux session: agentchain
@@ -51,83 +153,19 @@ tmux session: agentchain
  └─ window 2 "codex":  codex --model gpt-5.6-terra -s danger-full-access
 ```
 
-### Pull 기반 관찰 및 제어 모델
-- **Push 없는 Pull 구조**: tmux는 근본적으로 pull 모델이다. Sonnet이나 감시 스크립트는 필요할 때 `tmux capture-pane -p`로 대상 창의 화면 텍스트를 스냅샷 형태로 가져온다.
-- **스트림 감지 대안**: 비동기 스트림 감지가 필요할 경우 `tmux pipe-pane -o -t <target> 'cat >> logs/<target>.pane.log'`를 통해 로그 파일로 흘려보내고, 파일 감시(tail) 방식을 취한다.
-- **명령 주입**: 상위 제어자가 하위 창에 작업을 지시할 때는 `tmux send-keys -t <target> "지시문" C-m`을 호출한다.
-- **agy ↔ Codex 간 비자동화**: agy는 Codex를 직접 서브프로세스로 실행하거나 제어하지 않는다. Sonnet(또는 사람)이 agy 출력에서 "Terra급 작업 필요" 신호를 감지하고 Codex 창에 지시문을 수동으로 넘긴다.
+- **Pull 기반 관찰**: 상위 제어자가 `tmux capture-pane -p`로 대상 창 화면을 주기적으로 스냅샷 조회하거나, `pipe-pane`으로 로그를 파일로 흘려보내 관찰합니다.
+- **수동 지시**: `tmux send-keys -t <target> "지시문" C-m`으로 명령을 주입합니다.
+- **v1 워치독 (`watchdog.sh`)**: 창이 셸(`bash`, `sh`)로 복귀하거나 창이 닫힌 경우 재기동 커맨드를 단순 재주입하는 무상태(stateless) 복구 방식으로 동작합니다.
 
 ---
 
-## 3. bootstrap.sh 동작 흐름
+## 4. 진입점 비교: bootstrap-v2.sh vs bootstrap.sh
 
-`bootstrap.sh`는 원클릭으로 세션 생성부터 초기 오리엔테이션까지 완료하는 진입점 스크립트다.
-
-```mermaid
-flowchart TD
-    Start["bootstrap.sh 실행"] --> PathResolve["작업 대상 디렉토리 결정<br>(INVOKED_DIR 또는 config.env의 PROJECT_DIR)"]
-    PathResolve --> DepCheck["의존성 검사<br>(tmux, claude, agy, codex)"]
-    DepCheck --> SessionCheck{"tmux 세션 존재 여부"}
-    SessionCheck -- 없음 --> CreateSession["세션 생성 및 윈도우 분할<br>(sonnet, agy, codex)"]
-    SessionCheck -- 있음 --> ReuseSession["기존 세션 재사용"]
-    CreateSession --> LaunchAgents["프로세스 기동 명령 주입 (send-keys)"]
-    ReuseSession --> LaunchAgents
-    LaunchAgents --> TrustCheck{"AUTO_CONFIRM_TRUST == true?"}
-    TrustCheck -- 예 --> ConfirmTrust["화면 텍스트 폴링 감시 후<br>신뢰 확인 키 자동 전송"]
-    TrustCheck -- 아니오 --> GenBrief["session_brief.md 동적 생성"]
-    ConfirmTrust --> GenBrief
-    GenBrief --> SendOrientation["Sonnet 'auto mode on' 감지 시<br>session_brief.md 브리핑 메시지 주입"]
-    SendOrientation --> Finish["부트스트랩 완료 안내 출력"]
-```
-
-### 상세 실행 단계
-1. **작업 경로 결정**:
-   - 스크립트가 실행된 디렉토리(`$INVOKED_DIR`)가 작업 대상 프로젝트(`$PROJECT_DIR`)가 된다.
-   - `config.env`에 `PROJECT_DIR`이 정의되어 있다면 해당 경로를 우선 채택한다.
-2. **환경 변수 및 의존성 준비**:
-   - 비대화형 실행 환경을 고려해 `export PATH="$HOME/.local/bin:$PATH"`를 주입하여 `agy` 바이너리를 탐색 가능하도록 보장한다.
-   - `tmux`, `claude` 설치 여부를 확인(미설치 시 exit 1)하고, `agy`, `codex`는 경고 메시지를 남긴다.
-3. **세션 및 윈도우 생성**:
-   - 지정된 `$SESSION_NAME` 세션이 없으면 `tmux new-session -d`로 생성하며, 3개 윈도우(`$SONNET_WINDOW`, `$AGY_WINDOW`, `$CODEX_WINDOW`)의 시작 경로를 모두 `$PROJECT_DIR`로 통일한다.
-4. **프로세스 기동 파라미터**:
-   - **Sonnet**: `export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; $SONNET_CMD --add-dir "$HERE"`
-     - 자식 세션 판정으로 인한 transcript 비활성화 방지 플래그 주입.
-     - 대상 프로젝트 디렉토리 외부에 위치한 템플릿 디렉토리(`$HERE`)의 브리핑 문서를 읽을 때 발생하는 인터랙티브 권한 확인 팝업을 억제하기 위해 `--add-dir` 적용.
-   - **agy**: 대화형 지속 모드로 기동 (`$AGY_CMD`, 기본 `agy --new-project --mode plan`).
-   - **Codex**: one-shot 명령인 `codex exec` 대신 순수 `codex` 대화형 TUI 모드로 기동 (`$CODEX_CMD`).
-5. **폴더 신뢰(Trust confirmation) 자동 응답 (`AUTO_CONFIRM_TRUST`)**:
-   - 새 디렉토리 첫 실행 시 대화형 프롬프트를 건너뛰기 위해 `wait_for_pane_text` 함수로 최대 15초간 화면 텍스트를 감시한다.
-   - `sonnet` 창: `"trust this folder"` 감지 시 `Down` + `Enter` ("Yes, I trust this folder").
-   - `codex` 창: `"trust the contents"` 감지 시 `Enter` ("Yes, continue").
-6. **동적 오리엔테이션 메시지 전달**:
-   - 실행 시점의 실제 세션명, 프로젝트 경로, 윈도우명이 기록된 `$HERE/$LOG_DIR/session_brief.md`를 생성한다.
-   - Sonnet 창이 정상 기동되어 `"auto mode on"` 상태가 감지되면, `session_brief.md`를 읽고 역할을 인지하도록 메시지를 `send-keys`로 전송한다.
-
----
-
-## 4. watchdog.sh 동작 흐름
-
-`watchdog.sh`는 프로세스 장애 발생 시 최소한의 생존을 보장하는 느슨한(Loose) 워치독이다.
-
-```mermaid
-flowchart TD
-    LoopStart["워치독 루프 (주기: WATCHDOG_INTERVAL초)"] --> HasSession{"tmux 세션 존재 여부"}
-    HasSession -- 세션 없음 --> RestartBootstrap["bootstrap.sh 전체 재실행"]
-    HasSession -- 세션 존재 --> CheckWindows["각 윈도우 상태 확인 (pane_current_command)"]
-    CheckWindows --> InspectCmd{"명령어 상태"}
-    InspectCmd -- MISSING --> NewWindow["tmux new-window 생성 후 기동 커맨드 전송"]
-    InspectCmd -- bash / zsh / sh --> Respawn["셸로 복귀 감지 -> 기동 커맨드 재전송"]
-    InspectCmd -- 에이전트 CLI 실행 중 --> Healthy["정상 상태 유지 (아무 작업 안 함)"]
-    RestartBootstrap --> Sleep["sleep WATCHDOG_INTERVAL"]
-    NewWindow --> Sleep
-    Respawn --> Sleep
-    Healthy --> Sleep
-    Sleep --> LoopStart
-```
-
-### 무상태 복구 메커니즘
-- `tmux display-message -p -t "${SESSION_NAME}:${window}" '#{pane_current_command}'`를 실행해 각 창의 활성 명령어를 검사한다.
-- 프로세스가 비정상 종료되어 셸(`bash`, `zsh`, `sh` 등)로 복귀한 경우 프로세스 사망으로 판단하고 기동 커맨드를 재전송한다.
-- 윈도우 자체가 닫힌 경우(`MISSING`) `$PROJECT_DIR` 경로에서 새 윈도우를 열고 커맨드를 실행한다.
-- 세션 전체가 파괴된 경우 `PROJECT_DIR="$PROJECT_DIR" ./bootstrap.sh`를 실행해 복구한다.
-- 복잡한 락 파일, 분산 하트비트 없이 셸 커맨드 상태 검사만으로 단순하고 견고하게 동작한다.
+| 비교 항목 | `bootstrap-v2.sh` (기본 권장 v2) | `bootstrap.sh` (폴백/레거시 v1) |
+|---|---|---|
+| **통지 방식** | Full-Push (FIFO + asyncRewake 즉시 깨우기) | Pull (tmux 화면 캡처 및 폴링) |
+| **작업 실행 방식** | `bin/dispatch.sh` 기반 단발(oneshot) 어댑터 격리 실행 | tmux 대화형 창에 직접 `send-keys` 입력 |
+| **상태 관리** | `runtime/` 내 작업별 spec/state/log 완전 격리 및 Outbox 관리 | tmux 창 텍스트 화면 상태에 의존 |
+| **워치독 연동** | `watchdog-v2.sh` 자동 백그라운드 기동 (`START_WATCHDOG=true`) | `watchdog.sh &` 수동 실행 권장 |
+| **장애 복구** | PID Reap, 커널 flock, Deadline 초과, ACK 복구 등 4대 안전망 | 윈도우 프로세스 죽음 시 커맨드 재전송 |
+| **사용 목적** | 프로덕션 다중 에이전트 자율 협업 | 최소 환경 테스트 및 비상 폴백 |

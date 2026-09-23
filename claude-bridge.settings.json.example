@@ -1,0 +1,30 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${ACC_TEMPLATE_ROOT:-.}/bin/sonnet-event-wait.sh\" session_start \"${ACC_RUNTIME:-}\"",
+            "asyncRewake": true,
+            "timeout": 86400
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${ACC_TEMPLATE_ROOT:-.}/bin/sonnet-event-wait.sh\" stop \"${ACC_RUNTIME:-}\"",
+            "asyncRewake": true,
+            "timeout": 86400
+          }
+        ]
+      }
+    ]
+  }
+}
