@@ -22,6 +22,13 @@ done
 
 INVOKED_DIR="$PWD"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+_ENV_PROJECT_DIR="${PROJECT_DIR:-}"
+_ENV_ACC_RUNTIME="${ACC_RUNTIME:-}"
+_ENV_SESSION_NAME="${SESSION_NAME:-}"
+_ENV_START_WATCHDOG="${START_WATCHDOG:-}"
+_ENV_AUTO_CONFIRM_TRUST="${AUTO_CONFIRM_TRUST:-}"
+
 cd "$HERE"
 
 if [[ -f config.env ]]; then
@@ -31,6 +38,12 @@ else
   echo "config.env 가 없다. config.env.example 을 복사해서 값을 채워라." >&2
   exit 1
 fi
+
+[[ -n "$_ENV_PROJECT_DIR" ]] && PROJECT_DIR="$_ENV_PROJECT_DIR"
+[[ -n "$_ENV_ACC_RUNTIME" ]] && ACC_RUNTIME="$_ENV_ACC_RUNTIME"
+[[ -n "$_ENV_SESSION_NAME" ]] && SESSION_NAME="$_ENV_SESSION_NAME"
+[[ -n "$_ENV_START_WATCHDOG" ]] && START_WATCHDOG="$_ENV_START_WATCHDOG"
+[[ -n "$_ENV_AUTO_CONFIRM_TRUST" ]] && AUTO_CONFIRM_TRUST="$_ENV_AUTO_CONFIRM_TRUST"
 
 # 지원 모드 검증 (v2는 push / oneshot 전용)
 WORKER_MODE="${WORKER_MODE:-oneshot}"
@@ -51,6 +64,8 @@ if [[ ! -d "$PROJECT_DIR" ]]; then
 fi
 PROJECT_DIR="$(cd "$PROJECT_DIR" && pwd)"
 
+LOG_DIR="${LOG_DIR:-./logs}"
+[[ "$LOG_DIR" = /* ]] || LOG_DIR="$HERE/$LOG_DIR"
 mkdir -p "$LOG_DIR"
 
 command -v tmux >/dev/null 2>&1 || { echo "tmux 가 설치되어 있지 않다."; exit 1; }
@@ -104,7 +119,7 @@ with open(out_path, "w", encoding="utf-8") as f:
 ' "$HERE" "$ACC_RUNTIME" "$BRIDGE_SETTINGS"
 
 # Sonnet용 세션 브리핑 사전 생성 (Sonnet 기동 전 준비)
-BRIEF_FILE="$HERE/$LOG_DIR/session_brief.md"
+BRIEF_FILE="$LOG_DIR/session_brief.md"
 mkdir -p "$(dirname "$BRIEF_FILE")"
 cat > "$BRIEF_FILE" <<EOF
 # 이 tmux 세션 실제 작동 방식 (Full-Push 이벤트 통지 브리지 v2, $(date '+%Y-%m-%d %H:%M:%S'))
@@ -147,6 +162,19 @@ SONNET_LAUNCH="export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 ACC_RUNTIME=\"$ACC
 has_window() {
   local win="$1"
   tmux list-windows -t "$SESSION_NAME" -F '#{window_name}' 2>/dev/null | grep -qx "$win"
+}
+
+wait_for_pane_text() {
+  local target="$1" pattern="$2" timeout_s="${3:-15}"
+  local waited=0
+  while (( waited < timeout_s * 2 )); do
+    if tmux capture-pane -t "$target" -p 2>/dev/null | grep -qF "$pattern"; then
+      return 0
+    fi
+    sleep 0.5
+    waited=$((waited + 1))
+  done
+  return 1
 }
 
 # 기존 세션 강제 재시작 요청 처리
@@ -221,10 +249,32 @@ else
   tmux send-keys -t "${SESSION_NAME}:${CODEX_WINDOW}" "export ACC_RUNTIME=\"$ACC_RUNTIME\" PROJECT_DIR=\"$PROJECT_DIR\" HERE=\"$HERE\"; cd \"$PROJECT_DIR\"" C-m
 fi
 
+# 새 디렉토리에서 처음 뜰 때 claude/codex 둘 다 "이 폴더를 신뢰하는가" 대화형
+# 확인을 띄운다 (--dangerously-skip-permissions 로도 이 대화형 확인은 못
+# 건너뛴다는 걸 실측으로 확인함 — 있는 건 -p 비대화형 모드에서만 자동 스킵되는
+# 것). 매번 손으로 누르기 귀찮으니 기본값(각 CLI의 "예, 신뢰함" 옵션)을
+# 자동으로 눌러준다. 프롬프트가 실제로 뜬 걸 화면에서 확인한 뒤에만 키를
+# 보낸다(고정 sleep으로는 느린 기동 시 타이밍이 어긋나 실수로 "No, exit"가
+# 눌릴 수 있음을 실측으로 확인함). 이미 신뢰된 디렉토리라 프롬프트 자체가 안
+# 뜨면 그냥 아무 것도 안 보낸다. 끄고 싶으면 config.env 에서
+# AUTO_CONFIRM_TRUST=false 로.
+AUTO_CONFIRM_TRUST="${AUTO_CONFIRM_TRUST:-true}"
+if [[ "$AUTO_CONFIRM_TRUST" == "true" ]]; then
+  if wait_for_pane_text "${SESSION_NAME}:${SONNET_WINDOW}" "trust this folder" 15; then
+    tmux send-keys -t "${SESSION_NAME}:${SONNET_WINDOW}" Down C-m   # "No, exit" -> "Yes, I trust this folder"
+  fi
+  codex_cur="$(tmux display-message -p -t "${SESSION_NAME}:${CODEX_WINDOW}" '#{pane_current_command}' 2>/dev/null || echo "")"
+  if [[ "$codex_cur" == "codex" ]] && wait_for_pane_text "${SESSION_NAME}:${CODEX_WINDOW}" "trust the contents" 15; then
+    tmux send-keys -t "${SESSION_NAME}:${CODEX_WINDOW}" C-m          # 기본 선택지가 이미 "Yes, continue"
+  fi
+fi
+
 # 워치독 자동 시작 옵션 처리
-if [[ "${START_WATCHDOG:-false}" == "true" ]]; then
+START_WATCHDOG="${START_WATCHDOG:-true}"
+if [[ "$START_WATCHDOG" == "true" ]]; then
   echo "워치독 v2 백그라운드 기동..."
-  nohup "$HERE/watchdog-v2.sh" >> "$HERE/$LOG_DIR/watchdog.log" 2>&1 &
+  export PROJECT_DIR ACC_RUNTIME SESSION_NAME
+  nohup env PROJECT_DIR="$PROJECT_DIR" ACC_RUNTIME="$ACC_RUNTIME" SESSION_NAME="$SESSION_NAME" "$HERE/watchdog-v2.sh" >/dev/null 2>&1 &
 fi
 
 # 전체 세션 검증 및 기동 성공 후에만 bootstrap 버전 마커 기록

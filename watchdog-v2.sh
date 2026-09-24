@@ -5,18 +5,34 @@ umask 077
 
 INVOKED_DIR="$PWD"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+_ENV_PROJECT_DIR="${PROJECT_DIR:-}"
+_ENV_ACC_RUNTIME="${ACC_RUNTIME:-}"
+_ENV_SESSION_NAME="${SESSION_NAME:-}"
+_ENV_WATCHDOG_AUTO_KILL="${WATCHDOG_AUTO_KILL:-}"
+
 cd "$HERE"
 
-_ENV_WATCHDOG_AUTO_KILL="${WATCHDOG_AUTO_KILL:-}"
 if [[ -f config.env ]]; then
   # shellcheck disable=SC1091
   source config.env
 fi
+
+[[ -n "$_ENV_PROJECT_DIR" ]] && PROJECT_DIR="$_ENV_PROJECT_DIR"
+[[ -n "$_ENV_ACC_RUNTIME" ]] && ACC_RUNTIME="$_ENV_ACC_RUNTIME"
+[[ -n "$_ENV_SESSION_NAME" ]] && SESSION_NAME="$_ENV_SESSION_NAME"
 [[ -n "$_ENV_WATCHDOG_AUTO_KILL" ]] && WATCHDOG_AUTO_KILL="$_ENV_WATCHDOG_AUTO_KILL"
 WATCHDOG_AUTO_KILL="${WATCHDOG_AUTO_KILL:-false}"
 
 PROJECT_DIR="${PROJECT_DIR:-$INVOKED_DIR}"
+if [[ ! -d "$PROJECT_DIR" ]]; then
+  echo "PROJECT_DIR '$PROJECT_DIR' 가 존재하지 않는다." >&2
+  exit 1
+fi
 PROJECT_DIR="$(cd "$PROJECT_DIR" && pwd)"
+
+LOG_DIR="${LOG_DIR:-./logs}"
+[[ "$LOG_DIR" = /* ]] || LOG_DIR="$HERE/$LOG_DIR"
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/watchdog.log"
 
@@ -28,6 +44,7 @@ ACC_RUNTIME="${ACC_RUNTIME:-$default_runtime}"
 mkdir -p "$ACC_RUNTIME/events"/{pending,inflight,archive} "$ACC_RUNTIME/tasks" "$ACC_RUNTIME/workers"
 
 # 워치독 단일 인스턴스 락 (자식 프로세스 상속 방지를 위해 flock --close 래퍼 및 내부 전용 인자 사용)
+export PROJECT_DIR ACC_RUNTIME SESSION_NAME
 if [[ "${1:-}" != "--lock-held" ]]; then
   target_self="$HERE/${BASH_SOURCE[0]##*/}"
   [[ -f "$target_self" ]] || target_self="$0"
@@ -57,7 +74,7 @@ log "워치독 v2 시작 (세션=$SESSION_NAME, 주기=${WATCHDOG_INTERVAL}s, �
 check_session_and_sonnet() {
   if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
     log "세션 '$SESSION_NAME' 부재 — bootstrap-v2.sh 재실행"
-    PROJECT_DIR="$PROJECT_DIR" ./bootstrap-v2.sh >> "$LOG_FILE" 2>&1 || true
+    PROJECT_DIR="$PROJECT_DIR" SESSION_NAME="$SESSION_NAME" ACC_RUNTIME="$ACC_RUNTIME" "$HERE/bootstrap-v2.sh" >> "$LOG_FILE" 2>&1 || true
     return
   fi
 
@@ -68,14 +85,14 @@ check_session_and_sonnet() {
       log "Sonnet 윈도우 부재 — 재생성"
       tmux new-window -t "$SESSION_NAME" -n "$SONNET_WINDOW" -c "$PROJECT_DIR"
       local bridge_settings="$ACC_RUNTIME/claude-bridge.settings.json"
-      local brief_file="$HERE/$LOG_DIR/session_brief.md"
+      local brief_file="$LOG_DIR/session_brief.md"
       local sonnet_launch="export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 ACC_RUNTIME=\"$ACC_RUNTIME\"; $SONNET_CMD --settings \"$bridge_settings\" --add-dir \"$HERE\" --append-system-prompt \"\$(cat '$brief_file' 2>/dev/null || echo '')\""
       tmux send-keys -t "${SESSION_NAME}:${SONNET_WINDOW}" "$sonnet_launch" C-m
       ;;
     bash|zsh|sh|-bash|-zsh|-sh)
       log "Sonnet 프로세스 종료 감지(현재: $cur) — 재기동"
       local bridge_settings="$ACC_RUNTIME/claude-bridge.settings.json"
-      local brief_file="$HERE/$LOG_DIR/session_brief.md"
+      local brief_file="$LOG_DIR/session_brief.md"
       local sonnet_launch="export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 ACC_RUNTIME=\"$ACC_RUNTIME\"; $SONNET_CMD --settings \"$bridge_settings\" --add-dir \"$HERE\" --append-system-prompt \"\$(cat '$brief_file' 2>/dev/null || echo '')\""
       tmux send-keys -t "${SESSION_NAME}:${SONNET_WINDOW}" "$sonnet_launch" C-m
       ;;

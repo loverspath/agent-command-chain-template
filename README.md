@@ -88,7 +88,7 @@ cd ~/agent-command-chain-template && cp config.env.example config.env   # 필요
 cd /path/to/your/actual/project      # 지금부터 이 디렉토리가 대상이 된다
 
 # [기본 권장 경로: v2 Full-Push 이벤트 통지 브리지]
-~/agent-command-chain-template/bootstrap-v2.sh    # 세션 기동 + 런타임/FIFO 준비 + watchdog-v2 자동 기동
+~/agent-command-chain-template/bootstrap-v2.sh    # 세션 기동 + 런타임/FIFO 준비 + watchdog-v2 자동 기동 (START_WATCHDOG=true 기본값)
 
 # [폴백/레거시 경로: v1 순수 pull 브리지]
 # ~/agent-command-chain-template/bootstrap.sh
