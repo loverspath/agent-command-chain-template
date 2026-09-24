@@ -20,12 +20,19 @@ ENV_SESSION_NAME="${SESSION_NAME:-}"
 ENV_AGY_WINDOW="${AGY_WINDOW:-}"
 ENV_CODEX_WINDOW="${CODEX_WINDOW:-}"
 ENV_ACC_RUNTIME="${ACC_RUNTIME:-}"
+ENV_WORKER_MODE="${WORKER_MODE:-}"
+ENV_AGY_MODE="${AGY_MODE:-}"
+ENV_CODEX_MODE="${CODEX_MODE:-}"
 
 if [[ -f "$HERE/config.env" ]]; then
   # shellcheck disable=SC1091
   source "$HERE/config.env"
 fi
 CONFIG_SESSION_NAME="${SESSION_NAME:-agentchain}"
+
+[[ -n "$ENV_WORKER_MODE" ]] && WORKER_MODE="$ENV_WORKER_MODE"
+[[ -n "$ENV_AGY_MODE" ]] && AGY_MODE="$ENV_AGY_MODE"
+[[ -n "$ENV_CODEX_MODE" ]] && CODEX_MODE="$ENV_CODEX_MODE"
 
 # shellcheck disable=SC1091
 source "$HERE/lib/session.sh"
@@ -112,20 +119,48 @@ if [[ ! -f "$runtime/bootstrap_version" ]] || ! grep -q '^bootstrap_version=2' "
   exit 70
 fi
 
-# 대상 pane의 현재 프로세스가 idle shell인지 검증 (v1 상시 TUI 오염 원천 차단)
-cur_cmd="$(tmux display-message -p -t "$SESSION_NAME:$target_window" '#{pane_current_command}' 2>/dev/null || echo "")"
-case "$cur_cmd" in
-  bash|zsh|sh|-bash|-zsh|-sh) ;;
+case "$worker" in
+  agy) worker_mode="${AGY_MODE:-${WORKER_MODE:-oneshot}}" ;;
+  codex) worker_mode="${CODEX_MODE:-${WORKER_MODE:-oneshot}}" ;;
+  *) worker_mode="${WORKER_MODE:-oneshot}" ;;
+esac
+
+case "$worker_mode" in
+  oneshot) ;;
+  resident)
+    if [[ "$worker" == "codex" ]]; then
+      echo "Error: Stage 1 does not implement resident mode for codex (completion hooks/watchdog are agy-only). Use CODEX_MODE=oneshot. Dispatch rejected." >&2
+      exit 64
+    fi
+    ;;
   *)
-    echo "Error: Target window '$target_window' in session '$SESSION_NAME' is running interactive TUI '$cur_cmd' instead of idle shell. Dispatch rejected." >&2
-    echo "Hint: If this is a v1 session, re-run with SESSION_NAME=<v2-session> (e.g. SESSION_NAME=agentchain-v2) to target the v2 idle worker shell." >&2
-    exit 71
+    echo "Error: Unsupported worker mode '$worker_mode' for $worker (must be oneshot or resident)" >&2
+    exit 64
     ;;
 esac
 
+# 대상 pane의 현재 프로세스 검증 (상주 모드는 worker TUI, oneshot은 idle shell 요구)
+cur_cmd="$(tmux display-message -p -t "$SESSION_NAME:$target_window" '#{pane_current_command}' 2>/dev/null || echo "")"
+if [[ "$worker_mode" == "resident" ]]; then
+  if [[ "$cur_cmd" != "$worker" ]]; then
+    echo "Error: Target window '$target_window' in session '$SESSION_NAME' is running '$cur_cmd' instead of resident TUI '$worker'. Dispatch rejected." >&2
+    echo "Hint: Make sure the resident TUI for $worker is running in '$SESSION_NAME:$target_window' or set ${worker^^}_MODE=oneshot." >&2
+    exit 71
+  fi
+else
+  case "$cur_cmd" in
+    bash|zsh|sh|-bash|-zsh|-sh) ;;
+    *)
+      echo "Error: Target window '$target_window' in session '$SESSION_NAME' is running interactive TUI '$cur_cmd' instead of idle shell. Dispatch rejected." >&2
+      echo "Hint: If this is a v1 session, re-run with SESSION_NAME=<v2-session> (e.g. SESSION_NAME=agentchain-v2) to target the v2 idle worker shell." >&2
+      exit 71
+      ;;
+  esac
+fi
+
 # 드라이런 요청 시 실제 작업 디스패치 없이 성공 종료
 if [[ "$dry_run" == "true" ]]; then
-  echo "[dry-run] Target window '$target_window' in session '$SESSION_NAME' is ready (current command: '$cur_cmd')."
+  echo "[dry-run] Target window '$target_window' in session '$SESSION_NAME' is ready (mode: $worker_mode, current command: '$cur_cmd')."
   echo "[dry-run] Task would be dispatched to $worker with timeout ${timeout}s."
   exit 0
 fi
@@ -269,21 +304,64 @@ if (( prompt_size > 131072 )); then
   exit 65
 fi
 
-# 작업 예약 마커 설정 및 락 해제
-printf '%s\n%s\n' "$task_id" "$(date +%s)" > "$busy_file"
-lease_acquired=false
-if [[ "$(cat "$lock_dir/owner" 2>/dev/null || true)" == "$owner_token" ]]; then
-  rm -rf "$lock_dir" 2>/dev/null || true
-fi
+if [[ "$worker_mode" == "resident" ]]; then
+  started_epoch="$(date +%s)"
+  deadline_epoch=$((started_epoch + timeout))
+  pane_pid="$(tmux display-message -p -t "$SESSION_NAME:$target_window" '#{pane_pid}' 2>/dev/null || echo "$$")"
+  child_pid="$(pgrep -P "$pane_pid" "$worker" 2>/dev/null | head -n 1 || echo "")"
+  target_pid="${child_pid:-$pane_pid}"
+  proc_token="$(awk '{print $22}' "/proc/$target_pid/stat" 2>/dev/null || echo "$started_epoch")"
+  pgid="$(ps -o pgid= -p "$target_pid" 2>/dev/null | tr -d ' ' || echo "$target_pid")"
 
-# 안전하게 인자 이스케이프 후 literal 모드로 명령 주입
-run_cmd=$(printf '%q %q %q %q %q' "$HERE/bin/run-task.sh" "$worker" "$task_id" "$task_dir/prompt.md" "$timeout")
-if ! tmux send-keys -l -t "$SESSION_NAME:$target_window" "$run_cmd" || ! tmux send-keys -t "$SESSION_NAME:$target_window" C-m; then
-  echo "Error: Failed to inject command into tmux window '$target_window'." >&2
-  if grep -q "^$task_id$" "$busy_file" 2>/dev/null; then
-    rm -f "$busy_file"
+  # 상주 모드: 작업 상태 파일 직접 기록
+  cat > "$task_dir/state" <<EOF
+task_id=$task_id
+worker=$worker
+status=running
+mode=resident
+pid=$target_pid
+pgid=$pgid
+proc_token=$proc_token
+started_epoch=$started_epoch
+deadline_epoch=$deadline_epoch
+EOF
+
+  # 작업 예약 마커 설정 및 락 해제
+  printf '%s\n%s\n' "$task_id" "$started_epoch" > "$busy_file"
+  lease_acquired=false
+  if [[ "$(cat "$lock_dir/owner" 2>/dev/null || true)" == "$owner_token" ]]; then
+    rm -rf "$lock_dir" 2>/dev/null || true
   fi
-  exit 72
+
+  # started 이벤트 발행
+  "$HERE/bin/event-emit.sh" "$worker" started "$task_id" "Resident task started (target: $SESSION_NAME:$target_window)" >/dev/null 2>&1 || true
+
+  # 1줄 트리거 주입 (개행 폭주 방지)
+  trigger="Read and execute task prompt: $task_dir/prompt.md"
+  if ! tmux send-keys -l -t "$SESSION_NAME:$target_window" "$trigger" || ! tmux send-keys -t "$SESSION_NAME:$target_window" Enter; then
+    echo "Error: Failed to inject command into tmux window '$target_window'." >&2
+    if grep -q "^$task_id$" "$busy_file" 2>/dev/null; then
+      rm -f "$busy_file"
+    fi
+    exit 72
+  fi
+else
+  # oneshot 모드: 작업 예약 마커 설정 및 락 해제
+  printf '%s\n%s\n' "$task_id" "$(date +%s)" > "$busy_file"
+  lease_acquired=false
+  if [[ "$(cat "$lock_dir/owner" 2>/dev/null || true)" == "$owner_token" ]]; then
+    rm -rf "$lock_dir" 2>/dev/null || true
+  fi
+
+  # 안전하게 인자 이스케이프 후 literal 모드로 명령 주입
+  run_cmd=$(printf '%q %q %q %q %q' "$HERE/bin/run-task.sh" "$worker" "$task_id" "$task_dir/prompt.md" "$timeout")
+  if ! tmux send-keys -l -t "$SESSION_NAME:$target_window" "$run_cmd" || ! tmux send-keys -t "$SESSION_NAME:$target_window" C-m; then
+    echo "Error: Failed to inject command into tmux window '$target_window'." >&2
+    if grep -q "^$task_id$" "$busy_file" 2>/dev/null; then
+      rm -f "$busy_file"
+    fi
+    exit 72
+  fi
 fi
 
-echo "Dispatched task $task_id to $worker (target: $SESSION_NAME:$target_window)"
+echo "Dispatched task $task_id to $worker (target: $SESSION_NAME:$target_window, mode: $worker_mode)"

@@ -28,6 +28,15 @@ _ENV_ACC_RUNTIME="${ACC_RUNTIME:-}"
 _ENV_SESSION_NAME="${SESSION_NAME:-}"
 _ENV_START_WATCHDOG="${START_WATCHDOG:-}"
 _ENV_AUTO_CONFIRM_TRUST="${AUTO_CONFIRM_TRUST:-}"
+_ENV_LOG_DIR="${LOG_DIR:-}"
+_ENV_SONNET_CMD="${SONNET_CMD:-}"
+_ENV_AGY_CMD="${AGY_CMD:-}"
+_ENV_CODEX_CMD="${CODEX_CMD:-}"
+_ENV_WORKER_MODE="${WORKER_MODE:-}"
+_ENV_AGY_MODE="${AGY_MODE:-}"
+_ENV_CODEX_MODE="${CODEX_MODE:-}"
+_ENV_BRIDGE_MODE="${BRIDGE_MODE:-}"
+_ENV_AGY_RESIDENT_CMD="${AGY_RESIDENT_CMD:-}"
 
 cd "$HERE"
 
@@ -44,14 +53,43 @@ fi
 [[ -n "$_ENV_SESSION_NAME" ]] && SESSION_NAME="$_ENV_SESSION_NAME"
 [[ -n "$_ENV_START_WATCHDOG" ]] && START_WATCHDOG="$_ENV_START_WATCHDOG"
 [[ -n "$_ENV_AUTO_CONFIRM_TRUST" ]] && AUTO_CONFIRM_TRUST="$_ENV_AUTO_CONFIRM_TRUST"
+[[ -n "$_ENV_LOG_DIR" ]] && LOG_DIR="$_ENV_LOG_DIR"
+[[ -n "$_ENV_SONNET_CMD" ]] && SONNET_CMD="$_ENV_SONNET_CMD"
+[[ -n "$_ENV_AGY_CMD" ]] && AGY_CMD="$_ENV_AGY_CMD"
+[[ -n "$_ENV_CODEX_CMD" ]] && CODEX_CMD="$_ENV_CODEX_CMD"
+[[ -n "$_ENV_WORKER_MODE" ]] && WORKER_MODE="$_ENV_WORKER_MODE"
+[[ -n "$_ENV_AGY_MODE" ]] && AGY_MODE="$_ENV_AGY_MODE"
+[[ -n "$_ENV_CODEX_MODE" ]] && CODEX_MODE="$_ENV_CODEX_MODE"
+[[ -n "$_ENV_BRIDGE_MODE" ]] && BRIDGE_MODE="$_ENV_BRIDGE_MODE"
+[[ -n "$_ENV_AGY_RESIDENT_CMD" ]] && AGY_RESIDENT_CMD="$_ENV_AGY_RESIDENT_CMD"
 
-# 지원 모드 검증 (v2는 push / oneshot 전용)
+# 지원 모드 검증 (v2는 push 기반, worker는 oneshot(기본) 또는 resident)
 WORKER_MODE="${WORKER_MODE:-oneshot}"
+AGY_MODE="${AGY_MODE:-$WORKER_MODE}"
+CODEX_MODE="${CODEX_MODE:-$WORKER_MODE}"
 BRIDGE_MODE="${BRIDGE_MODE:-push}"
-if [[ "$WORKER_MODE" != "oneshot" ]]; then
-  echo "Error: Full-Push v2 아키텍처는 WORKER_MODE=oneshot 만 지원합니다. (설정값: $WORKER_MODE)" >&2
-  exit 64
-fi
+AGY_RESIDENT_CMD="${AGY_RESIDENT_CMD:-${AGY_CMD:-agy --dangerously-skip-permissions}}"
+
+case "$AGY_MODE" in
+  oneshot|resident) ;;
+  *)
+    echo "Error: Full-Push v2 아키텍처는 AGY_MODE=oneshot|resident 만 지원합니다. (설정값: $AGY_MODE)" >&2
+    exit 64
+    ;;
+esac
+
+case "$CODEX_MODE" in
+  oneshot) ;;
+  resident)
+    echo "Error: Stage 1 does not implement resident mode for codex (completion hooks/watchdog are agy-only). Use CODEX_MODE=oneshot. (설정값: CODEX_MODE=$CODEX_MODE, WORKER_MODE=$WORKER_MODE)" >&2
+    exit 64
+    ;;
+  *)
+    echo "Error: Full-Push v2 아키텍처는 CODEX_MODE=oneshot 만 지원합니다. (설정값: $CODEX_MODE)" >&2
+    exit 64
+    ;;
+esac
+
 if [[ "$BRIDGE_MODE" != "push" ]]; then
   echo "Error: Full-Push v2 아키텍처는 BRIDGE_MODE=push 만 지원합니다. (설정값: $BRIDGE_MODE)" >&2
   exit 64
@@ -205,7 +243,7 @@ if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
   if [[ -n "$sonnet_cmdline" ]] && [[ "$sonnet_cmdline" != *"$BRIDGE_SETTINGS"* && "$sonnet_cmdline" != *"claude-bridge.settings.json"* ]]; then
     is_v2_compatible=false
   fi
-  if [[ "$agy_cmd" == "agy" || "$codex_cmd" == "codex" ]]; then
+  if [[ "$AGY_MODE" != "resident" && "$agy_cmd" == "agy" ]] || [[ "$CODEX_MODE" != "resident" && "$codex_cmd" == "codex" ]]; then
     is_v2_compatible=false
   fi
 
@@ -225,10 +263,41 @@ if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
     tmux new-window -t "$SESSION_NAME" -n "$SONNET_WINDOW" -c "$PROJECT_DIR"
     tmux send-keys -t "${SESSION_NAME}:${SONNET_WINDOW}" "$SONNET_LAUNCH" C-m
   fi
+  if has_window "$AGY_WINDOW" && [[ "$AGY_MODE" == "resident" ]]; then
+    agy_pane_id="$(tmux display-message -p -t "${SESSION_NAME}:${AGY_WINDOW}" '#{pane_id}')"
+    printf 'pane_id=%s\nsession=%s\n' "$agy_pane_id" "$SESSION_NAME" > "$ACC_RUNTIME/workers/agy.resident"
+  fi
   if ! has_window "$AGY_WINDOW"; then
     echo "[$AGY_WINDOW] 생성"
     tmux new-window -t "$SESSION_NAME" -n "$AGY_WINDOW" -c "$PROJECT_DIR"
-    tmux send-keys -t "${SESSION_NAME}:${AGY_WINDOW}" "export ACC_RUNTIME=\"$ACC_RUNTIME\" PROJECT_DIR=\"$PROJECT_DIR\" HERE=\"$HERE\"; cd \"$PROJECT_DIR\"" C-m
+    if [[ "$AGY_MODE" == "resident" ]]; then
+      agy_pane_id="$(tmux display-message -p -t "${SESSION_NAME}:${AGY_WINDOW}" '#{pane_id}')"
+      printf 'pane_id=%s\nsession=%s\n' "$agy_pane_id" "$SESSION_NAME" > "$ACC_RUNTIME/workers/agy.resident"
+      tmux send-keys -t "${SESSION_NAME}:${AGY_WINDOW}" "export ACC_RUNTIME=\"$ACC_RUNTIME\" PROJECT_DIR=\"$PROJECT_DIR\" HERE=\"$HERE\" HOME=\"$HOME\" ACC_HOOK_DEBUG=\"${ACC_HOOK_DEBUG:-0}\"; cd \"$PROJECT_DIR\" && $AGY_RESIDENT_CMD" C-m
+      AUTO_CONFIRM_TRUST="${AUTO_CONFIRM_TRUST:-true}"
+      if [[ "$AUTO_CONFIRM_TRUST" == "true" ]]; then
+        trust_waited=0
+        while (( trust_waited < 10 )); do
+          pane_txt="$(tmux capture-pane -t "${SESSION_NAME}:${AGY_WINDOW}" -p 2>/dev/null || echo "")"
+          if [[ "$pane_txt" == *"trust this folder"* ]]; then
+            tmux send-keys -t "${SESSION_NAME}:${AGY_WINDOW}" Enter
+            break
+          fi
+          if [[ "$pane_txt" == *">"* ]] && [[ "$pane_txt" != *"Do you trust"* ]]; then
+            break
+          fi
+          sleep 0.5
+          trust_waited=$((trust_waited + 1))
+        done
+      fi
+      agy_rearm="ACC_ROLE: You are the resident router. Do not do file writing or coding directly. Always delegate via invoke_subagent and wait."
+      if wait_for_pane_text "${SESSION_NAME}:${AGY_WINDOW}" ">" 15; then
+        tmux send-keys -l -t "${SESSION_NAME}:${AGY_WINDOW}" "$agy_rearm"
+        tmux send-keys -t "${SESSION_NAME}:${AGY_WINDOW}" Enter
+      fi
+    else
+      tmux send-keys -t "${SESSION_NAME}:${AGY_WINDOW}" "export ACC_RUNTIME=\"$ACC_RUNTIME\" PROJECT_DIR=\"$PROJECT_DIR\" HERE=\"$HERE\"; cd \"$PROJECT_DIR\"" C-m
+    fi
   fi
   if ! has_window "$CODEX_WINDOW"; then
     echo "[$CODEX_WINDOW] 생성"
@@ -238,16 +307,45 @@ if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
 else
   echo "tmux 세션 '$SESSION_NAME' 신규 생성 (윈도우: $SONNET_WINDOW, $AGY_WINDOW, $CODEX_WINDOW)"
   tmux new-session -d -s "$SESSION_NAME" -n "$SONNET_WINDOW" -c "$PROJECT_DIR"
+  tmux set-environment -t "$SESSION_NAME" HOME "$HOME" 2>/dev/null || true
   tmux new-window -t "$SESSION_NAME" -n "$AGY_WINDOW" -c "$PROJECT_DIR"
   tmux new-window -t "$SESSION_NAME" -n "$CODEX_WINDOW" -c "$PROJECT_DIR"
 
   echo "[$SONNET_WINDOW] Sonnet 기동: $SONNET_CMD"
   tmux send-keys -t "${SESSION_NAME}:${SONNET_WINDOW}" "$SONNET_LAUNCH" C-m
 
-  echo "[$AGY_WINDOW] agy 대기 셸 초기화 (WORKER_MODE=oneshot)"
-  tmux send-keys -t "${SESSION_NAME}:${AGY_WINDOW}" "export ACC_RUNTIME=\"$ACC_RUNTIME\" PROJECT_DIR=\"$PROJECT_DIR\" HERE=\"$HERE\"; cd \"$PROJECT_DIR\"" C-m
-  echo "[$CODEX_WINDOW] Codex 대기 셸 초기화 (WORKER_MODE=oneshot)"
-  tmux send-keys -t "${SESSION_NAME}:${CODEX_WINDOW}" "export ACC_RUNTIME=\"$ACC_RUNTIME\" PROJECT_DIR=\"$PROJECT_DIR\" HERE=\"$HERE\"; cd \"$PROJECT_DIR\"" C-m
+  if [[ "$AGY_MODE" == "resident" ]]; then
+    echo "[$AGY_WINDOW] agy 상주 TUI 기동 (AGY_MODE=resident)"
+    agy_pane_id="$(tmux display-message -p -t "${SESSION_NAME}:${AGY_WINDOW}" '#{pane_id}')"
+    printf 'pane_id=%s\nsession=%s\n' "$agy_pane_id" "$SESSION_NAME" > "$ACC_RUNTIME/workers/agy.resident"
+    tmux send-keys -t "${SESSION_NAME}:${AGY_WINDOW}" "export ACC_RUNTIME=\"$ACC_RUNTIME\" PROJECT_DIR=\"$PROJECT_DIR\" HERE=\"$HERE\" HOME=\"$HOME\" ACC_HOOK_DEBUG=\"${ACC_HOOK_DEBUG:-0}\"; cd \"$PROJECT_DIR\" && $AGY_RESIDENT_CMD" C-m
+    AUTO_CONFIRM_TRUST="${AUTO_CONFIRM_TRUST:-true}"
+    if [[ "$AUTO_CONFIRM_TRUST" == "true" ]]; then
+      trust_waited=0
+      while (( trust_waited < 10 )); do
+        pane_txt="$(tmux capture-pane -t "${SESSION_NAME}:${AGY_WINDOW}" -p 2>/dev/null || echo "")"
+        if [[ "$pane_txt" == *"trust this folder"* ]]; then
+          tmux send-keys -t "${SESSION_NAME}:${AGY_WINDOW}" Enter
+          break
+        fi
+        if [[ "$pane_txt" == *">"* ]] && [[ "$pane_txt" != *"Do you trust"* ]]; then
+          break
+        fi
+        sleep 0.5
+        trust_waited=$((trust_waited + 1))
+      done
+    fi
+    agy_rearm="ACC_ROLE: You are the resident router. Do not do file writing or coding directly. Always delegate via invoke_subagent and wait."
+    if wait_for_pane_text "${SESSION_NAME}:${AGY_WINDOW}" ">" 15; then
+      tmux send-keys -l -t "${SESSION_NAME}:${AGY_WINDOW}" "$agy_rearm"
+      tmux send-keys -t "${SESSION_NAME}:${AGY_WINDOW}" Enter
+    fi
+  else
+    echo "[$AGY_WINDOW] agy 대기 셸 초기화 (AGY_MODE=oneshot)"
+    tmux send-keys -t "${SESSION_NAME}:${AGY_WINDOW}" "export ACC_RUNTIME=\"$ACC_RUNTIME\" PROJECT_DIR=\"$PROJECT_DIR\" HERE=\"$HERE\" HOME=\"$HOME\"; cd \"$PROJECT_DIR\"" C-m
+  fi
+  echo "[$CODEX_WINDOW] Codex 대기 셸 초기화 (CODEX_MODE=oneshot)"
+  tmux send-keys -t "${SESSION_NAME}:${CODEX_WINDOW}" "export ACC_RUNTIME=\"$ACC_RUNTIME\" PROJECT_DIR=\"$PROJECT_DIR\" HERE=\"$HERE\" HOME=\"$HOME\"; cd \"$PROJECT_DIR\"" C-m
 fi
 
 # 새 디렉토리에서 처음 뜰 때 claude/codex 둘 다 "이 폴더를 신뢰하는가" 대화형
@@ -264,6 +362,9 @@ if [[ "$AUTO_CONFIRM_TRUST" == "true" ]]; then
   if wait_for_pane_text "${SESSION_NAME}:${SONNET_WINDOW}" "trust this folder" 15; then
     tmux send-keys -t "${SESSION_NAME}:${SONNET_WINDOW}" Down C-m   # "No, exit" -> "Yes, I trust this folder"
   fi
+  if [[ "$AGY_MODE" == "resident" ]] && wait_for_pane_text "${SESSION_NAME}:${AGY_WINDOW}" "trust this folder" 15; then
+    tmux send-keys -t "${SESSION_NAME}:${AGY_WINDOW}" Enter
+  fi
   codex_cur="$(tmux display-message -p -t "${SESSION_NAME}:${CODEX_WINDOW}" '#{pane_current_command}' 2>/dev/null || echo "")"
   if [[ "$codex_cur" == "codex" ]] && wait_for_pane_text "${SESSION_NAME}:${CODEX_WINDOW}" "trust the contents" 15; then
     tmux send-keys -t "${SESSION_NAME}:${CODEX_WINDOW}" C-m          # 기본 선택지가 이미 "Yes, continue"
@@ -279,7 +380,7 @@ if [[ "$START_WATCHDOG" == "true" ]]; then
 fi
 
 # 전체 세션 검증 및 기동 성공 후에만 bootstrap 버전 및 세션 마커 기록
-printf 'bootstrap_version=2\ncreated_epoch=%s\nworker_mode=oneshot\nbridge_mode=push\n' "$(date +%s)" > "$ACC_RUNTIME/bootstrap_version"
+printf 'bootstrap_version=2\ncreated_epoch=%s\nworker_mode=%s\nagy_mode=%s\ncodex_mode=%s\nbridge_mode=push\n' "$(date +%s)" "$WORKER_MODE" "$AGY_MODE" "$CODEX_MODE" > "$ACC_RUNTIME/bootstrap_version"
 printf '%s\n' "$SESSION_NAME" > "$ACC_RUNTIME/session_name"
 tmux set-environment -t "$SESSION_NAME" ACC_BOOTSTRAP_VERSION 2 2>/dev/null || true
 tmux set-environment -t "$SESSION_NAME" ACC_RUNTIME "$ACC_RUNTIME" 2>/dev/null || true

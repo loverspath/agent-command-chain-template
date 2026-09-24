@@ -65,9 +65,10 @@ agy 창에서 최초로 줄 지시 (eraweb-fork `CLI_START_HERE.md`의 첫 프�
   - `--agent` 옵션은 "Agent for the current CLI session"으로 실행 세션의 메인 에이전트 프로필을 지정하는 옵션이며 서브에이전트 소환 플래그가 아니다.
   - 실제 서브에이전트 소환 수단은 LLM 내장 도구인 **`invoke_subagent`**이다.
   - oneshot(`agy -p`) 모드에서 메인이 `invoke_subagent`를 호출하여 서브에이전트를 기동하고, `send_message`로 결과를 취합한 뒤 정상 종료(exit 0) 및 잔류 프로세스 0건이 실측 검증되었다.
-- **v2 단발 실행 vs v1 legacy 대화형 TUI 반응형 대기**:
-  - **v2 (기본)**: agy 창은 유휴 셸(`bash`)로 대기하며, `dispatch.sh` 호출 시 `adapters/agy-oneshot.sh`를 통해 단발 프로세스로 기동된다. 한 턴 내에서 `invoke_subagent`로 위임·취합 후 종료하므로 상시 상주 프로세스가 없다.
-  - **legacy (v1)**: v1에서는 agy가 대화형 TUI로 상주하며 상위 인터럽트를 수신하는 반응형 대기 상태(responsive state)를 유지하도록 했다. 그러나 실측 결과 Antigravity CLI TUI는 활성 턴 중 외부 입력을 처리하지 못하고 `queued messages` 큐에 적재하는 비선점형(non-preemptive) 인터페이스 특성이 있어, 메인이 다수의 직접 도구 호출(과거 539회 언급은 unverified/횟수 미재현)에 몰입하면 상위 지시가 수 분간 블로킹되는 심각한 지연이 확인되었다 (`T0924-03`).
+- **v2 실행 모드 (oneshot vs resident Stage 1)**:
+  - **v2 oneshot (기본 권장, 무회귀 경로)**: agy 창은 유휴 셸(`bash`)로 대기하며, `dispatch.sh` 호출 시 `adapters/agy-oneshot.sh`를 통해 단발 프로세스로 기동된다. 한 턴 내에서 `invoke_subagent`로 위임·취합 후 종료하므로 상시 상주 프로세스가 없다.
+  - **v2 resident (Stage 1, 간소화 브리지)**: `AGY_MODE=resident` 설정 시 agy는 Window 1에 대화형 TUI로 상주한다. 디스패처가 주입하는 1줄 트리거(`Read and execute task prompt: ...`)를 수신하면 `prompt.md`를 읽고 `invoke_subagent`로 서브에이전트에 실작업을 위임하여 대기한다. 메인의 직접 코딩/툴루프는 엄격히 금지되며, 작업 완료 시 네이티브 `Stop` 훅(`bin/agy-stop-hook.sh`)이 `fullyIdle: true`를 감지하여 원자적으로 `done` 이벤트를 브리지에 통지한다. 컨텍스트 정리가 필요할 때는 유휴 상태에서 1줄 `/clear` 후 1줄 재무장 지침(`ACC_ROLE:...`)을 주입한다.
+  - **legacy (v1)**: v1에서는 폴링 기반 수동 관찰로 운용되었으며, 메인이 직접 툴루프에 빠질 경우 `queued messages` 병목이 발생했다. Stage 1 상주 모드는 이 문제를 `메인 툴루프 절대 금지 + 서브에이전트 위임 + 훅 완료 통지`로 완벽히 해결한다.
 - **실패 시 직접 처리 금지 및 명시 보고**: 서브에이전트 소환이 불가능하거나 실패했을 때 agy가 임의로 직접 작업을 수행해서는 안 된다. 반드시 `[[BLOCKED <id>]]`로 상위에 에스컬레이션해야 한다.
 - **Tier 3 산출물 자동 즉시 등록**: Sol/Opus 산출물은 리포 내부 휘발성 `logs/`에만 남겨두면 Obsidian 볼트에서 추적되지 않는다. 산출물 발생 시 사람이나 상위의 추가 지시를 기다리지 않고 기본 동작으로 루트 볼트 `Research/` 폴더에 정규 위키 문서로 등록하는 것을 의무화한다.
 

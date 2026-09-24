@@ -90,6 +90,55 @@ SESSION_NAME=agentchain-v2 ./bin/dispatch.sh agy --dry-run
 ACC_NO_BRIEF_HEADER=1 SESSION_NAME=agentchain-v2 ./bin/dispatch.sh agy --prompt-file /path/to/prompt.md
 ```
 
+### Resident TUI 브리지 운용 (Stage 1: agy 상주)
+
+`AGY_MODE=resident` 모드에서는 agy가 tmux Window 1에 상시 대화형 TUI로 상주하며, 파일 디스패치와 1줄 도어벨 트리거를 통해 작동합니다.
+
+#### 1. 머신 전역 훅 설정 (Zero Project Pollution)
+대상 프로젝트 리포지토리에 `.agents/hooks.json`을 추가할 필요 없이, 머신 전역 설정 파일(`~/.gemini/config/hooks.json`)에 Stop 훅을 등록합니다:
+
+```json
+{
+  "agent-command-chain-bridge": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "/home/rerun/agent-command-chain-template/bin/agy-stop-hook.sh"
+      }
+    ]
+  }
+}
+```
+> [!NOTE]
+> `~/.gemini/config/hooks.json`이 이미 존재하면 상기 `"agent-command-chain-bridge"` 키를 기존 JSON 객체 안에 추가(병합)합니다. 훅 제거 시 해당 키 블록만 삭제하면 됩니다.
+
+#### 2. 상주 세션 기동
+```bash
+# agy 상주 모드로 v2 세션 기동
+AGY_MODE=resident ./bootstrap-v2.sh
+```
+
+#### 3. 상주 agy 작업 디스패치
+```bash
+# 상주 agy에 작업 디스패치 (1줄 트리거가 tmux send-keys로 주입됨)
+AGY_MODE=resident SESSION_NAME=agentchain-v2 ./bin/dispatch.sh agy --prompt-file /path/to/prompt.md
+
+# 사전 상태 점검 (dry-run)
+AGY_MODE=resident SESSION_NAME=agentchain-v2 ./bin/dispatch.sh agy --dry-run
+```
+
+#### 4. 유휴 시점 컨텍스트 소거 (/clear) 및 1줄 재무장
+워커가 유휴 상태(`workers/agy.busy` 부재)일 때 대화 맥락을 소거하고 역할을 재장착합니다:
+```bash
+# 1. /clear 전송 후 1초 대기
+tmux send-keys -l -t agentchain-v2:agy "/clear" && tmux send-keys -t agentchain-v2:agy Enter
+sleep 1
+
+# 2. 1줄 재무장 지침 주입
+tmux send-keys -l -t agentchain-v2:agy "ACC_ROLE: You are the resident router. Do not do file writing or coding directly. Always delegate via invoke_subagent and wait."
+tmux send-keys -t agentchain-v2:agy Enter
+```
+
 ### 처리 완료 이벤트 확인 및 아카이빙 (v2)
 Sonnet이 비동기 기상(`asyncRewake`) 리마인더를 수신한 후 이벤트를 확인하고 보관 처리한다:
 

@@ -10,6 +10,9 @@ _ENV_PROJECT_DIR="${PROJECT_DIR:-}"
 _ENV_ACC_RUNTIME="${ACC_RUNTIME:-}"
 _ENV_SESSION_NAME="${SESSION_NAME:-}"
 _ENV_WATCHDOG_AUTO_KILL="${WATCHDOG_AUTO_KILL:-}"
+_ENV_WORKER_MODE="${WORKER_MODE:-}"
+_ENV_AGY_MODE="${AGY_MODE:-}"
+_ENV_CODEX_MODE="${CODEX_MODE:-}"
 
 cd "$HERE"
 
@@ -27,6 +30,26 @@ source "$HERE/lib/session.sh"
 [[ -n "$_ENV_SESSION_NAME" ]] && SESSION_NAME="$_ENV_SESSION_NAME"
 [[ -n "$_ENV_WATCHDOG_AUTO_KILL" ]] && WATCHDOG_AUTO_KILL="$_ENV_WATCHDOG_AUTO_KILL"
 WATCHDOG_AUTO_KILL="${WATCHDOG_AUTO_KILL:-false}"
+[[ -n "$_ENV_WORKER_MODE" ]] && WORKER_MODE="$_ENV_WORKER_MODE"
+[[ -n "$_ENV_AGY_MODE" ]] && AGY_MODE="$_ENV_AGY_MODE"
+[[ -n "$_ENV_CODEX_MODE" ]] && CODEX_MODE="$_ENV_CODEX_MODE"
+
+WORKER_MODE="${WORKER_MODE:-oneshot}"
+AGY_MODE="${AGY_MODE:-$WORKER_MODE}"
+CODEX_MODE="${CODEX_MODE:-$WORKER_MODE}"
+
+case "$AGY_MODE" in oneshot|resident) ;; *) echo "Error: Invalid AGY_MODE '$AGY_MODE'" >&2; exit 64 ;; esac
+case "$CODEX_MODE" in
+  oneshot) ;;
+  resident)
+    echo "Error: Stage 1 does not implement resident mode for codex (completion hooks/watchdog are agy-only). Use CODEX_MODE=oneshot. (설정값: CODEX_MODE=$CODEX_MODE, WORKER_MODE=$WORKER_MODE)" >&2
+    exit 64
+    ;;
+  *)
+    echo "Error: Invalid CODEX_MODE '$CODEX_MODE'" >&2
+    exit 64
+    ;;
+esac
 
 PROJECT_DIR="${PROJECT_DIR:-$INVOKED_DIR}"
 if [[ ! -d "$PROJECT_DIR" ]]; then
@@ -42,7 +65,12 @@ LOG_FILE="$LOG_DIR/watchdog.log"
 
 ENV_SESSION_NAME="$_ENV_SESSION_NAME"
 ENV_ACC_RUNTIME="$_ENV_ACC_RUNTIME"
+if [[ -z "${_ENV_ACC_RUNTIME:-}" || ! -d "$_ENV_ACC_RUNTIME" ]]; then
+  echo "Error: watchdog-v2 requires explicit ACC_RUNTIME directory." >&2
+  exit 1
+fi
 resolve_session_and_runtime "watchdog-v2" "" false
+ACC_RUNTIME="$_ENV_ACC_RUNTIME"
 
 mkdir -p "$ACC_RUNTIME/events"/{pending,inflight,archive} "$ACC_RUNTIME/tasks" "$ACC_RUNTIME/workers"
 
@@ -63,10 +91,23 @@ DEFAULT_TASK_TIMEOUT="${DEFAULT_TASK_TIMEOUT:-1800}"
 NO_OUTPUT_WARN_SECONDS="${NO_OUTPUT_WARN_SECONDS:-900}"
 EVENT_DELIVERY_GRACE="${EVENT_DELIVERY_GRACE:-120}"
 EVENT_ACK_TIMEOUT="${EVENT_ACK_TIMEOUT:-600}"
-if [[ "${WORKER_MODE:-oneshot}" != "oneshot" ]]; then
-  echo "Error: watchdog-v2는 WORKER_MODE=oneshot 만 지원합니다." >&2
-  exit 64
-fi
+WORKER_MODE="${WORKER_MODE:-oneshot}"
+AGY_MODE="${AGY_MODE:-$WORKER_MODE}"
+CODEX_MODE="${CODEX_MODE:-$WORKER_MODE}"
+
+case "$AGY_MODE" in oneshot|resident) ;; *) echo "Error: Invalid AGY_MODE '$AGY_MODE'" >&2; exit 64 ;; esac
+case "$CODEX_MODE" in
+  oneshot) ;;
+  resident)
+    echo "Error: Stage 1 does not implement resident mode for codex (completion hooks/watchdog are agy-only). Use CODEX_MODE=oneshot. (설정값: CODEX_MODE=$CODEX_MODE, WORKER_MODE=$WORKER_MODE)" >&2
+    exit 64
+    ;;
+  *)
+    echo "Error: Invalid CODEX_MODE '$CODEX_MODE'" >&2
+    exit 64
+    ;;
+esac
+
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
@@ -163,7 +204,7 @@ check_running_tasks() {
   for state_file in "$ACC_RUNTIME/tasks"/*/state; do
     [[ -f "$state_file" ]] || continue
     local task_dir="${state_file%/*}"
-    local task_id="" worker="" status="" pid="" pgid="" proc_token="" started_epoch="" deadline_epoch=""
+    local task_id="" worker="" status="" pid="" pgid="" proc_token="" started_epoch="" deadline_epoch="" mode=""
     while IFS= read -r line; do
       case "$line" in
         task_id=*) task_id="${line#task_id=}" ;;
@@ -174,6 +215,7 @@ check_running_tasks() {
         proc_token=*) proc_token="${line#proc_token=}" ;;
         started_epoch=*) started_epoch="${line#started_epoch=}" ;;
         deadline_epoch=*) deadline_epoch="${line#deadline_epoch=}" ;;
+        mode=*) mode="${line#mode=}" ;;
       esac
     done < "$state_file"
     [[ -n "$pgid" ]] || pgid="$pid"
@@ -184,7 +226,18 @@ check_running_tasks() {
     esac
     [[ -n "$pid" ]] || continue
 
-    # 1. OS PID 생존 및 PID 재사용 검증
+    local this_mode="oneshot"
+    if [[ "$mode" == "resident" ]] || [[ -f "$ACC_RUNTIME/workers/$worker.resident" ]]; then
+      this_mode="resident"
+    else
+      case "$worker" in
+        agy) this_mode="${AGY_MODE:-${WORKER_MODE:-oneshot}}" ;;
+        codex) this_mode="${CODEX_MODE:-${WORKER_MODE:-oneshot}}" ;;
+        *) this_mode="${WORKER_MODE:-oneshot}" ;;
+      esac
+    fi
+
+    # 1. OS PID 생존 및 PID 재사용 검증 (상주 모드는 tmux pane 커맨드 생존 검증 병행)
     local pid_alive=false
     if kill -0 "$pid" 2>/dev/null; then
       if [[ -n "$proc_token" ]]; then
@@ -198,9 +251,29 @@ check_running_tasks() {
       fi
     fi
 
-    # PID가 증발했거나, 이전 알림 실패(notification_error) 상태인 경우 reap 처리
-    if [[ "$pid_alive" == "false" || "$status" == "notification_error" ]]; then
-      if [[ "$pid_alive" == "false" ]]; then
+    local proc_state=""
+    if [[ "$pid_alive" == "true" ]]; then
+      proc_state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || echo "")"
+    fi
+
+    local pane_dead=false
+    local pane_cmd=""
+    if [[ "$this_mode" == "resident" ]]; then
+      pane_cmd="$(tmux display-message -p -t "${SESSION_NAME}:${worker}" '#{pane_current_command}' 2>/dev/null || echo "MISSING")"
+      if [[ "$pane_cmd" != "$worker" ]]; then
+        if [[ "$pid_alive" == "true" && ( "$proc_state" == "T" || "$proc_state" == "t" ) ]]; then
+          pane_dead=false
+        else
+          pane_dead=true
+        fi
+      fi
+    fi
+
+    # PID가 증발했거나, 상주 TUI가 사망했거나, 이전 알림 실패(notification_error) 상태인 경우 reap 처리
+    if [[ "$pid_alive" == "false" || "$pane_dead" == "true" || "$status" == "notification_error" ]]; then
+      if [[ "$pane_dead" == "true" ]]; then
+        log "Task $task_id 상주 워커 $worker 비정상 종료 감지 (현재 창 명령: $pane_cmd)"
+      elif [[ "$pid_alive" == "false" ]]; then
         log "Task $task_id (PID $pid) 비정상 증발 감지 (PID dead or reused)"
       else
         log "Task $task_id 알림 에러 복구 시도 (status=$status)"
@@ -272,8 +345,14 @@ check_running_tasks() {
               killed_by=""
             fi
           else
+            local exit_reason="Worker PID $pid disappeared unexpectedly"
+            if [[ "$pane_dead" == "true" ]]; then
+              exit_reason="Resident worker $worker disappeared or crashed (command: $pane_cmd)"
+            fi
+            local detail_file="$task_dir/output.log"
+            [[ -f "$detail_file" ]] || detail_file="$task_dir/prompt.md"
             if eval "\"$HERE/bin/event-emit.sh\" watchdog process_exit \"$task_id\" \
-              \"Worker PID $pid disappeared unexpectedly\" \"$task_dir/output.log\" \"$term_evt_id\" ${term_fd}>&-"; then
+              \"$exit_reason\" \"$detail_file\" \"$term_evt_id\" ${term_fd}>&-"; then
               emit_ok=true
             fi
           fi
@@ -351,8 +430,13 @@ check_running_tasks() {
             fi
 
             if [[ "$is_term" == "false" ]]; then
-              # Worker group 강제 종료
-              kill -9 -- "-$pgid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true
+              if [[ "$this_mode" == "resident" ]]; then
+                # 상주 TUI 인터럽트 (C-c)
+                tmux send-keys -t "${SESSION_NAME}:${worker}" C-c 2>/dev/null || true
+              else
+                # Worker group 강제 종료
+                kill -9 -- "-$pgid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true
+              fi
 
               local term_evt_id="${task_id}-terminal"
               local evt_already_exists=false
@@ -428,24 +512,63 @@ check_running_tasks() {
             [[ -n "$term_fd" ]] && exec {term_fd}>&-
           fi
         else
+          local warn_detail="$task_dir/output.log"
+          [[ -f "$warn_detail" ]] || warn_detail="$task_dir/prompt.md"
           if "$HERE/bin/event-emit.sh" watchdog stalled "$task_id" \
-            "Task exceeded deadline ($DEFAULT_TASK_TIMEOUT s) but remains running" "$task_dir/output.log" "${task_id}-deadline-warn"; then
+            "Task exceeded deadline ($DEFAULT_TASK_TIMEOUT s) but remains running" "$warn_detail" "${task_id}-deadline-warn"; then
             touch "$task_dir/deadline.notified"
           fi
         fi
       fi
     fi
 
-    # 3. No-output Stall 검사 (출력 정체)
-    local log_file="$task_dir/output.log"
-    if [[ -f "$log_file" && ! -f "$task_dir/stall.notified" ]]; then
-      local log_mtime
-      log_mtime="$(stat -c %Y "$log_file" 2>/dev/null || echo "$now")"
-      local idle_seconds=$(( now - log_mtime ))
-      if (( idle_seconds >= NO_OUTPUT_WARN_SECONDS )); then
-        log "Task $task_id 출력 장기 정체 감지 (${idle_seconds}s >= ${NO_OUTPUT_WARN_SECONDS}s)"
+    # 3. No-output / Inactivity Stall 및 SIGSTOP 일시정지 검사
+    local proc_state=""
+    proc_state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || echo "")"
+    if [[ "$proc_state" == "T" || "$proc_state" == "t" ]]; then
+      if [[ ! -f "$task_dir/stall.notified" ]]; then
+        log "Task $task_id 워커 프로세스 일시정지(SIGSTOP) 감지 (state: $proc_state)"
+        local warn_detail="$task_dir/output.log"
+        [[ -f "$warn_detail" ]] || warn_detail="$task_dir/prompt.md"
         if "$HERE/bin/event-emit.sh" watchdog stalled "$task_id" \
-          "No output produced for ${idle_seconds}s (exceeds ${NO_OUTPUT_WARN_SECONDS}s threshold)" "$log_file" "${task_id}-stall-warn"; then
+          "Worker process stopped by signal (SIGSTOP)" "$warn_detail" "${task_id}-stop-warn"; then
+          touch "$task_dir/stall.notified"
+        fi
+      fi
+    fi
+
+    if [[ ! -f "$task_dir/stall.notified" ]]; then
+      local last_act="$started_epoch"
+      local log_file="$task_dir/output.log"
+
+      if [[ "$this_mode" == "resident" ]]; then
+        # 상주 모드: brain transcript 파일 mtime 확인
+        local newest_trans=""
+        newest_trans="$(find "${HOME:-/home/rerun}/.gemini/antigravity-cli/brain" -name "transcript_full.jsonl" -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1)"
+        if [[ -n "$newest_trans" ]]; then
+          local t_mtime="${newest_trans%%.*}"
+          if (( t_mtime > last_act )); then
+            last_act="$t_mtime"
+          fi
+        fi
+        local prompt_mtime
+        prompt_mtime="$(stat -c %Y "$task_dir/prompt.md" 2>/dev/null || echo 0)"
+        if (( prompt_mtime > last_act )); then
+          last_act="$prompt_mtime"
+        fi
+        log_file="${newest_trans#* }"
+        [[ -f "$log_file" ]] || log_file="$task_dir/prompt.md"
+      else
+        if [[ -f "$log_file" ]]; then
+          last_act="$(stat -c %Y "$log_file" 2>/dev/null || echo "$now")"
+        fi
+      fi
+
+      local idle_seconds=$(( now - last_act ))
+      if (( idle_seconds >= NO_OUTPUT_WARN_SECONDS )); then
+        log "Task $task_id 출력/활동 장기 정체 감지 (${idle_seconds}s >= ${NO_OUTPUT_WARN_SECONDS}s)"
+        if "$HERE/bin/event-emit.sh" watchdog stalled "$task_id" \
+          "No output or activity detected for ${idle_seconds}s (exceeds ${NO_OUTPUT_WARN_SECONDS}s threshold)" "$log_file" "${task_id}-stall-warn"; then
           touch "$task_dir/stall.notified"
         fi
       fi

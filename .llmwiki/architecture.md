@@ -99,8 +99,9 @@ v2는 메시지 유실 없는 신뢰성을 달성하기 위해 **파일 기반 D
 | **`bin/event-emit.sh`** | **원자적 이벤트 발행기**. Outbox의 `pending/` 디렉토리에 이벤트를 안전하게 원자적 스풀링하고, `event.fifo`에 논블로킹 펄스를 전송하여 대기 중인 리스너를 깨웁니다. `outbox.lock` flock을 통해 동시 발행 경쟁을 보호합니다. |
 | **`bin/sonnet-event-wait.sh`** | **Claude Code `asyncRewake` 전용 리스너**. `runtime/event.fifo`를 감시하다가 펄스가 들어오거나 미확인 pending 이벤트가 감지되면 exit code `2`를 반환하여 Claude Code를 즉각 기상시킵니다. |
 | **`bin/event-ack.sh`** | **이벤트 완료 처리기**. Sonnet이 확인한 이벤트를 `archive/` 디렉토리로 원자적으로 이동시키고 FIFO에 남은 잔여 펄스를 드레인하여 중복 기상을 방지합니다. |
-| **`bin/dispatch.sh`** | **작업 디스패처**. 4계층 세션명 자동 해석(환경변수 `SESSION_NAME` 권장, 런타임 마커, 현재 tmux 세션, config 기본값) 및 v2 마커 검증 후, 고유 작업 ID 발급 및 실행 프롬프트 사본(`$task_dir/prompt.md`) 생성 시 체인 컨텍스트 헤더(< 1KB) 자동 주입(`ACC_NO_BRIEF_HEADER=1`로 비활성화 가능, 헤더 포함 128KB 제한 검증), 대상 워커 tmux 창에 `bin/run-task.sh` 1줄 실행 명령을 주입합니다. `--dry-run` 안전 검증 플래그 지원. |
-| **`bin/run-task.sh`** | **워커 프로세스 러너**. 터미널 소유권 락(`terminal.lock`)을 획득하고 작업 상태를 `running`으로 전이한 뒤, 지정된 어댑터를 실행합니다. 실행 완료 시 성공/실패 여부에 따라 `task.done` 또는 `task.error` 이벤트를 원자적으로 발행합니다. |
+| **`bin/dispatch.sh`** | **작업 디스패처**. 4계층 세션명 자동 해석(환경변수 `SESSION_NAME` 권장, 런타임 마커, 현재 tmux 세션, config 기본값) 및 v2 마커 검증 후, 고유 작업 ID 발급 및 실행 프롬프트 사본(`$task_dir/prompt.md`) 생성 시 체인 컨텍스트 헤더(< 1KB) 자동 주입(`ACC_NO_BRIEF_HEADER=1`로 비활성화 가능, 헤더 포함 128KB 제한 검증). `oneshot` 모드에서는 `bin/run-task.sh` 명령을 주입하고, `resident` 모드에서는 1줄 도어벨 트리거(`Read and execute task prompt: ...`)를 주입합니다. `--dry-run` 안전 검증 플래그 지원. |
+| **`bin/run-task.sh`** | **워커 프로세스 러너 (oneshot 전용)**. 터미널 소유권 락(`terminal.lock`)을 획득하고 작업 상태를 `running`으로 전이한 뒤, 지정된 어댑터를 실행합니다. 실행 완료 시 성공/실패 여부에 따라 `task.done` 또는 `task.error` 이벤트를 원자적으로 발행합니다. |
+| **`bin/agy-stop-hook.sh`** | **agy Stop 훅 핸들러 (resident 전용)**. Antigravity CLI의 `Stop` 라이프사이클 훅으로부터 stdin JSON을 수신하여 `fullyIdle: true` 여부 및 서브에이전트 여부를 판별합니다. `terminal.lock` 멱등성을 보장하며 원자적 `done` 또는 `error` 이벤트를 Outbox에 발행하고 작업 상태와 `workers/agy.busy`를 안전하게 정리합니다. |
 | **`adapters/agy-oneshot.sh`** | **agy 단발 실행 어댑터**. Antigravity CLI를 비대화형 단발 모드로 구동하여 명세된 프롬프트를 수행합니다. 메인 턴에서 `invoke_subagent` 도구를 통해 워커 서브에이전트를 기동·취합하고 종료합니다. |
 | **`adapters/codex-oneshot.sh`** | **Codex 단발 실행 어댑터**. `codex exec` 기반으로 단발성 설계/코딩 작업을 수행합니다. |
 
@@ -162,6 +163,49 @@ v2 Full-Push 아키텍처는 기계적 신뢰성(Durable Outbox)과 사람/감�
 - **원본 보존**: 사용자가 지정한 원본 프롬프트 파일은 절대 변경되지 않으며, 태스크 실행 사본에만 헤더가 합성됩니다.
 - **비활성화 스위치**: 환경변수 `ACC_NO_BRIEF_HEADER=1`을 설정하고 디스패치하면 헤더 주입이 비활성화됩니다.
 - **128KB 크기 가드**: 헤더가 합성된 최종 프롬프트 크기는 Linux `ARG_MAX` 및 모델 입력 한도를 준수하기 위해 128KB(131,072 바이트) 이내로 검증되며 초과 시 즉시 거부(`exit 65`)됩니다.
+
+### 2.8 Resident TUI 브리지 (Stage 1: agy 상주 + codex oneshot)
+
+과제 `T0924-09`에서 구현된 Resident TUI 브리지 Stage 1은 사용자가 직접 agy 창을 터미널에서 관찰할 수 있도록 대화형 TUI 상주를 지원하면서, 기존 Full-Push v2 브리지의 무폴링 통지 및 안전망을 100% 결합한 하이브리드 아키텍처입니다:
+
+1. **워커 모드 분기 (Worker Mode Resolution)**:
+   - 기본값은 `WORKER_MODE=oneshot`으로 100% 무회귀 원복 경로를 유지합니다.
+   - 개별 워커별로 `AGY_MODE=resident` 및 `CODEX_MODE=oneshot`을 설정할 수 있습니다.
+2. **도어벨과 페이로드 분리 (Doorbell vs Payload Separation)**:
+   - 디스패처(`bin/dispatch.sh`)는 프롬프트 전문과 헤더를 `$ACC_RUNTIME/tasks/<task_id>/prompt.md` 파일에 기록하고, `workers/agy.busy`를 선점합니다.
+   - tmux 창에는 오직 1줄 도어벨(`Read and execute task prompt: $task_dir/prompt.md`)만 주입하여 개행 폭주와 터미널 버퍼 오염을 원천 방지합니다.
+3. **무폴링 완료 통지 (Native Stop Hook + fullyIdle)**:
+   - agy가 작업을 수행하는 동안 서브에이전트 구동 턴에서는 `fullyIdle: false`이므로 훅이 대기합니다.
+   - 모든 서브에이전트가 완료되고 메인이 요약을 마치면 `fullyIdle: true`로 `bin/agy-stop-hook.sh`가 발동하여 `bin/event-emit.sh`를 통해 Outbox와 FIFO에 원자적 `done` 이벤트를 주입합니다.
+   - `terminal.lock` 기반 멱등성 보장으로 중복 통지를 차단하며, `workers/agy.busy`가 없는 상태의 `/clear`나 수동 입력은 이벤트를 발행하지 않습니다.
+   - **Fail-Closed 4중 가드 원칙 (Hook Fail-Closed Rules)**:
+     1. `ACC_RUNTIME` 환경변수가 명시적으로 지정되어 있고 디렉토리이며, `workers/agy.resident` 마커 파일이 존재할 때만 진입 (런타임 추측/config.env 폴백 전면 제거).
+     2. `workers/agy.resident` 내 기록된 `pane_id`와 hook 실행 환경의 `TMUX_PANE`이 일치할 때만 진입 (상주 창 이외 agy 프로세스의 Stop 훅 오반응 차단).
+     3. 활성 작업 상태 파일(`state`) 내 `mode=resident` 및 `status=running`이 모두 만족될 때만 이벤트 발행 (oneshot 작업이나 이미 완료된 작업 오반응 차단).
+     4. 상기 조건 미충족 시 무작업(no-op)으로 `{"decision":"allow"}`를 표준 출력하고 파일 변조 없이 즉시 안전 종료.
+4. **프로젝트 비침범 머신 전역 훅 구성 (Zero Project Pollution)**:
+   - 대상 프로젝트 리포지토리에 `.agents/hooks.json`을 강제하지 않고, 머신 전역 위치인 `~/.gemini/config/hooks.json`의 독립 키(`"agent-command-chain-bridge"`)를 활용하여 다중 프로젝트에 무침범 적용됩니다.
+5. **상주 감시 워치독 (`watchdog-v2.sh`)**:
+   - 상주 워커 창의 커맨드가 TUI에서 이탈(`pane_current_command != worker`)하거나 PID가 소멸할 경우 `process_exit`로 원자적 수거(reap)를 수행합니다.
+   - Antigravity CLI 트랜스크립트(`transcript_full.jsonl`)의 `mtime`을 무폴링 활동 신호로 채택하여 비정상 정체(`NO_OUTPUT_WARN_SECONDS`)를 정밀 감시합니다.
+   - `SIGSTOP` 시그널로 일시정지된 프로세스를 사망(reap)으로 오인하지 않고 `stalled` 정체 경고 이벤트를 발행합니다.
+   - 명시적 `ACC_RUNTIME` 인자 누락 시 fail-closed 거부하여 운영 런타임 오염을 원천 차단합니다.
+6. **단순 `/clear` 및 1줄 재무장**:
+   - 다단 핸드셰이크 없이 유휴 상태(`busy` 부재)에서 `/clear` 후 1줄 재무장 프롬프트(`ACC_ROLE:...`)를 주입하여 대화 맥락을 즉시 소거하고 역할을 재장착합니다.
+
+### 2.9 테스트 하네스 격리 규약 및 운영 런타임 보호 체계 (Test Harness Isolation & Live Protection)
+
+과제 `T0924-09`에서 발생한 운영 런타임 변조 사고를 교훈 삼아, `tests/` 하네스는 완전한 격리 실행 및 엄격한 무오염 단언 체계를 구축했습니다 (`tests/lib-isolated-env.sh`):
+
+1. **깨끗한 실행 환경 강제 (`run_clean`)**:
+   - 모든 테스트 명령은 `env -i PATH="$PATH" HOME="$TEST_HOME" ...`로 부모 프로세스로부터 상속된 환경변수를 100% 제거한 뒤, 명시적으로 허용된 변수만 주입하여 실행합니다.
+2. **동적 마커 검증 (`TESTMARK-<random>`)**:
+   - 매 테스트 실행마다 암호학적 난수 기반 마커(`TESTMARK-<random>`)를 발급하여 모든 페이로드, 프롬프트, 요약문에 삽입합니다.
+   - **Guard Check 2**: 테스트 시작 및 teardown 시 실제 운영 런타임(`$LIVE_RT`) 전체를 대상으로 `grep -r "$TESTMARK" "$LIVE_RT"`를 수행하여 일치 건수가 **정확히 0건**이어야 함을 단언하며, 단 1건이라도 발견 시 즉시 테스트를 실패 처리합니다.
+3. **런타임 경로 오버랩 원천 차단 (Guard Check 1)**:
+   - 임시 런타임 경로가 운영 런타임(`$LIVE_RT`)과 같거나 그 하위 디렉토리인 경우 테스트를 즉시 abort합니다.
+4. **독립 tmux 세션 격리 및 자동 정리**:
+   - 모든 tmux 명령은 `-t <session_name>`을 강제하며, 테스트 세션(`acc-t0924-10-<rand>`)은 trap에 의해 EXIT/INT/TERM 발생 시 즉각 자동 회수됩니다.
 
 ---
 

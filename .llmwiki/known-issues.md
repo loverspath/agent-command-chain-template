@@ -119,3 +119,82 @@ summary: Remote Control(RC) 전제조건, agy-Codex 자동 연동 부재, v1/v2 
      상주 대화형 TUI 구조를 공식 폐기(legacy)하고, `WORKER_MODE=oneshot`의 단발 실행기(`adapters/agy-oneshot.sh`)로 전환. 워커 창은 유휴 셸(`bash`)로 대기하며, 매 디스패치마다 독립 프로세스로 기동되어 `invoke_subagent`로 서브에이전트를 생성/취합하고 정상 종료함.
   2. **직접 작업 엄격 금지 규칙 확립**:
      경량 작업이라도 agy 메인의 직접 Read/Edit/Bash를 금지하고 제어면(라우팅/취합/보고)만 전담하도록 지침 정합화. 소환 실패 시 `[[BLOCKED]]`로 상위에 즉시 에스컬레이션.
+
+---
+
+## 9. 상주 워커 창 직접 타이핑 위험 (Human Typing Hazard)
+
+- **메타데이터**:
+  - `root-cause`: `operational-hazard` / `human-interference`
+  - `verified_with`: 2026-09-24
+- **위험 내용**:
+  - `AGY_MODE=resident` (또는 Stage 2의 Codex 상주) 환경에서 워커 tmux 창은 상시 대화형 TUI(composer 입력창)로 대기한다.
+  - 인간 관찰자가 `tmux attach`로 세션에 진입하여 워커 창에 키보드로 직접 문자열을 입력하거나 수정 중인 상태에서 자동화 디스패치가 도달하면 다음과 같은 치명적 왜곡이 발생할 수 있다:
+    1. **입력 버퍼 오염 (Composer Corruption)**: 사용자가 타이핑 중이던 미완성 텍스트와 디스패처의 1줄 도어벨(`Read and execute task prompt: ...`)이 합쳐져 비정상 프롬프트로 전송됨.
+    2. **비인가 수동 실행 및 상태 불일치**: 사용자가 워커 창에서 직접 엔터를 눌러 프롬프트를 실행할 경우, `workers/<worker>.busy` 및 `tasks/<id>/state`가 기록되지 않은 상태이므로 `Stop` 훅은 fake `done` 발행을 안전하게 차단하지만 에이전트의 대화 맥락이 오염됨.
+- **방어 및 운용 규약**:
+  - **디스패치 단계 선행 검증 (Input Interleaving Guard)**: `dispatch.sh`는 디스패치 전 대상 창이 상주 TUI 상태인지(`cur_cmd == worker`) 및 이전 작업의 `busy` 파일이 부재한지 검증하여, 최소한 자동화 에이전트 간 중복 입력은 원천 차단한다.
+  - **인간 관찰자 운용 수칙**: 사람 운영자가 상주 세션을 관찰할 때는 **읽기 전용 모드(`tmux attach -r -t <session>`)**로 접속하거나 `sonnet` 창을 통해서만 감사하며, 워커 창(`agy`, `codex`) 내부에서 임의의 키보드 입력을 전송하지 않아야 한다.
+
+---
+
+## 10. 테스트 하네스 런타임 오염 사고 및 훅/테스트 환경 격리 규약 (T0924-09/T0924-10)
+
+- **메타데이터**:
+  - `root-cause`: `test-harness-isolation` / `hook-fail-open`
+  - `verified_with`: 2026-09-24
+- **증상 및 사고 경위 (Live Pollution Incident)**:
+  - T0924-09 수행 중 테스트 하네스가 상위 세션으로부터 상속받은 `ACC_RUNTIME` 환경변수(= 실제 라이브 운영 런타임 `runtime/agentchain-v2-153d25bc`)를 정제하지 않고 테스트를 실행함.
+  - `bin/agy-stop-hook.sh`가 `ACC_RUNTIME` 부재 시 `resolve_session_and_runtime`으로 임의의 런타임에 부착되는 fail-open 결함과 결합하여, 실제 운영 태스크의 상태를 `error`로 덮어쓰고 `workers/agy.busy` 및 `lock`을 삭제하는 심각한 운영 런타임 오염 사고가 발생함.
+  - 당시 보고서에서는 런타임 무오염을 허위 보고하였으나, 실측 감사 결과 운영 런타임 변조가 적발됨.
+- **근본 원인 (Root Cause)**:
+  1. **`bin/agy-stop-hook.sh` fail-open 결함**:
+     - `ACC_RUNTIME` 미지정 시 폴백 해석으로 라이브 세션에 자동 부착.
+     - task의 `mode=resident` 여부를 확인하지 않아 oneshot 작업에도 오반응.
+     - `TMUX_PANE`을 확인하지 않아 v1 TUI/서브에이전트/oneshot agy의 Stop 훅에도 오반응.
+  2. **테스트 하네스 미격리 (`test-harness-isolation`)**:
+     - 테스트 스크립트 실행 시 환경변수 미정제(`env -i` 부재).
+     - 실시간 운영 런타임 변조 감지 및 단언(`TESTMARK` grep assertion) 부재.
+- **해결책 및 격리 규약 (Fix & Isolation Protocol)**:
+  1. **훅 Fail-Closed 원칙 (Hook Fail-Closed Rules)**:
+     - `bin/agy-stop-hook.sh`는 `ACC_RUNTIME`이 명시적으로 설정되어 있고 디렉토리이며, `workers/agy.resident` 마커 파일이 존재할 때만 실행.
+     - `workers/agy.resident` 내 `pane_id`와 환경변수 `TMUX_PANE`이 일치할 때만 실행.
+     - 작업 상태 파일(`state`)에 `mode=resident`와 `status=running`이 명시되어 있을 때만 이벤트 발행.
+     - 그 외 모든 예외/부적합 상황에서는 무작업(no-op)으로 `{"decision":"allow"}`를 반환하고 즉시 안전 종료.
+  2. **테스트 하네스 격리 규약 (Test Harness Isolation Rules)**:
+     - 모든 테스트는 `env -i PATH="$PATH" HOME="$TMP/home" ...`로 깨끗한 환경에서 명시적 변수만 주입하여 실행 (`tests/lib-isolated-env.sh`).
+     - 각 테스트는 고유 마커 `TESTMARK-<random>`을 생성하여 페이로드에 포함.
+     - **Guard Check 1**: 임시 런타임 경로가 운영 런타임(`$LIVE_RT`)과 동일하거나 하위 디렉토리이면 즉시 abort.
+     - **Guard Check 2**: 테스트 시작 및 teardown 시 운영 런타임 내 `TESTMARK` 검색 결과가 정확히 0건이어야 함을 단언 (0건 초과 시 즉시 테스트 실패). 플레인 텍스트뿐만 아니라 `summary_b64=` 등 Base64 인코딩 패턴도 함께 검사.
+     - **Guard Check 3 (운영 런타임 시그니처 대조 - 필수)**:
+       - **함정 (Pitfall)**: 단순 플레인 텍스트 마커 grep만으로는 Base64 인코딩 필드(`summary_b64`, `detail_path_b64`) 및 훅이 무시하는 페이로드 필드에 마커가 위치할 경우 운영 런타임 누수를 탐지하지 못하고 놓치는 심각한 맹점이 존재함. 따라서 운영 런타임 시그니처 대조(`workers/`, `tasks/*/state`, `events/` 목록, 설정 파일 해시)는 필수 불가결한 검증 규약임.
+       - 테스트 시작 시점의 스냅샷과 테스트 종료 시점의 스냅샷을 대조하여 `workers/`, `tasks/*/state`, `events/`, 설정 파일(`bootstrap_version`, `session_name`, `claude-bridge.settings.json`)이 1바이트라도 변조되면 즉시 실패 처리. 진행 중인 running task가 있는 경우 정상 완료 상태 전이에 대한 오탐을 방지하기 위해 경고 출력 후 예외를 인정하되, `workers/` 및 다른 task들의 상태는 엄격히 불변을 대조함.
+
+---
+
+## 11. 실제 agy 측정/탐색 실행의 사용자 홈 오염 사고 및 격리 래퍼 규약 (T0924-12/T0924-13)
+
+- **메타데이터**:
+  - `root-cause`: `test-harness-isolation` / `unisolated-measurement`
+  - `verified_with`: 2026-09-24
+- **증상 및 사고 경위 (Home Config Pollution Incident)**:
+  - T0924-12 (Round 3) 수행 중 F8 측정 실행(CLI 옵션 및 TUI 동작 계측)이 임시 HOME 없이 실제 사용자 환경에서 직접 실행됨.
+  - 그 결과 실제 사용자 홈 `~/.gemini/config/projects/`에 등록 파일 3개가 무단 생성되는 오염이 발생함 (감독자가 사후 수동 삭제함).
+  - 당시 보고서는 `settings.json` 및 `hooks.json`의 불변만 확인하고 "zero pollution"으로 오판 보고하였으나, `~/.gemini/config/` 전체를 검사하지 않아 발생한 맹점이었음.
+  - 또한 E2E 실행 중 작업 대상 파일 경로가 상대 경로(`Create file a.txt in project dir...`)로 주어져, 서브에이전트가 디스패치 헤더의 `TEMPLATE_ROOT`(리포 루트)에 `a.txt`, `b.txt`를 생성하는 리포 오염 결함도 함께 확인됨.
+- **근본 원인 (Root Cause)**:
+  1. **실제 agy 직접 호출 시 임시 HOME 부재**: 계측/탐색 실험을 격리 하네스 래퍼 없이 직접 셸에서 실행.
+  2. **검증 범위 협소**: `settings.json`만 검사하고 `~/.gemini/config/` 전체 트리 및 리포지토리 파일 생성 여부를 감시하지 않음.
+- **해결책 및 격리 규약 (Fix & Isolation Protocol)**:
+  1. **실제 agy 격리 실행 래퍼 필수화 (`run_real_agy_isolated`)**:
+     - 측정, 탐색, E2E 등 실제 Antigravity CLI를 호출하는 모든 실행은 **반드시** `lib-isolated-env.sh`의 `run_real_agy_isolated`를 통해서만 수행해야 한다.
+     - `HOME`이 실제 홈이거나 임시 경로(`/tmp/`) 하위가 아니면 즉시 abort(`exit 99`).
+     - 실제 OAuth 토큰은 임시 HOME에 **심볼릭 링크**로만 마운트하며(복사 금지), 토큰 내용의 출력/노출은 엄격히 금지된다.
+  2. **Gemini 전역 설정 전체 트리 스냅샷 대조 (`Guard Check 5`)**:
+     - 테스트 전후에 실제 `~/.gemini/config/` 전체(파일 목록+크기+해시; `projects/` 포함)와 `~/.gemini/antigravity-cli/`의 설정류를 스냅샷 대조하여 1바이트라도 변경 시 즉시 실패 처리.
+     - 단, 인증 토큰(`antigravity-oauth-token`)은 존재 여부 및 심볼릭 링크 대상만 대조하고 크기/해시/mtime은 무시하여 agy의 정상적인 OAuth 토큰 자동 갱신을 허용.
+  3. **리포지토리 무오염 단언 (`Guard Check 4`) 및 절대경로 지정**:
+     - E2E 및 모든 디스패치 프롬프트에서 작업 대상 파일은 반드시 절대 경로(`$TEST_PROJ/a.txt` 등)로 명시.
+     - 테스트 전후 리포지토리의 `git status --porcelain --ignored=no`를 대조하여 새 파일이 검출되면 즉시 실패 처리.
+  4. **보고서 규칙 (H4)**:
+     - "무접촉 / zero pollution" 표현은 전역 설정 및 리포지토리 스냅샷 대조 출력(전후 동일 입증 증빙)을 첨부할 때만 사용 가능.
