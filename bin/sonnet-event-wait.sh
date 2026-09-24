@@ -10,10 +10,18 @@ if [[ -f "$HERE/config.env" ]]; then
   source "$HERE/config.env"
 fi
 
-session_safe="$(printf '%s' "${SESSION_NAME:-agentchain}" | tr -cd '[:alnum:]_-')"
-proj_hash="$(printf '%s' "${PROJECT_DIR:-$PWD}" | md5sum | cut -c1-8)"
-default_runtime="$HERE/runtime/${session_safe}-${proj_hash}"
-runtime="${2:-${ACC_RUNTIME:-$default_runtime}}"
+CONFIG_SESSION_NAME="${SESSION_NAME:-agentchain}"
+
+if [[ -n "${2:-}" ]]; then
+  runtime="$2"
+elif [[ -n "${ACC_RUNTIME:-}" ]]; then
+  runtime="$ACC_RUNTIME"
+else
+  # shellcheck disable=SC1091
+  source "$HERE/lib/session.sh"
+  resolve_session_and_runtime "sonnet-event-wait" "" true
+  runtime="$ACC_RUNTIME"
+fi
 
 pending="$runtime/events/pending"
 inflight="$runtime/events/inflight"

@@ -15,13 +15,13 @@
 |---|---|---|---|
 | **0. 사용자** | 사람 | 최종 의사결정, 승인 | RC로 Sonnet 세션에 원격 개입 |
 | **1. 감독/디스패치** | Claude Sonnet | 모니터링·감사, 작업 디스패치, 루프 관리, RC(원격제어) | 사람과의 상시 소통 창구. **사용자가 직접 요청하지 않는 한 실질 작업(문서/코드 작성/조사)은 스스로 하지 않고 agy/codex에 위임** |
-| **2. 라우터 겸 워커 총괄** | agy (Gemini 3.8 Flash) | 난이도 판단(hard routing) 및 서브에이전트 위임·총괄 | **메인 세션 직접 작업(Read/Bash/Edit) 금지 및 서브에이전트(--agent) 위임.** 상위(Sonnet) 인터럽트 수신 대기 상태(responsive state) 유지. 소환 불가/실패 시 직접 처리 금지 및 Sonnet에 명시 보고 |
+| **2. 라우터 겸 워커 총괄** | agy (Gemini 3.8 Flash) | 난이도 판단(hard routing) 및 서브에이전트 위임·총괄 | **메인 세션 직접 작업(Read/Bash/Edit) 금지 및 서브에이전트(`invoke_subagent`) 위임.** v2 단발 실행(oneshot 한 턴) 라우팅. 소환 불가/실패 시 직접 처리 금지 및 `[[BLOCKED <id>]] reason=subagent-unavailable\|needs-terra` 보고. (v1 상주 TUI responsive state는 legacy) |
 | **2-내부 Tier 2** | Codex Terra | 중난이도 작업의 설계 및 직접 수행 | 별도 tmux 창(§2). agy가 자동 호출하진 않음 — 아래 "한계" 참고 |
 | **2-내부 Tier 3** | Sol / Opus | 최고난도 문제, 전체 플래닝 상담 | 상시 창 없음. 필요할 때 codex 창의 커맨드를 `--model gpt-5.6-sol`로 바꿔 send-keys, 또는 claude 쪽은 `--model opus`로 즉석 실행 |
 
 핵심 원칙:
 1. **계층 1 Sonnet(감독)은 사람과의 상시 소통 창구이자 agy/codex의 모니터링·감사가 주 역할이다.** 사용자가 Sonnet에게 직접 수행하라고 명시적으로 요구하지 않는 한, 문서 작성/코드 작성/조사 같은 실질적인 작업은 스스로 직접 처리하지 않고 agy 또는 codex(Terra/Sol)에 위임해야 한다.
-2. **계층 2 agy(메인 세션) 역시 자신이 직접 Read/Bash/Edit 등의 툴을 호출해 파일 읽기/쓰기/수정 작업에 몰입하지 말고, 서브에이전트(`--agent`)를 소환해 워커로 위임해야 한다.** agy 메인 세션의 존재 이유는 상위 감독자(Sonnet)의 추가 지시나 인터럽트를 언제든 즉시 수신할 수 있는 대기 상태(responsive state)를 유지하고, 지시/취합/보고를 총괄하는 데 있다. 서브에이전트 소환이 불가능하거나 실패하면 조용히 메인 세션이 직접 처리하지 말고 그 사실을 상위(Sonnet)에 명시 보고해야 한다.
+2. **계층 2 agy는 v2 Full-Push 환경에서 `WORKER_MODE=oneshot`의 단발 실행 한 턴으로 기동되며, 자신이 직접 Read/Bash/Edit 등의 툴을 호출해 파일 읽기/쓰기/수정 작업에 몰입하지 말고 내장 도구 `invoke_subagent`를 호출해 서브에이전트에 실작업을 위임해야 한다 (경량 작업 예외 없음).** 서브에이전트 소환이 불가능하거나 실패하면 조용히 직접 처리하지 말고 즉시 `[[BLOCKED <id>]] reason=subagent-unavailable|needs-terra`로 보고하여 Sonnet이 Codex Terra 등으로 재라우팅할 수 있게 해야 한다. (참고: v1의 "상주 대화형 TUI 라우터/responsive state"는 legacy이며, Antigravity TUI의 비선점형 입력 큐잉(`queued messages`)으로 인해 직접 툴 루프 시 상위 지시가 지연되는 문제가 확인되어 v2 유휴 셸 + oneshot 구조로 전환됨)
 
 핵심 단순화: **Sonnet은 agy와 codex(Terra) 두 창만 직접 본다.** Sol/Opus는
 상시 프로세스가 아니라 필요할 때만 커맨드를 바꿔 일회성으로 부르는 대상
@@ -66,7 +66,8 @@ v2는 tmux의 pull 모델(화면 스크래핑/폴링)의 지연과 불안정성�
 | | `bin/event-emit.sh` | 원자적 이벤트 스풀링(Durable Outbox) 및 FIFO 펄스 전송 |
 | | `bin/sonnet-event-wait.sh` | Claude Code asyncRewake 전용 FIFO 이벤트 대기 어댑터 (exit 2로 기상) |
 | | `bin/event-ack.sh` | 처리 완료된 이벤트의 archive 이동 및 FIFO 드레인 |
-| | `bin/dispatch.sh` | 파일 기반 작업 명세(`runtime/tasks/<id>/spec.json`) 생성 및 워커 창 1줄 실행 커맨드 주입 |
+| | `bin/dispatch.sh` | 작업 디스패처 (4계층 세션 자동 해석, v2 마커 검증, `--dry-run` 지원) |
+| | `lib/session.sh` | 세션명 자동 해석 및 v2 런타임/마커 검증 공통 라이브러리 |
 | | `bin/run-task.sh` | 커널 자동 해제형 terminal flock 기반 워커 프로세스 실행 및 상태/이벤트 발행 |
 | | `adapters/agy-oneshot.sh` | agy 단발 실행기 어댑터 |
 | | `adapters/codex-oneshot.sh` | Codex 단발 실행기 어댑터 |
@@ -90,11 +91,14 @@ cd /path/to/your/actual/project      # 지금부터 이 디렉토리가 대상�
 # [기본 권장 경로: v2 Full-Push 이벤트 통지 브리지]
 ~/agent-command-chain-template/bootstrap-v2.sh    # 세션 기동 + 런타임/FIFO 준비 + watchdog-v2 자동 기동 (START_WATCHDOG=true 기본값)
 
+# [작업 디스패치: 세션명 명시 권장]
+SESSION_NAME=agentchain-v2 ~/agent-command-chain-template/bin/dispatch.sh agy --prompt-file /path/to/prompt.md
+
 # [폴백/레거시 경로: v1 순수 pull 브리지]
 # ~/agent-command-chain-template/bootstrap.sh
 # ~/agent-command-chain-template/watchdog.sh &
 
-tmux attach -t agentchain                          # 직접 들어가서 보고 싶을 때
+tmux attach -t agentchain-v2                       # 직접 들어가서 보고 싶을 때 (v2 세션)
 ```
 
 ## 5. 알려진 한계 (초안 단계)

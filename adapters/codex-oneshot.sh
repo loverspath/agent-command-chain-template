@@ -14,6 +14,7 @@ project_dir="${PROJECT_DIR:-$PWD}"
 
 exec codex exec \
   --model "${CODEX_MODEL:-gpt-5.6-terra}" \
+  --skip-git-repo-check \
   -s danger-full-access \
   -C "$project_dir" \
   - <"$prompt_file"

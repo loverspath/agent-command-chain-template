@@ -48,23 +48,62 @@ cp config.env.example config.env
 # 1. 작업 대상 프로젝트 디렉토리로 이동
 cd /path/to/your/actual/project
 
-# 2. 부트스트랩 스크립트 실행 (tmux 세션 및 3개 창 기동 + 신뢰 확인 자동 처리 + 브리핑 전달)
-~/agent-command-chain-template/bootstrap.sh
+# 2. [기본 권장] v2 부트스트랩 스크립트 실행 (Full-Push 브리지 + 런타임/마커 초기화 + 워치독 v2 자동 백그라운드)
+~/agent-command-chain-template/bootstrap-v2.sh
 
-# 3. (선택) 워치독 백그라운드 기동
-~/agent-command-chain-template/watchdog.sh &
+# 3. [폴백/레거시] v1 부트스트랩 실행
+# ~/agent-command-chain-template/bootstrap.sh
+# ~/agent-command-chain-template/watchdog.sh &
 
 # 4. 세션 직접 확인 (필요한 경우)
-tmux attach -t agentchain
+tmux attach -t agentchain-v2
 ```
 
 ---
 
-## 3. tmux 관찰 및 제어 명령어
+## 3. 제어 및 관찰 명령어
 
+### 작업 디스패치 (v2 Full-Push 권장)
+v2 아키텍처에서 상위 감독자(Sonnet)나 사용자는 파일 기반 1줄 주입 도구인 `dispatch.sh`를 통해 워커에 작업을 지시한다.
+세션 오조준 방지를 위해 **`SESSION_NAME=<세션명>`을 명시하는 것을 강력 권장**한다 (생략 시 4계층 우선순위: 환경변수 → 런타임 마커 → 현재 tmux 세션 → config 기본값으로 자동 해석):
+
+```bash
+# agy에게 작업 지시 (비대화형 oneshot)
+SESSION_NAME=agentchain-v2 ./bin/dispatch.sh agy --prompt-file /path/to/prompt.md
+
+# codex에게 작업 지시 (비대화형 oneshot)
+SESSION_NAME=agentchain-v2 ./bin/dispatch.sh codex --prompt-file /path/to/prompt.md --timeout 1800
+
+# 인라인 프롬프트 지시
+SESSION_NAME=agentchain-v2 ./bin/dispatch.sh agy --prompt "프로젝트 디렉토리 구조를 분석하라."
+
+# 사전 안전 검증 (dry-run, 작업 디스패치 없이 세션/프로세스 유휴 상태 확인)
+SESSION_NAME=agentchain-v2 ./bin/dispatch.sh agy --dry-run
+```
+
+#### 체인 컨텍스트 헤더 및 비활성화 (`ACC_NO_BRIEF_HEADER=1`)
+`dispatch.sh`는 워커가 체인 규칙(`ROLES.md`) 및 체인 위키(`INDEX.md`)를 즉시 인지할 수 있도록, 디스패치 실행 사본(`$task_dir/prompt.md`) 앞에 1KB 미만의 경량 체인 컨텍스트 헤더를 자동으로 prepend합니다 (사용자 원본 프롬프트는 불변).
+헤더 주입을 비활성화하고 순수 프롬프트만 전달하려면 환경변수 `ACC_NO_BRIEF_HEADER=1`을 설정합니다:
+
+```bash
+# 컨텍스트 헤더 없이 순수 프롬프트로 디스패치
+ACC_NO_BRIEF_HEADER=1 SESSION_NAME=agentchain-v2 ./bin/dispatch.sh agy --prompt-file /path/to/prompt.md
+```
+
+### 처리 완료 이벤트 확인 및 아카이빙 (v2)
+Sonnet이 비동기 기상(`asyncRewake`) 리마인더를 수신한 후 이벤트를 확인하고 보관 처리한다:
+
+```bash
+# 이벤트 아카이브 (런타임 경로 생략 시 자동 해석 지원)
+SESSION_NAME=agentchain-v2 ./bin/event-ack.sh <batch_id>
+# 또는 명시적 런타임 전달
+./bin/event-ack.sh "$ACC_RUNTIME" <batch_id>
+```
+
+### v1 레거시 관찰 및 수동 주입 (순수 pull 폴백)
 컨트롤러(사람 또는 Sonnet의 Bash 툴)는 표준 tmux 명령을 통해 각 창의 상태를 파악하고 지시를 내린다.
 
-### 스냅샷 읽기 (Pull)
+#### 스냅샷 읽기 (Pull)
 터미널 창의 현재 텍스트 스냅샷을 덤프한다:
 
 ```bash
@@ -78,8 +117,8 @@ tmux capture-pane -t agentchain:codex -p
 tmux capture-pane -t agentchain:sonnet -p
 ```
 
-### 실시간 스트림 로깅 (Async 감지)
-`pipe-pane`을 활성화하면 터미널 출력이 실시간으로 지정 파일에 추가된다. 상위 컨트롤러가 로그 파일을 tail 감시(Monitor 툴)할 수 있다:
+#### 실시간 스트림 로깅 (Async 감지)
+`pipe-pane`을 활성화하면 터미널 출력이 실시간으로 지정 파일에 추가된다:
 
 ```bash
 # agy 창의 실시간 출력을 로그 파일로 파이프
@@ -89,7 +128,7 @@ tmux pipe-pane -o -t agentchain:agy 'cat >> logs/agy.pane.log'
 tmux pipe-pane -o -t agentchain:codex 'cat >> logs/codex.pane.log'
 ```
 
-### 명령 주입 (Push)
+#### 수동 명령 주입 (Push)
 지정된 윈도우에 키 입력을 주입한다 (`C-m`은 Enter 키에 해당):
 
 ```bash
@@ -110,15 +149,16 @@ tmux send-keys -t agentchain:codex "Specification 문서를 확인하고 테스�
 agy 창에 최초 프롬프트를 주입할 때 한계 상황 시의 보고 규칙을 명시한다:
 
 ```text
-너는 이 프로젝트의 구현 에이전트(메인 세션)다. 먼저 현재 작업 디렉토리와 프로젝트 정체성을 보고해라.
+너는 이 프로젝트의 라우터 에이전트다. 먼저 현재 작업 디렉토리와 프로젝트 정체성을 보고해라.
 스스로 처리하기 벅찬 하위 작업이 있으면 직접 호출하지 말고 결과 보고에
 "Terra급 작업 필요: ..." 라고 명시해서 Sonnet이 codex 창으로 넘길 수 있게 해라.
 
-[핵심 원칙: 메인 세션 직접 작업 금지 및 서브에이전트 위임]
-- 너 자신(메인 세션)은 직접 Read/Bash/Edit 등의 툴을 호출해 파일 작업에 몰입하지 마라.
-- agy CLI의 `--agent` 서브에이전트 기능으로 워커를 소환해 실작업을 위임하고, 지시/취합/보고만 총괄해라.
-- 네 존재 이유는 상위 감독자(Sonnet)의 추가 지시나 인터럽트를 언제든 즉시 수신할 수 있는 대기 상태(responsive state)를 유지하는 데 있다.
-- 서브에이전트 소환이 불가능하거나 실패하면 조용히 메인 세션이 직접 처리하지 말고 상위(Sonnet)에 명시 보고해라.
+[v2 핵심 원칙: oneshot 단발 턴 내 invoke_subagent 위임 및 직접 작업 금지]
+- 너의 실행 단위는 WORKER_MODE=oneshot의 단발 실행 한 턴이다.
+- 너 자신(메인 세션)은 직접 Read/Edit/Bash 등의 툴을 호출해 파일 작업에 몰입하지 마라 (경량 작업 예외 없음).
+- 내장 도구 invoke_subagent를 호출해 워커 서브에이전트에게 실작업을 위임하고, 지시/취합/보고만 총괄해라.
+- 서브에이전트 소환이 불가능하거나 실패하면 조용히 직접 처리하지 말고 [[BLOCKED <id>]] reason=subagent-unavailable|needs-terra 로 상위(Sonnet)에 명시 보고해라.
+(참고: v1 상주 TUI의 responsive state 대기는 legacy이며, TUI 비선점형 입력 큐잉 지연 방지를 위해 v2 oneshot으로 전환됨)
 ```
 
 ### 단계 2: Sonnet의 관찰 및 판단

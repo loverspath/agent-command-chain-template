@@ -4,16 +4,21 @@ umask 077
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+ENV_SESSION_NAME="${SESSION_NAME:-}"
+ENV_ACC_RUNTIME="${ACC_RUNTIME:-}"
+
 if [[ -f "$HERE/config.env" ]]; then
   # shellcheck disable=SC1091
   source "$HERE/config.env"
 fi
+CONFIG_SESSION_NAME="${SESSION_NAME:-agentchain}"
 
-session_safe="$(printf '%s' "${SESSION_NAME:-agentchain}" | tr -cd '[:alnum:]_-')"
-proj_hash="$(printf '%s' "${PROJECT_DIR:-$PWD}" | md5sum | cut -c1-8)"
-default_runtime="$HERE/runtime/${session_safe}-${proj_hash}"
+# shellcheck disable=SC1091
+source "$HERE/lib/session.sh"
+
 if [[ $# -eq 1 ]]; then
-  runtime="${ACC_RUNTIME:-$default_runtime}"
+  resolve_session_and_runtime "event-ack" "" false
+  runtime="$ACC_RUNTIME"
   batch="$1"
 elif [[ $# -ge 2 ]]; then
   runtime="$1"

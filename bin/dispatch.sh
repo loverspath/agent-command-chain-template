@@ -4,7 +4,7 @@ umask 077
 
 worker="${1:-}"
 if [[ -z "$worker" ]]; then
-  echo "Usage: $0 <agy|codex> [--timeout <seconds>] [--prompt-file <path> | --prompt <text>]" >&2
+  echo "Usage: $0 <agy|codex> [--timeout <seconds>] [--prompt-file <path> | --prompt <text>] [--dry-run]" >&2
   exit 64
 fi
 shift
@@ -25,22 +25,25 @@ if [[ -f "$HERE/config.env" ]]; then
   # shellcheck disable=SC1091
   source "$HERE/config.env"
 fi
+CONFIG_SESSION_NAME="${SESSION_NAME:-agentchain}"
 
-SESSION_NAME="${ENV_SESSION_NAME:-${SESSION_NAME:-agentchain}}"
+# shellcheck disable=SC1091
+source "$HERE/lib/session.sh"
+
 AGY_WINDOW="${ENV_AGY_WINDOW:-${AGY_WINDOW:-agy}}"
 CODEX_WINDOW="${ENV_CODEX_WINDOW:-${CODEX_WINDOW:-codex}}"
-
-session_safe="$(printf '%s' "$SESSION_NAME" | tr -cd '[:alnum:]_-')"
-proj_hash="$(printf '%s' "${PROJECT_DIR:-$PWD}" | md5sum | cut -c1-8)"
-default_runtime="$HERE/runtime/${session_safe}-${proj_hash}"
-runtime="${ENV_ACC_RUNTIME:-${ACC_RUNTIME:-$default_runtime}}"
 
 timeout="${DEFAULT_TASK_TIMEOUT:-1800}"
 prompt_file=""
 prompt_inline=""
+dry_run=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --dry-run)
+      dry_run=true
+      shift
+      ;;
     --timeout)
       timeout="$2"
       shift 2
@@ -76,7 +79,7 @@ if [[ -n "$prompt_file" && ! -f "$prompt_file" ]]; then
   echo "Error: Prompt file not found: $prompt_file" >&2
   exit 66
 fi
-if [[ -z "$prompt_file" && -z "$prompt_inline" && -t 0 ]]; then
+if [[ "$dry_run" == "false" && -z "$prompt_file" && -z "$prompt_inline" && -t 0 ]]; then
   echo "Error: No prompt provided (--prompt-file, --prompt, or stdin)" >&2
   exit 64
 fi
@@ -87,6 +90,10 @@ if [[ "$worker" == "agy" ]]; then
 elif [[ "$worker" == "codex" ]]; then
   target_window="${CODEX_WINDOW:-codex}"
 fi
+
+# 세션명 및 런타임 디렉토리 자동 해석 (우선순위: ①환경변수 -> ②런타임마커 -> ③현재tmux -> ④config기본값)
+resolve_session_and_runtime "dispatch" "$target_window" false
+runtime="$ACC_RUNTIME"
 
 # 세션 및 대상 윈도우 존재 확인
 if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
@@ -110,10 +117,18 @@ cur_cmd="$(tmux display-message -p -t "$SESSION_NAME:$target_window" '#{pane_cur
 case "$cur_cmd" in
   bash|zsh|sh|-bash|-zsh|-sh) ;;
   *)
-    echo "Error: Target window '$target_window' is running interactive TUI '$cur_cmd' instead of idle shell. Dispatch rejected." >&2
+    echo "Error: Target window '$target_window' in session '$SESSION_NAME' is running interactive TUI '$cur_cmd' instead of idle shell. Dispatch rejected." >&2
+    echo "Hint: If this is a v1 session, re-run with SESSION_NAME=<v2-session> (e.g. SESSION_NAME=agentchain-v2) to target the v2 idle worker shell." >&2
     exit 71
     ;;
 esac
+
+# 드라이런 요청 시 실제 작업 디스패치 없이 성공 종료
+if [[ "$dry_run" == "true" ]]; then
+  echo "[dry-run] Target window '$target_window' in session '$SESSION_NAME' is ready (current command: '$cur_cmd')."
+  echo "[dry-run] Task would be dispatched to $worker with timeout ${timeout}s."
+  exit 0
+fi
 
 # 워커 단일 활성 작업 원자적 락 획득 (이중 dispatch 방지)
 mkdir -p "$runtime/workers"
@@ -210,12 +225,48 @@ task_id="${worker}-$(date +%s%N)"
 task_dir="$runtime/tasks/$task_id"
 mkdir -p "$task_dir"
 
-if [[ -n "$prompt_file" ]]; then
-  cp "$prompt_file" "$task_dir/prompt.md"
-elif [[ -n "$prompt_inline" ]]; then
-  printf '%s\n' "$prompt_inline" >"$task_dir/prompt.md"
-elif [[ ! -t 0 ]]; then
-  cat >"$task_dir/prompt.md"
+brief_header=""
+if [[ "${ACC_NO_BRIEF_HEADER:-0}" != "1" ]]; then
+  target_project_dir="${PROJECT_DIR:-$PWD}"
+  brief_header="[CHAIN CONTEXT]
+TEMPLATE_ROOT: $HERE
+CHAIN_WIKI_INDEX: $HERE/.llmwiki/INDEX.md
+ROLES: $HERE/ROLES.md
+PROJECT_DIR: $target_project_dir
+SESSION_NAME: $SESSION_NAME
+TASK_ID: $task_id
+WORKER_RULES:
+- agy: oneshot router mode. Do not directly execute with Read/Edit/Bash. Delegate using invoke_subagent. If delegation fails, report [[BLOCKED <id>]].
+- codex: Project convention files (e.g. AGENTS.md) take precedence over chain rules for coding conventions.
+---
+"
+fi
+
+if [[ -n "$brief_header" ]]; then
+  printf '%s\n' "$brief_header" >"$task_dir/prompt.md"
+  if [[ -n "$prompt_file" ]]; then
+    cat "$prompt_file" >>"$task_dir/prompt.md"
+  elif [[ -n "$prompt_inline" ]]; then
+    printf '%s\n' "$prompt_inline" >>"$task_dir/prompt.md"
+  elif [[ ! -t 0 ]]; then
+    cat >>"$task_dir/prompt.md"
+  fi
+else
+  if [[ -n "$prompt_file" ]]; then
+    cp "$prompt_file" "$task_dir/prompt.md"
+  elif [[ -n "$prompt_inline" ]]; then
+    printf '%s\n' "$prompt_inline" >"$task_dir/prompt.md"
+  elif [[ ! -t 0 ]]; then
+    cat >"$task_dir/prompt.md"
+  fi
+fi
+
+# ARG_MAX 및 CLI 입력 방어를 위한 프롬프트 크기 사전 검증 (헤더 포함 128KB 제한)
+prompt_size="$(wc -c < "$task_dir/prompt.md")"
+if (( prompt_size > 131072 )); then
+  echo "Error: Prompt file exceeds maximum allowed size (128KB)" >&2
+  rm -rf "$task_dir"
+  exit 65
 fi
 
 # 작업 예약 마커 설정 및 락 해제

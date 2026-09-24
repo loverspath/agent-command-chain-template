@@ -83,6 +83,7 @@ ACC_RUNTIME="${ACC_RUNTIME:-$default_runtime}"
 
 mkdir -p "$ACC_RUNTIME/events"/{pending,inflight,archive} "$ACC_RUNTIME/tasks" "$ACC_RUNTIME/workers"
 [[ -p "$ACC_RUNTIME/event.fifo" ]] || mkfifo -m 600 "$ACC_RUNTIME/event.fifo"
+printf '%s\n' "$SESSION_NAME" > "$ACC_RUNTIME/session_name"
 
 # Claude Code asyncRewake 3중 훅 스키마 동적 생성 (JSON 인코더로 안전한 escaping 보장)
 BRIDGE_SETTINGS="$ACC_RUNTIME/claude-bridge.settings.json"
@@ -135,10 +136,10 @@ cat > "$BRIEF_FILE" <<EOF
 ## 작업 지시 (Dispatch)
 \`\`\`bash
 # agy에게 작업 지시 (비대화형 oneshot)
-$HERE/bin/dispatch.sh agy --prompt-file /path/to/prompt.md
+SESSION_NAME=$SESSION_NAME $HERE/bin/dispatch.sh agy --prompt-file /path/to/prompt.md
 
 # codex에게 작업 지시 (비대화형 oneshot)
-$HERE/bin/dispatch.sh codex --prompt-file /path/to/prompt.md --timeout 1800
+SESSION_NAME=$SESSION_NAME $HERE/bin/dispatch.sh codex --prompt-file /path/to/prompt.md --timeout 1800
 \`\`\`
 
 ## 비동기 기상 및 이벤트 처리 (asyncRewake)
@@ -277,8 +278,12 @@ if [[ "$START_WATCHDOG" == "true" ]]; then
   nohup env PROJECT_DIR="$PROJECT_DIR" ACC_RUNTIME="$ACC_RUNTIME" SESSION_NAME="$SESSION_NAME" "$HERE/watchdog-v2.sh" >/dev/null 2>&1 &
 fi
 
-# 전체 세션 검증 및 기동 성공 후에만 bootstrap 버전 마커 기록
+# 전체 세션 검증 및 기동 성공 후에만 bootstrap 버전 및 세션 마커 기록
 printf 'bootstrap_version=2\ncreated_epoch=%s\nworker_mode=oneshot\nbridge_mode=push\n' "$(date +%s)" > "$ACC_RUNTIME/bootstrap_version"
+printf '%s\n' "$SESSION_NAME" > "$ACC_RUNTIME/session_name"
+tmux set-environment -t "$SESSION_NAME" ACC_BOOTSTRAP_VERSION 2 2>/dev/null || true
+tmux set-environment -t "$SESSION_NAME" ACC_RUNTIME "$ACC_RUNTIME" 2>/dev/null || true
+tmux set-environment -t "$SESSION_NAME" SESSION_NAME "$SESSION_NAME" 2>/dev/null || true
 
 echo ""
 echo "완료. Full-Push v2 세션이 가동되었습니다."

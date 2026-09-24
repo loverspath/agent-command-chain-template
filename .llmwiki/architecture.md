@@ -36,7 +36,7 @@ summary: tmux 창 3개 기반 4계층 명령계통(사람/Sonnet/agy/Codex) 및 
 |---|---|---|---|---|
 | **0. 사용자** | 사람 | 외부 클라이언트 / RC 웹 UI | 최종 의사결정 및 승인 | `claude --remote-control`을 통해 브라우저에서 개입 |
 | **1. 감독/디스패치** | Claude Sonnet | tmux window `sonnet` | 모니터링, 작업 분배, 감사, 사용자 명령 하달 | 사람과의 상시 소통 창구. 실질 작업은 스스로 하지 않고 agy/codex에 위임 |
-| **2. 라우터 겸 워커 총괄** | agy (Gemini 3.8 Flash) | tmux window `agy` | 난이도 판단 및 워커 서브에이전트 위임·총괄 | 직접 작업(Read/Bash/Edit) 금지 및 서브에이전트 위임. 상위 인터럽트 수신 대기(responsive state) 유지 |
+| **2. 라우터 겸 워커 총괄** | agy (Gemini 3.8 Flash) | tmux window `agy` | 난이도 판단 및 워커 서브에이전트 위임·총괄 | v2 단발 실행(oneshot 한 턴) 라우팅. 직접 작업(Read/Bash/Edit) 금지 및 내장 도구 `invoke_subagent`로 위임. 실패 시 `[[BLOCKED]]` 에스컬레이션. (v1 상주 TUI responsive state는 legacy) |
 | **2-내부 Tier 2** | Codex Terra | tmux window `codex` | 중난도 작업 설계 및 직접 수행 | 단발 어댑터(`adapters/codex-oneshot.sh`) 또는 대화형 TUI 기동 |
 | **2-내부 Tier 3** | Sol / Opus | 상시 창 없음 (필요 시 호출) | 최고난도 문제 및 전체 플래닝 상담 | codex 창의 커맨드를 `gpt-5.6-sol`로 전환하거나, Sonnet 창에서 `--model opus` 일회성 실행 |
 
@@ -58,7 +58,7 @@ sequenceDiagram
     participant Worker as 워커 (agy / codex)
     participant Watchdog as watchdog-v2.sh
 
-    Sonnet->>Task: bin/dispatch.sh <worker> "<prompt>"
+    Sonnet->>Task: SESSION_NAME=<session> bin/dispatch.sh <worker> "<prompt>"
     Task->>Worker: adapters/*-oneshot.sh 실행 (flock 획득)
     Sonnet->>Wait: asyncRewake 대기 진입 (FIFO read)
     Note over Wait,FIFO: 이벤트 도착 전까지 블로킹 대기
@@ -99,9 +99,9 @@ v2는 메시지 유실 없는 신뢰성을 달성하기 위해 **파일 기반 D
 | **`bin/event-emit.sh`** | **원자적 이벤트 발행기**. Outbox의 `pending/` 디렉토리에 이벤트를 안전하게 원자적 스풀링하고, `event.fifo`에 논블로킹 펄스를 전송하여 대기 중인 리스너를 깨웁니다. `outbox.lock` flock을 통해 동시 발행 경쟁을 보호합니다. |
 | **`bin/sonnet-event-wait.sh`** | **Claude Code `asyncRewake` 전용 리스너**. `runtime/event.fifo`를 감시하다가 펄스가 들어오거나 미확인 pending 이벤트가 감지되면 exit code `2`를 반환하여 Claude Code를 즉각 기상시킵니다. |
 | **`bin/event-ack.sh`** | **이벤트 완료 처리기**. Sonnet이 확인한 이벤트를 `archive/` 디렉토리로 원자적으로 이동시키고 FIFO에 남은 잔여 펄스를 드레인하여 중복 기상을 방지합니다. |
-| **`bin/dispatch.sh`** | **작업 디스패처**. 고유 작업 ID를 발급하고 `runtime/tasks/<task_id>/spec.json` 명세를 생성한 뒤, 워커 tmux 창에 `bin/run-task.sh` 1줄 실행 명령을 주입합니다. |
+| **`bin/dispatch.sh`** | **작업 디스패처**. 4계층 세션명 자동 해석(환경변수 `SESSION_NAME` 권장, 런타임 마커, 현재 tmux 세션, config 기본값) 및 v2 마커 검증 후, 고유 작업 ID 발급 및 실행 프롬프트 사본(`$task_dir/prompt.md`) 생성 시 체인 컨텍스트 헤더(< 1KB) 자동 주입(`ACC_NO_BRIEF_HEADER=1`로 비활성화 가능, 헤더 포함 128KB 제한 검증), 대상 워커 tmux 창에 `bin/run-task.sh` 1줄 실행 명령을 주입합니다. `--dry-run` 안전 검증 플래그 지원. |
 | **`bin/run-task.sh`** | **워커 프로세스 러너**. 터미널 소유권 락(`terminal.lock`)을 획득하고 작업 상태를 `running`으로 전이한 뒤, 지정된 어댑터를 실행합니다. 실행 완료 시 성공/실패 여부에 따라 `task.done` 또는 `task.error` 이벤트를 원자적으로 발행합니다. |
-| **`adapters/agy-oneshot.sh`** | **agy 단발 실행 어댑터**. Antigravity CLI를 비대화형 단발 모드로 구동하여 명세된 프롬프트를 수행합니다. |
+| **`adapters/agy-oneshot.sh`** | **agy 단발 실행 어댑터**. Antigravity CLI를 비대화형 단발 모드로 구동하여 명세된 프롬프트를 수행합니다. 메인 턴에서 `invoke_subagent` 도구를 통해 워커 서브에이전트를 기동·취합하고 종료합니다. |
 | **`adapters/codex-oneshot.sh`** | **Codex 단발 실행 어댑터**. `codex exec` 기반으로 단발성 설계/코딩 작업을 수행합니다. |
 
 ### 2.4 커널 자동 해제형 Terminal Ownership Flock 및 Worker Lease
@@ -139,6 +139,29 @@ bootstrap-v2 재실행   원자적 fail+이벤트   초과 경고/알림 발행 
    - **Stall**: 워커 출력 로그(`output.log`)가 `NO_OUTPUT_WARN_SECONDS`(기본 900초/15분) 동안 1바이트도 갱신되지 않으면 무응답 스톨 경고를 기록합니다.
 4. **브리지 정체 해소 (ACK Timeout Recovery)**:
    - `inflight` 상태로 전환된 이벤트가 `EVENT_ACK_TIMEOUT`(기본 600초/10분) 동안 Sonnet에 의해 ACK 처리되지 않으면, 상위 세션 일시 지연으로 판단하고 이벤트를 다시 `pending`으로 롤백 인계하여 영구 분실을 방지합니다.
+
+### 2.6 Sentinel 통신 프로토콜 및 2층 감사 체계
+
+v2 Full-Push 아키텍처는 기계적 신뢰성(Durable Outbox)과 사람/감독자의 가독성을 결합하기 위해 2계층 통신 및 감사 구조를 채택합니다:
+
+1. **상태 Sentinel 규격 (모니터링용)**:
+   - `[[ACK <id>]]`: 작업 수신 및 착수 확인.
+   - `[[DONE <id>]] result=<요약> | learning=<한줄|none>`: 작업 완료 및 1줄 학습 캡슐.
+   - `[[BLOCKED <id>]] reason=<subagent-unavailable|ambiguous-spec|needs-terra>`: 차단 및 에스컬레이션.
+2. **완료 판정의 단일 진실 공급원 (SSOT)**:
+   - **원칙**: 상기 Sentinel은 사람이 읽고 관찰하기 위한 출력 포맷이다.
+   - **SSOT**: 작업의 실제 성공/실패 및 완료 판정은 반드시 **v2 Durable Outbox 이벤트(`run-task.sh`가 발행하는 `runtime/events/pending/<id>.evt`)**를 기준으로 이루어진다.
+3. **2층 감사 구조 (Two-Tier Audit)**:
+   - **1층 (자기 보고 검토)**: 워커가 최종 보고에 제출한 `refs_loaded`(실제 열람 문서)와 `learning_capsule` 검토.
+   - **2층 (물리 로그 대조)**: `$ACC_RUNTIME/tasks/<task_id>/output.log` 및 Antigravity transcript 상의 실제 도구 호출 내역(`view_file`, `Read` 등)을 교차 검증하여 보고와 실측 간 불일치를 감사.
+
+### 2.7 체인 컨텍스트 헤더 자동 주입 (Brief Context Header)
+
+디스패치 시 워커가 프로젝트 디렉토리 외부의 체인 규칙과 위키 경로를 즉시 인지할 수 있도록, `bin/dispatch.sh`는 실행용 프롬프트 사본(`$task_dir/prompt.md`) 앞에 1KB 미만의 경량 체인 컨텍스트 헤더를 자동으로 prepend합니다:
+- **헤더 내용**: `TEMPLATE_ROOT`, `CHAIN_WIKI_INDEX`, `ROLES`, `PROJECT_DIR`, `SESSION_NAME`, `TASK_ID`, 워커별 핵심 규칙(agy oneshot 위임 및 BLOCKED 보고 규정, Codex 프로젝트 컨벤션 우선 원칙).
+- **원본 보존**: 사용자가 지정한 원본 프롬프트 파일은 절대 변경되지 않으며, 태스크 실행 사본에만 헤더가 합성됩니다.
+- **비활성화 스위치**: 환경변수 `ACC_NO_BRIEF_HEADER=1`을 설정하고 디스패치하면 헤더 주입이 비활성화됩니다.
+- **128KB 크기 가드**: 헤더가 합성된 최종 프롬프트 크기는 Linux `ARG_MAX` 및 모델 입력 한도를 준수하기 위해 128KB(131,072 바이트) 이내로 검증되며 초과 시 즉시 거부(`exit 65`)됩니다.
 
 ---
 

@@ -17,6 +17,10 @@ if [[ -f config.env ]]; then
   # shellcheck disable=SC1091
   source config.env
 fi
+CONFIG_SESSION_NAME="${SESSION_NAME:-agentchain}"
+
+# shellcheck disable=SC1091
+source "$HERE/lib/session.sh"
 
 [[ -n "$_ENV_PROJECT_DIR" ]] && PROJECT_DIR="$_ENV_PROJECT_DIR"
 [[ -n "$_ENV_ACC_RUNTIME" ]] && ACC_RUNTIME="$_ENV_ACC_RUNTIME"
@@ -36,11 +40,10 @@ LOG_DIR="${LOG_DIR:-./logs}"
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/watchdog.log"
 
-SESSION_NAME="${SESSION_NAME:-agentchain}"
-session_safe="$(printf '%s' "$SESSION_NAME" | tr -cd '[:alnum:]_-')"
-proj_hash="$(printf '%s' "$PROJECT_DIR" | md5sum | cut -c1-8)"
-default_runtime="$HERE/runtime/${session_safe}-${proj_hash}"
-ACC_RUNTIME="${ACC_RUNTIME:-$default_runtime}"
+ENV_SESSION_NAME="$_ENV_SESSION_NAME"
+ENV_ACC_RUNTIME="$_ENV_ACC_RUNTIME"
+resolve_session_and_runtime "watchdog-v2" "" false
+
 mkdir -p "$ACC_RUNTIME/events"/{pending,inflight,archive} "$ACC_RUNTIME/tasks" "$ACC_RUNTIME/workers"
 
 # 워치독 단일 인스턴스 락 (자식 프로세스 상속 방지를 위해 flock --close 래퍼 및 내부 전용 인자 사용)

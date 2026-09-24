@@ -21,7 +21,7 @@ summary: tmux 창 3개(Sonnet/agy/Codex) 기반 프로젝트 비종속 4계층 �
 
 ## Known Issues
 
-- [[known-issues]] — Claude Code Remote Control(RC) 활성화 전제조건, agy→Codex 자동 라우팅 부재, 세션 지속성 경고, 무상태 워치독 한계
+- [[known-issues]] — Claude Code Remote Control(RC) 활성화 전제조건, agy→Codex 자동 라우팅 부재, 세션 지속성 경고, v1/v2 세션 오조준 및 세션명 자동 해석, 무상태 워치독 한계, 상주 대화형 TUI 비선점형 입력 큐잉 및 지시 지연 병목(9/23 사례)
 
 ## 태그 인덱스
 
@@ -36,6 +36,11 @@ summary: tmux 창 3개(Sonnet/agy/Codex) 기반 프로젝트 비종속 4계층 �
 - `#known-issues` — [[known-issues]]
 - `#limitations` — [[known-issues]]
 - `#remote-control` — [[known-issues]]
+- `#session-resolution` — [[known-issues]]
+- `#dispatch-targeting` — [[known-issues]]
+- `#non-preemptive-tui` — [[known-issues]]
+- `#cli-behavior` — [[known-issues]]
+- `#prompt-drift` — [[known-issues]]
 
 ---
 새 페이지 추가 규칙: [[/mnt/c/Users/rerun/llm-wiki/CONVENTIONS/llm-wiki-convention|LLM Wiki Convention]] 참고.
