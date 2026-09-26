@@ -1,44 +1,30 @@
 ---
-title: Architecture & Bridge Design
-tags: [architecture, tmux-bridge, 4-tier-command, full-push-v2, event-bridge, durable-outbox, watchdog-v2]
-related: ["[[INDEX]]", "[[usage]]", "[[known-issues]]", "[[2026-09-24-sol-v2-push-bridge-11-rounds-review-log]]"]
-summary: tmux 창 3개 기반 4계층 명령계통(사람/Sonnet/agy/Codex) 및 Full-Push 이벤트 통지 브리지 v2(FIFO+asyncRewake, Durable Outbox, 4대 안전망 워치독) 아키텍처 상세.
+title: Architecture
+tags: [architecture, roles, tmux-bridge, 4-tier-command, full-push, fifo, outbox, watchdog, resident-tui, isolation, dashboard]
+related: ["[[INDEX]]", "[[usage]]", "[[known-issues]]"]
+summary: Sonnet/agy/Codex Terra/Sol-Opus 4계층 명령계통과 v2 Full-Push(FIFO+Outbox) 브리지, Stage 1 Resident TUI, 읽기 전용 대시보드, v1 tmux 브리지 및 폴백 설계.
 ---
 
-# Architecture & Bridge Design
+# Architecture
 
-`agent-command-chain-template`는 SQLite 상태머신, 무거운 외부 메시지 브로커 없이 **단일 tmux 세션의 3개 윈도우와 파일 기반 이벤트 통지 브리지(Full-Push v2)**를 통해 고신뢰성의 멀티 에이전트 명령계통을 형성한다.
-
-> [!IMPORTANT]
-> **실행 아키텍처 경로 안내 (v2 기본 권장 / v1 폴백)**
-> - **v2 (기본 권장 경로)**: **Full-Push 이벤트 통지 브리지** (`bootstrap-v2.sh`, `watchdog-v2.sh`, `bin/*`, `adapters/*`). POSIX FIFO + Claude Code `asyncRewake` 훅을 이용한 제로 딜레이 푸시 통지, Durable Outbox 원자적 트랜잭션, 커널 자동 해제형 flock, 그리고 4대 비정상 상태를 전담 복구하는 `watchdog-v2.sh`를 제공합니다.
-> - **v1 (폴백/레거시 경로)**: **순수 tmux pull 브리지** (`bootstrap.sh`, `watchdog.sh`). tmux 화면 캡처(`capture-pane`)와 단순 폴링 방식으로 동작하며, v2 환경 구성이 어렵거나 최소 환경에서의 검증용 폴백으로 완전 보존됩니다. (v1 파일은 절대 삭제되지 않음)
+`agent-command-chain-template`의 4계층 역할 구조, Full-Push v2 브리지 아키텍처, Stage 1 Resident TUI 모드, 읽기 전용 상태 대시보드, 그리고 v1 폴백 브리지 설계를 설명한다.
 
 ---
 
-## 1. 4계층 명령계통 구조
-
-```
-[계층 0: 사용자 (사람)]
-       │ (RC / 원격 개입 또는 직접 tmux attach)
-       ▼
-[계층 1: 감독/디스패치 (Claude Sonnet)] ────────────── (고난도 플래닝 필요시 일회성 Opus 상담)
-       │
-       ├─────────────────────────────────┐ (Sonnet 작업 디스패치 / dispatch.sh)
-       ▼                                 ▼
-[계층 2: 라우터 겸 워커 (agy)]      [계층 2-내부 Tier 2: 작업 설계·수행 (Codex Terra)]
-(Gemini 3.8 Flash, 일상 작업)       (gpt-5.6-terra, 중난도 설계 및 구현)
-       │                                 │
-       └─ (결과 보고 / 이벤트 발행) ──────┴─ (필요시 gpt-5.6-sol 커맨드 전환 일회성 상담)
-```
+## 1. 역할 구조 (4계층)
 
 | 계층 | 주체 | 실행 환경 / 윈도우 | 주요 역할 | 특징 |
 |---|---|---|---|---|
 | **0. 사용자** | 사람 | 외부 클라이언트 / RC 웹 UI | 최종 의사결정 및 승인 | `claude --remote-control`을 통해 브라우저에서 개입 |
 | **1. 감독/디스패치** | Claude Sonnet | tmux window `sonnet` | 모니터링, 작업 분배, 감사, 사용자 명령 하달 | 사람과의 상시 소통 창구. 실질 작업은 스스로 하지 않고 agy/codex에 위임 |
-| **2. 라우터 겸 워커 총괄** | agy (Gemini 3.8 Flash) | tmux window `agy` | 난이도 판단 및 워커 서브에이전트 위임·총괄 | v2 단발 실행(oneshot 한 턴) 라우팅. 직접 작업(Read/Bash/Edit) 금지 및 내장 도구 `invoke_subagent`로 위임. 실패 시 `[[BLOCKED]]` 에스컬레이션. (v1 상주 TUI responsive state는 legacy) |
-| **2-내부 Tier 2** | Codex Terra | tmux window `codex` | 중난도 작업 설계 및 직접 수행 | 단발 어댑터(`adapters/codex-oneshot.sh`) 또는 대화형 TUI 기동 |
+| **2. 라우터 겸 워커 총괄** | agy (Gemini 3.8 Flash) | tmux window `agy` | 난이도 판단 및 워커 서브에이전트 위임·총괄 | v2 단발 실행(oneshot 한 턴) 라우팅 또는 Stage 1 상주 TUI 모드. 직접 작업(Read/Bash/Edit) 금지 및 내장 도구 `invoke_subagent`로 위임. 실패 시 `[[BLOCKED]]` 에스컬레이션. (v1 상주 TUI responsive state는 legacy) |
+| **2-내부 Tier 2** | Codex Terra | tmux window `codex` | 중난도 작업 설계 및 직접 수행 | 단발 어댑터(`adapters/codex-oneshot.sh`) 또는 대화형 TUI 기동. agy가 자동 호출하지 않음 |
 | **2-내부 Tier 3** | Sol / Opus | 상시 창 없음 (필요 시 호출) | 최고난도 문제 및 전체 플래닝 상담 | codex 창의 커맨드를 `gpt-5.6-sol`로 전환하거나, Sonnet 창에서 `--model opus` 일회성 실행 |
+
+### 핵심 아키텍처 단순화 및 원칙
+- **계층 단순화**: Sonnet은 agy와 codex(Terra) 두 창만 직접 봅니다. eraweb-fork의 "Terra가 agy 보고를 정규화해서 Sol에게만 전달, agy는 Sol에 직접 보고 안 함" 규칙을 계층 구조 자체로 끌어올린 것입니다.
+- **agy → codex 자동 연동이 없는 이유**: eraweb-fork에서 agy가 Terra/Sol을 실제로 호출하는 로직은 `tools/router/src/adapters/*.ts`(Node `child_process.spawn`)에 있었으나, 본 템플릿은 외부 라우터 엔진 하네스를 배제하고 경량화하기 위해 해당 레이어를 의도적으로 제외했습니다. 따라서 codex 창은 agy와 자동으로 연동되지 않으며, Sonnet(또는 사람)이 agy 출력을 보고 필요하다고 판단되면 codex 창에 직접 `send-keys`로 작업을 넘깁니다. (진짜 자동 연동이 필요해지면 eraweb-fork의 라우터 어댑터를 참고하여 별도 구현)
+- **Sol/Opus가 상시 창이 없는 이유**: 사용 빈도가 낮고(최고난도 상담), 상시 프로세스를 켜두는 것보다 필요할 때 `codex` 창 커맨드를 `--model gpt-5.6-sol`로 바꾸거나 Sonnet 세션에서 `--model opus`로 일회성 실행하는 것이 자원상 훨씬 가볍기 때문입니다.
 
 ---
 
@@ -103,7 +89,7 @@ v2는 메시지 유실 없는 신뢰성을 달성하기 위해 **파일 기반 D
 | **`bin/run-task.sh`** | **워커 프로세스 러너 (oneshot 전용)**. 터미널 소유권 락(`terminal.lock`)을 획득하고 작업 상태를 `running`으로 전이한 뒤, 지정된 어댑터를 실행합니다. 실행 완료 시 성공/실패 여부에 따라 `task.done` 또는 `task.error` 이벤트를 원자적으로 발행합니다. |
 | **`bin/agy-stop-hook.sh`** | **agy Stop 훅 핸들러 (resident 전용)**. Antigravity CLI의 `Stop` 라이프사이클 훅으로부터 stdin JSON을 수신하여 `fullyIdle: true` 여부 및 서브에이전트 여부를 판별합니다. `terminal.lock` 멱등성을 보장하며 원자적 `done` 또는 `error` 이벤트를 Outbox에 발행하고 작업 상태와 `workers/agy.busy`를 안전하게 정리합니다. |
 | **`adapters/agy-oneshot.sh`** | **agy 단발 실행 어댑터**. Antigravity CLI를 비대화형 단발 모드로 구동하여 명세된 프롬프트를 수행합니다. 메인 턴에서 `invoke_subagent` 도구를 통해 워커 서브에이전트를 기동·취합하고 종료합니다. |
-| **`adapters/codex-oneshot.sh`** | **Codex 단발 실행 어댑터**. `codex exec` 기반으로 단발성 설계/코딩 작업을 수행합니다. |
+| **`adapters/codex-oneshot.sh`** | **Codex 단발 실행 어댑터**. `codex exec` 기반으로 단발성 설계/코딩 작업을 수행합니다. 비-Git 프로젝트용 `--skip-git-repo-check` 플래그를 포함합니다. |
 
 ### 2.4 커널 자동 해제형 Terminal Ownership Flock 및 Worker Lease
 
@@ -207,6 +193,17 @@ v2 Full-Push 아키텍처는 기계적 신뢰성(Durable Outbox)과 사람/감�
 4. **독립 tmux 세션 격리 및 자동 정리**:
    - 모든 tmux 명령은 `-t <session_name>`을 강제하며, 테스트 세션(`acc-t0924-10-<rand>`)은 trap에 의해 EXIT/INT/TERM 발생 시 즉각 자동 회수됩니다.
 
+### 2.10 읽기 전용 상태 대시보드 (`dashboard/`)
+
+`dashboard/`는 전체 체인의 상태를 관찰할 수 있도록 제공되는 완전 읽기 전용 웹 모니터링 하위 시스템입니다:
+1. **표준 라이브러리 전용 서버 (`server.py`)**:
+   - 외부 종속성 없이 Python 3 내장 라이브러리만으로 동작합니다.
+   - 기본적으로 Tailscale IPv4 주소에 바인딩되어 안전한 사설망(tailnet) 내에서만 접속 가능하며, `0.0.0.0` 바인딩은 `--allow-any-host` 플래그를 통해서만 허용됩니다.
+2. **완전 읽기 전용 및 보안 격리**:
+   - 서버는 디스크에 어떠한 파일도 쓰지 않으며 모든 캐시는 인메모리(2초)로만 관리됩니다.
+   - 트랜스크립트 파일 접근 시 엄격한 정규화 및 화이트리스트 검증을 수행하여 상위 디렉터리 탈출 시도를 원천 차단합니다.
+   - 작업 단위 정밀 트랜스크립트 슬라이싱(exact, partial, inferred, none) 및 텍스트 절단 전 단일 지점 민감 정보 마스킹(`mask_sensitive`)을 적용합니다.
+
 ---
 
 ## 3. tmux 브리지 (v1, 폴백/레거시)
@@ -214,15 +211,16 @@ v2 Full-Push 아키텍처는 기계적 신뢰성(Durable Outbox)과 사람/감�
 v1 아키텍처는 추가적인 FIFO나 Outbox 없이 순수 tmux 내부 기능만을 활용하는 최소형 브리지입니다.
 
 ```
-tmux session: agentchain
- ├─ window 0 "sonnet": claude --model sonnet --remote-control
- ├─ window 1 "agy":    agy --new-project --mode plan
- └─ window 2 "codex":  codex --model gpt-5.6-terra -s danger-full-access
+tmux session: agentchain (config.env의 SESSION_NAME)
+ ├─ window 0 "sonnet": claude --model sonnet --remote-control --add-dir <템플릿경로>
+ ├─ window 1 "agy":    agy --new-project --mode plan (대화형, 지속)
+ └─ window 2 "codex":  codex --model gpt-5.6-terra -s danger-full-access (대화형, 지속)
 ```
 
-- **Pull 기반 관찰**: 상위 제어자가 `tmux capture-pane -p`로 대상 창 화면을 주기적으로 스냅샷 조회하거나, `pipe-pane`으로 로그를 파일로 흘려보내 관찰합니다.
+- **동적 대상 디렉토리 (`PROJECT_DIR`)**: 세 창 모두 `bootstrap.sh`를 실행한 디렉토리(`PROJECT_DIR`)에서 시작합니다 (`-c "$PROJECT_DIR"`). 하드코딩된 프로젝트 경로는 없으며 실행 위치를 기준으로 동적으로 결정됩니다.
+- **Pull 기반 관찰**: 상위 제어자가 `tmux capture-pane -p`로 대상 창 화면을 주기적으로 스냅샷 조회하거나, `pipe-pane`으로 로그를 파일로 흘려보내 관찰합니다. push는 근본적으로 없으며, 실시간성이 필요하면 `pipe-pane` 로그 tail이 가장 근접한 비동기 감지 수단입니다.
 - **수동 지시**: `tmux send-keys -t <target> "지시문" C-m`으로 명령을 주입합니다.
-- **v1 워치독 (`watchdog.sh`)**: 창이 셸(`bash`, `sh`)로 복귀하거나 창이 닫힌 경우 재기동 커맨드를 단순 재주입하는 무상태(stateless) 복구 방식으로 동작합니다.
+- **v1 워치독 (`watchdog.sh`, 느슨한 폴백)**: 창이 셸(`bash`, `sh`)로 복귀하거나 창이 닫힌 경우 재기동 커맨드를 단순 재주입하는 무상태(stateless) 복구 방식으로 동작합니다. 리스, 하트비트, 스티키 라우팅 등의 복잡한 상태머신은 배제되어 있습니다.
 
 ---
 
@@ -231,7 +229,7 @@ tmux session: agentchain
 | 비교 항목 | `bootstrap-v2.sh` (기본 권장 v2) | `bootstrap.sh` (폴백/레거시 v1) |
 |---|---|---|
 | **통지 방식** | Full-Push (FIFO + asyncRewake 즉시 깨우기) | Pull (tmux 화면 캡처 및 폴링) |
-| **작업 실행 방식** | `bin/dispatch.sh` 기반 단발(oneshot) 어댑터 격리 실행 | tmux 대화형 창에 직접 `send-keys` 입력 |
+| **작업 실행 방식** | `bin/dispatch.sh` 기반 단발(oneshot) 어댑터 격리 실행 또는 Stage 1 상주 TUI | tmux 대화형 창에 직접 `send-keys` 입력 |
 | **상태 관리** | `runtime/` 내 작업별 spec/state/log 완전 격리 및 Outbox 관리 | tmux 창 텍스트 화면 상태에 의존 |
 | **워치독 연동** | `watchdog-v2.sh` 자동 백그라운드 기동 (`START_WATCHDOG=true`) | `watchdog.sh &` 수동 실행 권장 |
 | **장애 복구** | PID Reap, 커널 flock, Deadline 초과, ACK 복구 등 4대 안전망 | 윈도우 프로세스 죽음 시 커맨드 재전송 |

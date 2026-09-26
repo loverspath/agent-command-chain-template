@@ -13,15 +13,39 @@ export PATH="$HOME/.local/bin:$PATH"
 
 INVOKED_DIR="$PWD"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+_ENV_PROJECT_DIR="${PROJECT_DIR:-}"
+_ENV_SESSION_NAME="${SESSION_NAME:-}"
+_ENV_SONNET_CMD="${SONNET_CMD:-}"
+_ENV_AGY_CMD="${AGY_CMD:-}"
+_ENV_CODEX_CMD="${CODEX_CMD:-}"
+_ENV_AUTO_CONFIRM_TRUST="${AUTO_CONFIRM_TRUST:-}"
+_ENV_LOG_DIR="${LOG_DIR:-}"
+
 cd "$HERE"
 
-if [[ -f config.env ]]; then
+_CFG_ENV="${ACC_CONFIG_ENV:-$HERE/config.env}"
+if [[ -f "$_CFG_ENV" ]]; then
+  # shellcheck disable=SC1091
+  source "$_CFG_ENV"
+elif [[ -f config.env ]]; then
   # shellcheck disable=SC1091
   source config.env
+elif [[ -f config.env.example ]]; then
+  # shellcheck disable=SC1091
+  source config.env.example
 else
   echo "config.env 가 없다. config.env.example 을 복사해서 값을 채워라." >&2
   exit 1
 fi
+
+[[ -n "$_ENV_PROJECT_DIR" ]] && PROJECT_DIR="$_ENV_PROJECT_DIR"
+[[ -n "$_ENV_SESSION_NAME" ]] && SESSION_NAME="$_ENV_SESSION_NAME"
+[[ -n "$_ENV_SONNET_CMD" ]] && SONNET_CMD="$_ENV_SONNET_CMD"
+[[ -n "$_ENV_AGY_CMD" ]] && AGY_CMD="$_ENV_AGY_CMD"
+[[ -n "$_ENV_CODEX_CMD" ]] && CODEX_CMD="$_ENV_CODEX_CMD"
+[[ -n "$_ENV_AUTO_CONFIRM_TRUST" ]] && AUTO_CONFIRM_TRUST="$_ENV_AUTO_CONFIRM_TRUST"
+[[ -n "$_ENV_LOG_DIR" ]] && LOG_DIR="$_ENV_LOG_DIR"
 
 PROJECT_DIR="${PROJECT_DIR:-$INVOKED_DIR}"
 if [[ ! -d "$PROJECT_DIR" ]]; then
@@ -33,9 +57,15 @@ PROJECT_DIR="$(cd "$PROJECT_DIR" && pwd)"
 mkdir -p "$LOG_DIR"
 
 command -v tmux >/dev/null 2>&1 || { echo "tmux 가 설치되어 있지 않다."; exit 1; }
-command -v claude >/dev/null 2>&1 || { echo "claude CLI 가 PATH 에 없다."; exit 1; }
-command -v agy >/dev/null 2>&1 || echo "경고: agy 가 PATH 에 없다 — agy 창은 뜨지만 명령이 실패할 것이다."
-command -v codex >/dev/null 2>&1 || echo "경고: codex 가 PATH 에 없다 — codex 창은 뜨지만 명령이 실패할 것이다."
+if [[ "$SONNET_CMD" == *"claude"* ]]; then
+  command -v claude >/dev/null 2>&1 || { echo "claude CLI 가 PATH 에 없다."; exit 1; }
+fi
+if [[ "$AGY_CMD" == *"agy"* ]]; then
+  command -v agy >/dev/null 2>&1 || echo "경고: agy 가 PATH 에 없다 — agy 창은 뜨지만 명령이 실패할 것이다."
+fi
+if [[ "$CODEX_CMD" == *"codex"* ]]; then
+  command -v codex >/dev/null 2>&1 || echo "경고: codex 가 PATH 에 없다 — codex 창은 뜨지만 명령이 실패할 것이다."
+fi
 
 echo "프로젝트 디렉토리: $PROJECT_DIR"
 
@@ -60,7 +90,11 @@ fi
 # 안 하면 PROJECT_DIR 밖의 session_brief.md 를 읽을 때마다 "작업 디렉토리 밖
 # 읽기 허용?" 프롬프트가 뜬다(실측 확인). --add-dir 은 이 세션에만 적용되고
 # 전역 설정(permissions.blockReadsOutsideWorkingDirectories)은 안 건드린다.
-SONNET_LAUNCH="export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; $SONNET_CMD --add-dir \"$HERE\""
+if [[ "$SONNET_CMD" == *"claude"* ]]; then
+  SONNET_LAUNCH="export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; $SONNET_CMD --add-dir \"$HERE\""
+else
+  SONNET_LAUNCH="$SONNET_CMD"
+fi
 
 echo "[$SONNET_WINDOW] Sonnet 기동 + RC on: $SONNET_CMD"
 tmux send-keys -t "${SESSION_NAME}:${SONNET_WINDOW}" "$SONNET_LAUNCH" C-m
@@ -94,10 +128,10 @@ wait_for_pane_text() {
 }
 
 if [[ "${AUTO_CONFIRM_TRUST:-true}" == "true" ]]; then
-  if wait_for_pane_text "${SESSION_NAME}:${SONNET_WINDOW}" "trust this folder" 15; then
+  if [[ "$SONNET_CMD" == *"claude"* ]] && wait_for_pane_text "${SESSION_NAME}:${SONNET_WINDOW}" "trust this folder" 15; then
     tmux send-keys -t "${SESSION_NAME}:${SONNET_WINDOW}" Down C-m   # "No, exit" -> "Yes, I trust this folder"
   fi
-  if wait_for_pane_text "${SESSION_NAME}:${CODEX_WINDOW}" "trust the contents" 15; then
+  if [[ "$CODEX_CMD" == *"codex"* ]] && wait_for_pane_text "${SESSION_NAME}:${CODEX_WINDOW}" "trust the contents" 15; then
     tmux send-keys -t "${SESSION_NAME}:${CODEX_WINDOW}" C-m          # 기본 선택지가 이미 "Yes, continue"
   fi
 fi
@@ -153,7 +187,7 @@ tmux send-keys -t $SESSION_NAME:$CODEX_WINDOW "여기에 지시문" C-m
 - $HERE/ROLES.md — 역할별 최초 프롬프트 템플릿, 확장 지점
 EOF
 
-if [[ "${AUTO_CONFIRM_TRUST:-true}" == "true" ]] && wait_for_pane_text "${SESSION_NAME}:${SONNET_WINDOW}" "auto mode on" 20; then
+if [[ "${AUTO_CONFIRM_TRUST:-true}" == "true" && "$SONNET_CMD" == *"claude"* ]] && wait_for_pane_text "${SESSION_NAME}:${SONNET_WINDOW}" "auto mode on" 20; then
   tmux send-keys -t "${SESSION_NAME}:${SONNET_WINDOW}" "이 tmux 세션이 어떻게 동작하는지 먼저 $BRIEF_FILE 를 읽고 파악해라. 그 안의 지시대로 agy/codex 창을 감독해라." C-m
   echo "[$SONNET_WINDOW] 오리엔테이션 메시지 전송함 (참조: $BRIEF_FILE)"
 fi

@@ -1,46 +1,67 @@
 ---
 title: agent-command-chain-template Wiki Index
 tags: [index, moc, tmux-bridge, multi-agent-orchestration]
-related: []
-summary: tmux 창 3개(Sonnet/agy/Codex) 기반 프로젝트 비종속 4계층 멀티 에이전트 명령계통 템플릿의 내부 위키 색인.
+related: ["[[architecture]]", "[[usage]]", "[[known-issues]]"]
+summary: Sonnet/agy/Codex 4계층 명령계통 및 v2 Full-Push/Stage 1 상주/대시보드/v1 tmux 브리지 내부 위키 색인.
 ---
 
 # agent-command-chain-template
 
-임의의 프로젝트 디렉토리에서 Sonnet(감독), agy(라우터 겸 워커), Codex Terra(설계/수행) 세 CLI를 tmux 창 3개로 브리지하는 범용 4계층 명령계통 템플릿이다.
-무거운 외부 하네스(DB, 하트비트, 리스 등) 없이 순수 셸 스크립트(`bootstrap.sh`, `watchdog.sh`)와 tmux 내장 명령(`send-keys`, `capture-pane`, `pipe-pane`)만으로 동작한다.
-어느 디렉토리에서든 스크립트를 호출하면 해당 디렉토리를 작업 대상으로 삼아 즉시 멀티 에이전트 협업 환경을 구축한다.
+Claude Sonnet(감독/RC) · agy(Gemini 3.8 Flash, 라우터+워커) · Codex Terra(중난도 설계/직접수행) · Sol/Opus(최고난도 상담, 상시 창 없음) 4계층을 연결하는 범용 멀티 에이전트 명령계통 템플릿이다.
+무거운 외부 하네스(DB, 하트비트, 리스 등) 없이 순수 셸 스크립트와 tmux 기반으로 시작하여, v2 Full-Push(POSIX FIFO + Durable Outbox) 비동기 통지, Stage 1 agy 상주 TUI 모드, tailnet 전용 읽기 전용 대시보드(`dashboard/`)까지 지원한다.
+어느 디렉토리에서든 스크립트를 호출하면 해당 작업 디렉토리를 대상으로 삼아 즉시 멀티 에이전트 협업 환경을 구축한다.
+
+세션을 처음 시작한다면: [[architecture]] → [[usage]] 순서로 읽으면 충분하다.
+작업 중 막히거나 경고가 발생하면 바로 [[known-issues]]를 확인하라 — 이미 실측하고 해결책/우회책을 정리해 두었다.
 
 ## Architecture
 
-- [[architecture]] — tmux 윈도우 3개 브리지 설계, 4계층 명령계통 구조, bootstrap.sh 및 watchdog.sh의 구체적 동작 흐름
+- [[architecture]] — 4계층 역할 구조, Full-Push v2 브리지(FIFO+Outbox), Stage 1 Resident TUI 모드, 대시보드, v1 tmux 브리지 및 폴백 설계, agy→codex 자동 연동 부재 이유
 
 ## Usage
 
-- [[usage]] — 템플릿 설정(config.env), 부트스트랩 및 워치독 기동, tmux 관찰/개입 명령, Sonnet 매개 agy-Codex 수동 핸드오프 절차
+- [[usage]] — 사전 요구사항, 템플릿 설정(config.env), bootstrap-v2.sh/bootstrap.sh 실행법, 디스패치 및 관찰/개입 명령, Resident TUI 및 대시보드 운용, agy-Codex 수동 핸드오프, 세션 정리
 
 ## Known Issues
 
-- [[known-issues]] — Claude Code Remote Control(RC) 활성화 전제조건, agy→Codex 자동 라우팅 부재, 세션 지속성 경고, v1/v2 세션 오조준 및 세션명 자동 해석, 무상태 워치독 한계, 상주 대화형 TUI 비선점형 입력 큐잉 및 지시 지연 병목(9/23 사례)
+- [[known-issues]] — RC 전제조건, 디렉토리 신뢰(Folder Trust) 자동 확인 한계, 세션 지속성 제품 버그, agy/codex 바이너리 이슈, tmux 중첩 attach, v1/v2 세션 오조준(interactive TUI) 및 4계층 자동 해석, 상주 대화형 TUI 비선점형 입력 큐잉(9/23 병목), 동시 타이핑 혼선, 테스트 하네스 격리 규약
 
 ## 태그 인덱스
 
-- `#architecture` — [[architecture]]
-- `#tmux-bridge` — [[architecture]], [[usage]]
 - `#4-tier-command` — [[architecture]]
+- `#architecture` — [[architecture]]
 - `#bootstrap` — [[architecture]], [[usage]]
-- `#watchdog` — [[architecture]]
-- `#usage` — [[usage]]
+- `#bug` — [[known-issues]]
+- `#cli-behavior` — [[known-issues]]
+- `#config` — [[usage]]
+- `#dashboard` — [[architecture]], [[usage]]
+- `#dispatch-targeting` — [[known-issues]]
+- `#fallback` — [[architecture]], [[known-issues]]
+- `#fifo` — [[architecture]]
+- `#full-push` — [[architecture]], [[usage]]
 - `#handoff` — [[usage]]
-- `#operation` — [[usage]]
+- `#isolation` — [[architecture]], [[known-issues]]
 - `#known-issues` — [[known-issues]]
 - `#limitations` — [[known-issues]]
-- `#remote-control` — [[known-issues]]
-- `#session-resolution` — [[known-issues]]
-- `#dispatch-targeting` — [[known-issues]]
 - `#non-preemptive-tui` — [[known-issues]]
-- `#cli-behavior` — [[known-issues]]
+- `#operation` — [[usage]]
+- `#outbox` — [[architecture]]
+- `#permissions` — [[known-issues]]
+- `#product-bug` — [[known-issues]]
 - `#prompt-drift` — [[known-issues]]
+- `#remote-control` — [[known-issues]]
+- `#resident-tui` — [[architecture]], [[usage]]
+- `#roles` — [[architecture]]
+- `#session-resolution` — [[architecture]], [[known-issues]]
+- `#test-harness-isolation` — [[architecture]], [[known-issues]]
+- `#tmux-bridge` — [[architecture]], [[usage]]
+- `#tmux-nesting` — [[known-issues]]
+- `#troubleshooting` — [[known-issues]]
+- `#usage` — [[usage]]
+- `#usage-manual` — [[usage]]
+- `#watchdog` — [[architecture]], [[usage]]
+- `#wsl` — [[known-issues]], [[usage]]
 
 ---
-새 페이지 추가 규칙: [[/mnt/c/Users/rerun/llm-wiki/CONVENTIONS/llm-wiki-convention|LLM Wiki Convention]] 참고.
+- 상위 볼트: `C:\Users\rerun\llm-wiki\Projects\agent-command-chain-template\`
+- 위키 컨벤션: `C:\Users\rerun\llm-wiki\CONVENTIONS\llm-wiki-convention.md`
