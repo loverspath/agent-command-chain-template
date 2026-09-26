@@ -5,9 +5,10 @@ umask 077
 mode="${1:-wait}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-if [[ -f "$HERE/config.env" ]]; then
+_CFG_ENV="${ACC_CONFIG_ENV:-$HERE/config.env}"
+if [[ -f "$_CFG_ENV" ]]; then
   # shellcheck disable=SC1091
-  source "$HERE/config.env"
+  source "$_CFG_ENV"
 fi
 
 CONFIG_SESSION_NAME="${SESSION_NAME:-agentchain}"

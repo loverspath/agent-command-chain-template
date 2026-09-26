@@ -1,0 +1,3363 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0">
+  <title>AgentCommandChain 대시보드</title>
+  <style>
+    /* -------------------------------------------------------------
+       CSS Variables & Themes (Auto Light/Dark via prefers-color-scheme)
+       ------------------------------------------------------------- */
+    :root {
+      --bg-primary: #f8fafc;
+      --bg-surface: #ffffff;
+      --bg-surface-hover: #f1f5f9;
+      --bg-subtle: #f1f5f9;
+      --bg-code: #f8fafc;
+      --border-color: #e2e8f0;
+      --border-strong: #cbd5e1;
+      --text-primary: #0f172a;
+      --text-secondary: #475569;
+      --text-muted: #64748b;
+      --accent-primary: #2563eb;
+      --accent-light: #eff6ff;
+      --accent-border: #93c5fd;
+
+      --status-online: #16a34a;
+      --status-online-bg: #dcfce7;
+      --status-offline: #dc2626;
+      --status-offline-bg: #fee2e2;
+
+      --status-busy: #2563eb;
+      --status-busy-bg: #dbeafe;
+      --status-idle: #64748b;
+      --status-idle-bg: #f1f5f9;
+      --status-error: #dc2626;
+      --status-error-bg: #fee2e2;
+      --status-warning: #d97706;
+      --status-warning-bg: #fef3c7;
+
+      --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+      --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.07), 0 2px 4px -2px rgba(0, 0, 0, 0.04);
+      --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      --radius-sm: 6px;
+      --radius-md: 10px;
+      --radius-lg: 14px;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg-primary: #0b0f19;
+        --bg-surface: #111827;
+        --bg-surface-hover: #1f2937;
+        --bg-subtle: #1a2234;
+        --bg-code: #0d1320;
+        --border-color: #243048;
+        --border-strong: #374151;
+        --text-primary: #f9fafb;
+        --text-secondary: #94a3b8;
+        --text-muted: #64748b;
+        --accent-primary: #3b82f6;
+        --accent-light: rgba(59, 130, 246, 0.15);
+        --accent-border: #1d4ed8;
+
+        --status-online: #22c55e;
+        --status-online-bg: rgba(34, 197, 94, 0.15);
+        --status-offline: #ef4444;
+        --status-offline-bg: rgba(239, 68, 68, 0.15);
+
+        --status-busy: #3b82f6;
+        --status-busy-bg: rgba(59, 130, 246, 0.2);
+        --status-idle: #94a3b8;
+        --status-idle-bg: rgba(148, 163, 184, 0.12);
+        --status-error: #ef4444;
+        --status-error-bg: rgba(239, 68, 68, 0.2);
+        --status-warning: #f59e0b;
+        --status-warning-bg: rgba(245, 158, 11, 0.15);
+
+        --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.3);
+        --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.4), 0 2px 4px -2px rgba(0, 0, 0, 0.2);
+      }
+    }
+
+    /* -------------------------------------------------------------
+       Base Layout & Mobile-First Reset
+       ------------------------------------------------------------- */
+    *, *::before, *::after {
+      box-sizing: border-box;
+    }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      max-width: 100%;
+      overflow-x: hidden;
+      background-color: var(--bg-primary);
+      color: var(--text-primary);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans KR", sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .container {
+      width: 100%;
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 12px 14px 40px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    /* -------------------------------------------------------------
+       Top Header Bar
+       ------------------------------------------------------------- */
+    .top-header {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-lg);
+      padding: 12px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      box-shadow: var(--shadow-sm);
+    }
+
+    .top-header-row1 {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .title-group {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .logo-badge {
+      width: 34px;
+      height: 34px;
+      border-radius: 8px;
+      background: var(--accent-light);
+      border: 1px solid var(--accent-border);
+      color: var(--accent-primary);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+    .app-title {
+      margin: 0;
+      font-size: 17px;
+      font-weight: 700;
+      letter-spacing: -0.3px;
+      color: var(--text-primary);
+    }
+
+    .app-subtitle {
+      margin: 0;
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    .top-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 600;
+      user-select: none;
+    }
+
+    .status-pill.online {
+      background: var(--status-online-bg);
+      color: var(--status-online);
+      border: 1px solid rgba(22, 163, 74, 0.3);
+    }
+
+    .status-pill.offline {
+      background: var(--status-offline-bg);
+      color: var(--status-offline);
+      border: 1px solid rgba(220, 38, 38, 0.3);
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+
+    .status-pill.online .status-dot {
+      box-shadow: 0 0 6px currentColor;
+    }
+
+    /* Minimum 44x44px touch button */
+    .btn-icon {
+      min-width: 44px;
+      min-height: 44px;
+      width: 44px;
+      height: 44px;
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      background: var(--bg-surface);
+      color: var(--text-secondary);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      padding: 0;
+      transition: background 0.15s, border-color 0.15s, transform 0.1s;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    .btn-icon:hover {
+      background: var(--bg-surface-hover);
+      color: var(--text-primary);
+    }
+
+    .btn-icon:active {
+      transform: scale(0.96);
+    }
+
+    .btn-icon.spinning svg {
+      animation: spin 1s linear infinite;
+    }
+
+    .top-header-row2 {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding-top: 8px;
+      border-top: 1px solid var(--border-color);
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
+    .meta-group {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .meta-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      background: var(--bg-subtle);
+      border: 1px solid var(--border-color);
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+    }
+
+    /* -------------------------------------------------------------
+       Disconnection Banner
+       ------------------------------------------------------------- */
+    .disconnect-banner {
+      display: none;
+      background: var(--status-error-bg);
+      border: 1px solid var(--status-error);
+      color: var(--status-error);
+      border-radius: var(--radius-md);
+      padding: 10px 14px;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 10px;
+      box-shadow: var(--shadow-sm);
+    }
+
+    .disconnect-banner.show {
+      display: flex;
+    }
+
+    .disconnect-content {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 500;
+      font-size: 13px;
+    }
+
+    .btn-retry {
+      min-height: 44px;
+      min-width: 44px;
+      padding: 8px 14px;
+      background: var(--bg-surface);
+      border: 1px solid var(--status-error);
+      color: var(--status-error);
+      border-radius: 6px;
+      font-weight: 600;
+      font-size: 12px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+    }
+
+    .btn-retry:active {
+      background: var(--status-error);
+      color: #ffffff;
+    }
+
+    /* -------------------------------------------------------------
+       Cards & Section Layouts
+       ------------------------------------------------------------- */
+    .section-title {
+      font-size: 15px;
+      font-weight: 700;
+      margin: 0 0 10px 0;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--text-primary);
+    }
+
+    .section-title .count-badge {
+      font-size: 11px;
+      padding: 2px 8px;
+      background: var(--bg-subtle);
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      color: var(--text-muted);
+      font-weight: 500;
+    }
+
+    .card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-lg);
+      padding: 14px;
+      box-shadow: var(--shadow-sm);
+    }
+
+    .grid-3 {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 12px;
+    }
+
+    @media (min-width: 768px) {
+      .grid-3 {
+        grid-template-columns: repeat(3, 1fr);
+      }
+    }
+
+    .grid-2 {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 12px;
+    }
+
+    @media (min-width: 640px) {
+      .grid-2 {
+        grid-template-columns: repeat(2, 1fr);
+      }
+    }
+
+    /* -------------------------------------------------------------
+       Worker Cards
+       ------------------------------------------------------------- */
+    .worker-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      position: relative;
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+
+    .worker-card.busy {
+      border-color: var(--status-busy);
+      box-shadow: 0 0 0 2px var(--status-busy-bg);
+    }
+
+    .worker-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+    }
+
+    .worker-name-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .worker-avatar {
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+      background: var(--bg-subtle);
+      border: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      font-size: 11px;
+      color: var(--text-secondary);
+    }
+
+    .worker-name {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--text-primary);
+    }
+
+    .badge-chip {
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 7px;
+      border-radius: 4px;
+      border: 1px solid var(--border-color);
+      background: var(--bg-subtle);
+      color: var(--text-secondary);
+    }
+
+    .badge-chip.mode-supervisor {
+      background: rgba(147, 51, 234, 0.1);
+      border-color: rgba(147, 51, 234, 0.3);
+      color: #9333ea;
+    }
+
+    .badge-chip.mode-resident {
+      background: rgba(37, 99, 235, 0.1);
+      border-color: rgba(37, 99, 235, 0.3);
+      color: #2563eb;
+    }
+
+    .badge-chip.mode-oneshot {
+      background: rgba(13, 148, 136, 0.1);
+      border-color: rgba(13, 148, 136, 0.3);
+      color: #0d9488;
+    }
+
+    .worker-body {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      font-size: 12px;
+    }
+
+    .info-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .info-label {
+      color: var(--text-muted);
+      font-size: 12px;
+    }
+
+    .info-value {
+      font-weight: 600;
+      color: var(--text-primary);
+      font-family: var(--font-mono);
+      font-size: 12px;
+      text-align: right;
+    }
+
+    .state-indicator {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 12px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 12px;
+    }
+
+    .state-indicator.busy {
+      background: var(--status-busy-bg);
+      color: var(--status-busy);
+    }
+
+    .state-indicator.idle {
+      background: var(--status-idle-bg);
+      color: var(--status-idle);
+    }
+
+    .pulse-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+
+    .state-indicator.busy .pulse-dot {
+      animation: pulse 1.2s infinite;
+    }
+
+    /* -------------------------------------------------------------
+       Daemons Card
+       ------------------------------------------------------------- */
+    .daemon-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 10px;
+      background: var(--bg-subtle);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-sm);
+      gap: 8px;
+    }
+
+    .daemon-info {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 0;
+      flex: 1;
+    }
+
+    .daemon-name {
+      font-weight: 600;
+      font-size: 13px;
+    }
+
+    .daemon-sub {
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    /* -------------------------------------------------------------
+       Queue & Outbox Summary
+       ------------------------------------------------------------- */
+    .queue-stats-row {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    .queue-stat-box {
+      background: var(--bg-subtle);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-sm);
+      padding: 8px;
+      text-align: center;
+    }
+
+    .queue-stat-num {
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--text-primary);
+      font-family: var(--font-mono);
+    }
+
+    .queue-stat-label {
+      font-size: 10px;
+      color: var(--text-muted);
+      margin-top: 2px;
+    }
+
+    /* -------------------------------------------------------------
+       Tasks Timeline List
+       ------------------------------------------------------------- */
+    .task-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .task-item {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      transition: border-color 0.2s, background-color 0.2s, transform 0.1s;
+      min-height: 48px;
+    }
+
+    .task-item.running {
+      border-color: var(--accent-primary);
+      background: var(--accent-light);
+    }
+
+    .task-item-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .task-id-badge {
+      font-family: var(--font-mono);
+      font-weight: 700;
+      font-size: 13px;
+      color: var(--text-primary);
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 3px 8px;
+      border-radius: 4px;
+    }
+
+    .chip.status-running {
+      background: var(--status-busy-bg);
+      color: var(--status-busy);
+      border: 1px solid var(--accent-border);
+    }
+
+    .chip.status-done,
+    .chip.status-online {
+      background: var(--status-online-bg);
+      color: var(--status-online);
+      border: 1px solid rgba(22, 163, 74, 0.3);
+    }
+
+    .chip.status-error {
+      background: var(--status-error-bg);
+      color: var(--status-error);
+      border: 1px solid rgba(220, 38, 38, 0.3);
+    }
+
+    .chip.status-info {
+      background: var(--status-busy-bg);
+      color: var(--status-busy);
+      border: 1px solid var(--accent-border);
+    }
+
+    .chip.status-warning {
+      background: var(--status-warning-bg);
+      color: var(--status-warning);
+      border: 1px solid rgba(217, 119, 6, 0.3);
+    }
+
+    .chip.status-idle,
+    .chip.status-muted {
+      background: var(--status-idle-bg);
+      color: var(--status-idle);
+      border: 1px solid var(--border-color);
+    }
+
+    .task-meta-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 11px;
+      color: var(--text-muted);
+      flex-wrap: wrap;
+    }
+
+    /* -------------------------------------------------------------
+       Event Feed
+       ------------------------------------------------------------- */
+    .event-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .event-item {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      transition: border-color 0.2s, background-color 0.2s, transform 0.1s;
+      min-height: 48px;
+    }
+
+    .event-item-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .event-kind-badge {
+      font-size: 11px;
+      font-weight: 700;
+      padding: 2px 7px;
+      border-radius: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .event-kind-done {
+      background: var(--status-online-bg);
+      color: var(--status-online);
+    }
+
+    .event-kind-started {
+      background: var(--status-busy-bg);
+      color: var(--status-busy);
+    }
+
+    .event-kind-error {
+      background: var(--status-error-bg);
+      color: var(--status-error);
+    }
+
+    .event-kind-stalled {
+      background: var(--status-warning-bg);
+      color: var(--status-warning);
+    }
+
+    .event-kind-default {
+      background: var(--bg-subtle);
+      color: var(--text-secondary);
+    }
+
+    .event-summary-box {
+      font-size: 12px;
+      color: var(--text-primary);
+      background: var(--bg-code);
+      border: 1px solid var(--border-color);
+      border-radius: 4px;
+      padding: 6px 8px;
+      word-break: break-all;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+      line-height: 1.4;
+    }
+
+    .empty-state {
+      padding: 24px;
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 13px;
+    }
+
+    /* Clickable list item touch affordance */
+    .clickable {
+      cursor: pointer;
+      user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    .clickable:hover {
+      border-color: var(--accent-primary);
+      background-color: var(--bg-surface-hover);
+    }
+
+    .clickable:active {
+      transform: scale(0.99);
+    }
+
+    .clickable:focus-visible {
+      outline: 2px solid var(--accent-primary);
+      outline-offset: 2px;
+    }
+
+    /* -------------------------------------------------------------
+       Bottom Sheet / Drawer Modal
+       ------------------------------------------------------------- */
+    .bottom-sheet-backdrop {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background-color: rgba(0, 0, 0, 0.65);
+      z-index: 1000;
+      opacity: 0;
+      visibility: hidden;
+      transition: opacity 0.25s ease, visibility 0.25s ease;
+      display: flex;
+      justify-content: center;
+      align-items: flex-end;
+      padding: 0;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    .bottom-sheet-backdrop.active {
+      opacity: 1;
+      visibility: visible;
+    }
+
+    .bottom-sheet-drawer {
+      position: relative;
+      width: 100%;
+      max-width: 600px;
+      max-height: 88vh;
+      background-color: var(--bg-surface);
+      border-top-left-radius: 16px;
+      border-top-right-radius: 16px;
+      box-shadow: 0 -4px 24px rgba(0, 0, 0, 0.25);
+      border: 1px solid var(--border-color);
+      border-bottom: none;
+      display: flex;
+      flex-direction: column;
+      transform: translateY(100%);
+      transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+      overflow: hidden;
+    }
+
+    .bottom-sheet-backdrop.active .bottom-sheet-drawer {
+      transform: translateY(0);
+    }
+
+    .sheet-handle-bar {
+      display: flex;
+      justify-content: center;
+      padding: 10px 0 4px;
+      flex-shrink: 0;
+    }
+
+    .sheet-handle {
+      width: 36px;
+      height: 4px;
+      border-radius: 2px;
+      background: var(--border-strong);
+    }
+
+    .sheet-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 16px 12px;
+      border-bottom: 1px solid var(--border-color);
+      flex-shrink: 0;
+      gap: 12px;
+    }
+
+    .sheet-title-group {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 0;
+      flex: 1;
+    }
+
+    .sheet-title {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 700;
+      color: var(--text-primary);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .sheet-subtitle {
+      font-size: 11px;
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .btn-sheet-close {
+      min-width: 44px;
+      min-height: 44px;
+      width: 44px;
+      height: 44px;
+      border-radius: 8px;
+      border: 1px solid var(--border-color);
+      background: var(--bg-surface);
+      color: var(--text-secondary);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      padding: 0;
+      flex-shrink: 0;
+      transition: background 0.15s, border-color 0.15s, transform 0.1s;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    .btn-sheet-close:hover {
+      background: var(--bg-surface-hover);
+      color: var(--text-primary);
+    }
+
+    .btn-sheet-close:active {
+      transform: scale(0.96);
+    }
+
+    .sheet-content {
+      flex: 1;
+      overflow-y: auto;
+      padding: 14px 16px 28px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      -webkit-overflow-scrolling: touch;
+    }
+
+    /* Sheet Prompt Title Card */
+    .sheet-prompt-card {
+      background: var(--bg-subtle);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .sheet-prompt-badge {
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+    }
+
+    .sheet-prompt-title {
+      margin: 0;
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--text-primary);
+      line-height: 1.4;
+      word-break: break-word;
+    }
+
+    /* Sheet Meta Card */
+    .sheet-meta-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .sheet-meta-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px 12px;
+    }
+
+    @media (max-width: 420px) {
+      .sheet-meta-grid {
+        grid-template-columns: 1fr;
+      }
+      .sheet-meta-item.span-2 {
+        grid-column: span 1 !important;
+      }
+    }
+
+    .sheet-meta-item {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 0;
+    }
+
+    .sheet-meta-label {
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    .sheet-meta-val {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-primary);
+      word-break: break-all;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .sheet-section-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin: 4px 0 0 0;
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--text-primary);
+    }
+
+    .sheet-section-header .count-badge {
+      font-size: 11px;
+      padding: 2px 7px;
+      background: var(--bg-subtle);
+      border: 1px solid var(--border-color);
+      border-radius: 10px;
+      color: var(--text-muted);
+      font-weight: 500;
+    }
+
+    /* Progress Timeline in Sheet */
+    .sheet-timeline {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .sheet-timeline-item {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 10px 12px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+    }
+
+    .sheet-timeline-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .sheet-timeline-type {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 7px;
+      border-radius: 4px;
+    }
+
+    .step-badge-model {
+      background: var(--status-busy-bg);
+      color: var(--status-busy);
+      border: 1px solid var(--accent-border);
+    }
+
+    .step-badge-tool {
+      background: var(--status-warning-bg);
+      color: var(--status-warning);
+      border: 1px solid rgba(217, 119, 6, 0.3);
+    }
+
+    .step-badge-subagent {
+      background: rgba(147, 51, 234, 0.12);
+      color: #9333ea;
+      border: 1px solid rgba(147, 51, 234, 0.3);
+    }
+
+    @media (prefers-color-scheme: dark) {
+      .step-badge-subagent {
+        color: #c084fc;
+        border-color: rgba(192, 132, 252, 0.35);
+      }
+    }
+
+    .step-badge-system {
+      background: var(--bg-subtle);
+      color: var(--text-secondary);
+      border: 1px solid var(--border-color);
+    }
+
+    .sheet-timeline-summary {
+      font-size: 12px;
+      color: var(--text-primary);
+      line-height: 1.45;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+      background: var(--bg-code);
+      padding: 8px 10px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border-color);
+    }
+
+    .sheet-truncation-banner {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 12px;
+      background: var(--status-warning-bg);
+      border: 1px solid rgba(217, 119, 6, 0.35);
+      border-radius: var(--radius-sm);
+      color: var(--status-warning);
+      font-size: 12px;
+      font-weight: 600;
+      line-height: 1.4;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+    }
+
+    .sheet-notice-box {
+      padding: 14px 16px;
+      text-align: center;
+      color: var(--text-secondary);
+      font-size: 12px;
+      line-height: 1.5;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+    }
+
+    /* Output Log Tail */
+    .sheet-details {
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      background: var(--bg-surface);
+      overflow: hidden;
+    }
+
+    .sheet-summary-toggle {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 14px;
+      min-height: 44px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-primary);
+      background: var(--bg-subtle);
+      cursor: pointer;
+      user-select: none;
+      list-style: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    .sheet-summary-toggle::-webkit-details-marker {
+      display: none;
+    }
+
+    .sheet-summary-toggle:hover {
+      background: var(--bg-surface-hover);
+    }
+
+    .log-scroll-box {
+      padding: 10px;
+      max-height: 250px;
+      overflow-y: auto;
+      overflow-x: auto;
+      background: var(--bg-code);
+      border-top: 1px solid var(--border-color);
+    }
+
+    .log-code-pre {
+      margin: 0;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      line-height: 1.45;
+      color: var(--text-primary);
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
+    /* Connected Events List */
+    .sheet-events-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .sheet-event-card {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 10px 12px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      min-height: 44px;
+      cursor: pointer;
+      transition: border-color 0.15s, background-color 0.15s, transform 0.1s;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    .sheet-event-card:hover {
+      border-color: var(--accent-primary);
+      background-color: var(--bg-surface-hover);
+    }
+
+    .sheet-event-card:active {
+      transform: scale(0.99);
+    }
+
+    /* Event Detail Summary */
+    .event-full-summary-box {
+      font-size: 13px;
+      line-height: 1.5;
+      color: var(--text-primary);
+      background: var(--bg-code);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      padding: 12px 14px;
+      word-break: break-word;
+      white-space: pre-wrap;
+      max-height: 280px;
+      overflow-y: auto;
+    }
+
+    .btn-action {
+      min-height: 44px;
+      width: 100%;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 10px 16px;
+      background: var(--accent-primary);
+      color: #ffffff;
+      border: none;
+      border-radius: var(--radius-md);
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s, transform 0.1s;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    .btn-action:hover {
+      opacity: 0.92;
+    }
+
+    .btn-action:active {
+      transform: scale(0.98);
+    }
+
+    /* Loading, Error, Empty States */
+    .sheet-loading-container {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      padding: 48px 16px;
+      color: var(--text-muted);
+    }
+
+    .sheet-loading-text {
+      font-size: 13px;
+      font-weight: 500;
+    }
+
+    .spin-icon {
+      animation: spin 1s linear infinite;
+    }
+
+    .sheet-error-container {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      padding: 36px 16px;
+      text-align: center;
+    }
+
+    .sheet-error-title {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--status-error);
+    }
+
+    .sheet-error-msg {
+      font-size: 12px;
+      color: var(--text-muted);
+      max-width: 320px;
+      word-break: break-word;
+    }
+
+    .sheet-empty-state {
+      padding: 16px;
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 12px;
+      background: var(--bg-subtle);
+      border: 1px dashed var(--border-color);
+      border-radius: var(--radius-md);
+    }
+
+    /* -------------------------------------------------------------
+       Dynamic Inline SVG Diagram Styles
+       ------------------------------------------------------------- */
+    .diagram-container {
+      width: 100%;
+      overflow: hidden;
+      border-radius: var(--radius-lg);
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      padding: 12px 8px;
+      box-shadow: var(--shadow-sm);
+    }
+
+    .flow-svg {
+      width: 100%;
+      height: auto;
+      display: block;
+      overflow: visible;
+    }
+
+    .svg-node-box {
+      fill: var(--bg-subtle);
+      stroke: var(--border-strong);
+      stroke-width: 1.5;
+      transition: fill 0.3s, stroke 0.3s;
+    }
+
+    .node-title {
+      fill: var(--text-primary);
+      font-size: 12px;
+      font-weight: 700;
+      text-anchor: middle;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+
+    .node-sub {
+      fill: var(--text-muted);
+      font-size: 10px;
+      font-weight: 400;
+      text-anchor: middle;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+
+    .node-badge-rect {
+      fill: var(--bg-surface);
+      stroke: var(--border-strong);
+      stroke-width: 1;
+      transition: fill 0.3s, stroke 0.3s;
+    }
+
+    .node-badge-text {
+      fill: var(--text-secondary);
+      font-size: 9.5px;
+      font-weight: 700;
+      text-anchor: middle;
+      font-family: var(--font-mono);
+    }
+
+    /* States */
+    .node.state-running .svg-node-box {
+      fill: var(--status-busy-bg);
+      stroke: var(--status-busy);
+      stroke-width: 2;
+    }
+
+    .node.state-running .node-badge-rect {
+      stroke: var(--status-busy);
+    }
+
+    .node.state-running .node-badge-text {
+      fill: var(--status-busy);
+    }
+
+    .node.state-error .svg-node-box {
+      fill: var(--status-error-bg);
+      stroke: var(--status-error);
+      stroke-width: 2;
+    }
+
+    .node.state-error .node-badge-rect {
+      stroke: var(--status-error);
+    }
+
+    .node.state-error .node-badge-text {
+      fill: var(--status-error);
+    }
+
+    .node.state-dead .svg-node-box {
+      fill: var(--bg-subtle);
+      stroke: var(--border-color);
+      stroke-dasharray: 4 3;
+      opacity: 0.6;
+    }
+
+    .node.state-dead .node-badge-text {
+      fill: var(--text-muted);
+    }
+
+    /* Flow paths */
+    .flow-line {
+      fill: none;
+      stroke: var(--border-strong);
+      stroke-width: 1.5;
+      transition: stroke 0.3s, stroke-width 0.3s;
+    }
+
+    .flow-line.active {
+      stroke: var(--accent-primary);
+      stroke-width: 2.5;
+      stroke-dasharray: 6 4;
+      animation: dashMove 1s linear infinite;
+    }
+
+    .flow-line.return-active {
+      stroke: var(--status-online);
+      stroke-width: 2.5;
+      stroke-dasharray: 6 4;
+      animation: dashMove 1s linear infinite;
+    }
+
+    .flow-label-text {
+      fill: var(--text-muted);
+      font-size: 9px;
+      font-weight: 600;
+      text-anchor: middle;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+
+    .legend-box {
+      fill: var(--bg-subtle);
+      stroke: var(--border-color);
+      stroke-width: 1;
+    }
+
+    .legend-text {
+      fill: var(--text-secondary);
+      font-size: 10px;
+      font-weight: 500;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+
+    /* -------------------------------------------------------------
+       Animations & Accessibility
+       ------------------------------------------------------------- */
+    @keyframes dashMove {
+      from { stroke-dashoffset: 20; }
+      to { stroke-dashoffset: 0; }
+    }
+
+    @keyframes spin {
+      100% { transform: rotate(360deg); }
+    }
+
+    @keyframes pulse {
+      0% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.3; transform: scale(0.85); }
+      100% { opacity: 1; transform: scale(1); }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .bottom-sheet-backdrop,
+      .bottom-sheet-drawer,
+      .clickable,
+      .flow-line.active,
+      .flow-line.return-active,
+      .pulse-dot,
+      .btn-icon.spinning svg,
+      .spin-icon {
+        animation: none !important;
+        transition: none !important;
+        stroke-dasharray: none !important;
+      }
+      * {
+        transition: none !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <!-- =========================================================
+         Top Header Bar
+         ========================================================= -->
+    <header class="top-header">
+      <div class="top-header-row1">
+        <div class="title-group">
+          <div class="logo-badge" aria-hidden="true">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="2" y="2" width="20" height="8" rx="2" ry="2"></rect>
+              <rect x="2" y="14" width="20" height="8" rx="2" ry="2"></rect>
+              <line x1="6" y1="6" x2="6.01" y2="6"></line>
+              <line x1="6" y1="18" x2="6.01" y2="18"></line>
+            </svg>
+          </div>
+          <div>
+            <h1 class="app-title">AgentCommandChain 대시보드</h1>
+            <p class="app-subtitle">4-Tier 통합 에이전트 오케스트레이션 현황</p>
+          </div>
+        </div>
+
+        <div class="top-actions">
+          <div id="status-pill" class="status-pill offline" role="status">
+            <span class="status-dot"></span>
+            <span id="status-pill-text">연결 확인중</span>
+          </div>
+
+          <button id="btn-refresh" class="btn-icon" aria-label="새로고침" title="상태 즉시 새로고침">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="top-header-row2">
+        <div class="meta-group">
+          <span>세션: <span id="meta-session" class="meta-chip">-</span></span>
+          <span>Git: <span id="meta-git" class="meta-chip">-</span></span>
+        </div>
+        <div>
+          <span>시간: <span id="meta-time" style="font-family: var(--font-mono);">-</span></span>
+        </div>
+      </div>
+    </header>
+
+    <!-- =========================================================
+         Disconnection Warning Banner
+         ========================================================= -->
+    <div id="disconnect-banner" class="disconnect-banner" role="alert">
+      <div class="disconnect-content">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;">
+          <circle cx="12" cy="12" r="10"></circle>
+          <line x1="12" y1="8" x2="12" y2="12"></line>
+          <line x1="12" y1="16" x2="12.01" y2="16"></line>
+        </svg>
+        <span id="disconnect-msg">서버 연결 끊김 - 마지막 갱신 확인 중...</span>
+      </div>
+      <button id="btn-retry" class="btn-retry">지금 재시도</button>
+    </div>
+
+    <!-- =========================================================
+         Dynamic Inline SVG Architecture Diagram
+         ========================================================= -->
+    <section class="card" style="padding: 10px;">
+      <h2 class="section-title" style="padding: 4px 6px;">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+        </svg>
+        4-Tier 아키텍처 워크플로우
+      </h2>
+      <div class="diagram-container">
+        <svg class="flow-svg" viewBox="0 0 440 550" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="arrow" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="var(--border-strong)"></path>
+            </marker>
+            <marker id="arrow-active" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="var(--accent-primary)"></path>
+            </marker>
+            <marker id="arrow-green" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="var(--status-online)"></path>
+            </marker>
+          </defs>
+
+          <!-- 1. User Node -->
+          <g id="node-user" class="node state-running">
+            <rect class="svg-node-box" x="140" y="12" width="160" height="42" rx="8"></rect>
+            <text class="node-title" x="220" y="30">사용자 (사람)</text>
+            <text class="node-sub" x="220" y="44">Operator / Auditor</text>
+            <rect class="node-badge-rect" x="250" y="16" width="42" height="14" rx="3"></rect>
+            <text class="node-badge-text" x="271" y="27">명령</text>
+          </g>
+
+          <!-- Line: User <-> Sonnet -->
+          <path id="path-user-sonnet" d="M 220 54 L 220 80" class="flow-line" marker-end="url(#arrow)"></path>
+          <text class="flow-label-text" x="220" y="70">지시 ↕ 결과보고</text>
+
+          <!-- 2. Sonnet Node (Tier 1 Supervisor) -->
+          <g id="node-sonnet" class="node state-idle">
+            <rect class="svg-node-box" x="70" y="82" width="300" height="52" rx="8"></rect>
+            <text class="node-title" x="220" y="103">Sonnet (감독 / 감사)</text>
+            <text class="node-sub" x="220" y="118">Tier 1: Supervisor (claude-bridge)</text>
+            <rect class="node-badge-rect" x="312" y="88" width="50" height="16" rx="3"></rect>
+            <text id="badge-sonnet-text" class="node-badge-text" x="337" y="100">감독대기</text>
+          </g>
+
+          <!-- Line: Sonnet -> agy -->
+          <path id="path-sonnet-agy" d="M 135 134 L 105 174" class="flow-line" marker-end="url(#arrow)"></path>
+          <text class="flow-label-text" x="95" y="156">디스패치 + 1줄도어벨</text>
+
+          <!-- Line: Sonnet -> Codex -->
+          <path id="path-sonnet-codex" d="M 305 134 L 335 174" class="flow-line" marker-end="url(#arrow)"></path>
+          <text class="flow-label-text" x="345" y="156">단발 디스패치</text>
+
+          <!-- 3. agy Node (Tier 2 Router) -->
+          <g id="node-agy" class="node state-idle">
+            <rect class="svg-node-box" x="15" y="176" width="180" height="62" rx="8"></rect>
+            <text class="node-title" x="105" y="198">agy (상주 라우터)</text>
+            <text class="node-sub" x="105" y="213">Tier 2: 상주 TUI / 도어벨</text>
+            <rect class="node-badge-rect" x="45" y="221" width="120" height="13" rx="3"></rect>
+            <text id="badge-agy-text" class="node-badge-text" x="105" y="231">상주 유휴</text>
+          </g>
+
+          <!-- 4. Codex Node (Tier 2 Oneshot) -->
+          <g id="node-codex" class="node state-idle">
+            <rect class="svg-node-box" x="245" y="176" width="180" height="62" rx="8"></rect>
+            <text class="node-title" x="335" y="198">Codex (단발 워커)</text>
+            <text class="node-sub" x="335" y="213">Tier 2: Oneshot 작업</text>
+            <rect class="node-badge-rect" x="275" y="221" width="120" height="13" rx="3"></rect>
+            <text id="badge-codex-text" class="node-badge-text" x="335" y="231">유휴</text>
+          </g>
+
+          <!-- Line: agy -> subagents -->
+          <path id="path-agy-subagents" d="M 105 238 L 105 268" class="flow-line" marker-end="url(#arrow)"></path>
+          <text class="flow-label-text" x="105" y="255">서브태스크 위임</text>
+
+          <!-- 5. Subagents Node (Tier 3) -->
+          <g id="node-subagents" class="node state-idle">
+            <rect class="svg-node-box" x="15" y="270" width="180" height="46" rx="8"></rect>
+            <text class="node-title" x="105" y="289">서브에이전트군</text>
+            <text class="node-sub" x="105" y="303">Tier 3: gemini / flash / pro</text>
+            <rect class="node-badge-rect" x="145" y="275" width="42" height="13" rx="3"></rect>
+            <text id="badge-subagents-text" class="node-badge-text" x="166" y="285">대기</text>
+          </g>
+
+          <!-- Line: subagents/agy -> Outbox (Stop Hook / event-emit) -->
+          <path id="path-agy-outbox" d="M 105 316 L 105 348" class="flow-line" marker-end="url(#arrow)"></path>
+          <text class="flow-label-text" x="105" y="334">Stop Hook / event-emit</text>
+
+          <!-- Line: Codex -> Outbox (return event) -->
+          <path id="path-codex-outbox" d="M 335 238 C 335 295, 230 355, 195 365" class="flow-line" marker-end="url(#arrow)"></path>
+
+          <!-- 6. Outbox Node (Pending Queue) -->
+          <g id="node-outbox" class="node state-idle">
+            <rect class="svg-node-box" x="15" y="350" width="180" height="52" rx="8"></rect>
+            <text class="node-title" x="105" y="371">이벤트 Outbox</text>
+            <text class="node-sub" x="105" y="386">Pending / FIFO 큐</text>
+            <rect class="node-badge-rect" x="55" y="390" width="100" height="11" rx="3"></rect>
+            <text id="badge-outbox-text" class="node-badge-text" x="105" y="399">0건 대기</text>
+          </g>
+
+          <!-- Line: Outbox -> Listener -->
+          <path id="path-outbox-listener" d="M 195 376 L 243 376" class="flow-line" marker-end="url(#arrow)"></path>
+          <text class="flow-label-text" x="219" y="370">FIFO</text>
+
+          <!-- 7. sonnet-event-wait (Listener Daemon) -->
+          <g id="node-listener" class="node state-idle">
+            <rect class="svg-node-box" x="245" y="350" width="180" height="52" rx="8"></rect>
+            <text class="node-title" x="335" y="371">sonnet-event-wait</text>
+            <text class="node-sub" x="335" y="386">이벤트 수신 리스너</text>
+            <rect class="node-badge-rect" x="285" y="390" width="100" height="11" rx="3"></rect>
+            <text id="badge-listener-text" class="node-badge-text" x="335" y="399">가동중</text>
+          </g>
+
+          <!-- Line: Listener -> Sonnet (Event return & ack) -->
+          <path id="path-listener-sonnet" d="M 390 350 C 435 260, 435 160, 372 115" class="flow-line" marker-end="url(#arrow)"></path>
+          <text class="flow-label-text" x="410" y="215">통지 &amp; Ack</text>
+
+          <!-- 8. Watchdog Node (Cross-cutting Recovery) -->
+          <g id="node-watchdog" class="node state-idle">
+            <rect class="svg-node-box" x="15" y="425" width="410" height="52" rx="8"></rect>
+            <text class="node-title" x="220" y="446">Watchdog (감시 및 복구 데몬)</text>
+            <text class="node-sub" x="220" y="461">Deadlines · Stall 감지 · 비정상 세션 자동 복구</text>
+            <rect class="node-badge-rect" x="150" y="465" width="140" height="11" rx="3"></rect>
+            <text id="badge-watchdog-text" class="node-badge-text" x="220" y="474">가동중</text>
+          </g>
+
+          <!-- Dashed monitoring lines from Watchdog -->
+          <path id="path-watchdog-mon" d="M 105 425 L 105 404 M 335 425 L 335 404" class="flow-line" stroke-dasharray="3 3"></path>
+
+          <!-- 9. Legend Bar -->
+          <g id="diagram-legend" transform="translate(15, 498)">
+            <rect class="legend-box" x="0" y="0" width="410" height="34" rx="6"></rect>
+            <!-- Blue dot -->
+            <circle cx="20" cy="17" r="5" fill="var(--status-busy)"></circle>
+            <text class="legend-text" x="30" y="21">가동/실행중</text>
+            <!-- Gray dot -->
+            <circle cx="120" cy="17" r="5" fill="var(--status-idle)"></circle>
+            <text class="legend-text" x="130" y="21">유휴/대기</text>
+            <!-- Red dot -->
+            <circle cx="215" cy="17" r="5" fill="var(--status-error)"></circle>
+            <text class="legend-text" x="225" y="21">오류/중지</text>
+            <!-- Dashed line -->
+            <line x1="305" y1="17" x2="325" y2="17" stroke="var(--border-strong)" stroke-dasharray="3 2" stroke-width="2"></line>
+            <text class="legend-text" x="330" y="21">감시/연계경로</text>
+          </g>
+        </svg>
+      </div>
+    </section>
+
+    <!-- =========================================================
+         Worker Cards (Sonnet, agy, codex)
+         ========================================================= -->
+    <section>
+      <h2 class="section-title">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+          <circle cx="9" cy="7" r="4"></circle>
+          <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
+          <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+        </svg>
+        에이전트 워커 현황
+      </h2>
+
+      <div class="grid-3">
+        <!-- Sonnet Worker Card -->
+        <div id="card-sonnet" class="worker-card">
+          <div class="worker-header">
+            <div class="worker-name-group">
+              <div class="worker-avatar">S</div>
+              <span class="worker-name">Sonnet</span>
+            </div>
+            <span class="badge-chip mode-supervisor">감독 (Supervisor)</span>
+          </div>
+
+          <div class="worker-body">
+            <div class="info-row">
+              <span class="info-label">윈도우 상태</span>
+              <span id="sonnet-win-status" class="info-value">-</span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">실행 명령</span>
+              <span id="sonnet-cmd-status" class="info-value">-</span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">작업 상태</span>
+              <span id="sonnet-busy-status" class="state-indicator idle">
+                <span class="pulse-dot"></span>
+                <span id="sonnet-busy-label">대기중</span>
+              </span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">현재 작업</span>
+              <span id="sonnet-task-id" class="info-value">-</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- agy Worker Card -->
+        <div id="card-agy" class="worker-card">
+          <div class="worker-header">
+            <div class="worker-name-group">
+              <div class="worker-avatar">A</div>
+              <span class="worker-name">agy</span>
+            </div>
+            <span id="agy-mode-badge" class="badge-chip mode-resident">상주 (Resident)</span>
+          </div>
+
+          <div class="worker-body">
+            <div class="info-row">
+              <span class="info-label">윈도우 상태</span>
+              <span id="agy-win-status" class="info-value">-</span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">실행 명령</span>
+              <span id="agy-cmd-status" class="info-value">-</span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">작업 상태</span>
+              <span id="agy-busy-status" class="state-indicator idle">
+                <span class="pulse-dot"></span>
+                <span id="agy-busy-label">유휴</span>
+              </span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">현재 작업</span>
+              <span id="agy-task-id" class="info-value">-</span>
+            </div>
+            <div class="info-row" id="agy-elapsed-row" style="display: none;">
+              <span class="info-label">경과 시간</span>
+              <span id="agy-elapsed-time" class="info-value">-</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Codex Worker Card -->
+        <div id="card-codex" class="worker-card">
+          <div class="worker-header">
+            <div class="worker-name-group">
+              <div class="worker-avatar">C</div>
+              <span class="worker-name">Codex</span>
+            </div>
+            <span id="codex-mode-badge" class="badge-chip mode-oneshot">단발 (Oneshot)</span>
+          </div>
+
+          <div class="worker-body">
+            <div class="info-row">
+              <span class="info-label">윈도우 상태</span>
+              <span id="codex-win-status" class="info-value">-</span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">실행 명령</span>
+              <span id="codex-cmd-status" class="info-value">-</span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">작업 상태</span>
+              <span id="codex-busy-status" class="state-indicator idle">
+                <span class="pulse-dot"></span>
+                <span id="codex-busy-label">유휴</span>
+              </span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">현재 작업</span>
+              <span id="codex-task-id" class="info-value">-</span>
+            </div>
+            <div class="info-row" id="codex-elapsed-row" style="display: none;">
+              <span class="info-label">경과 시간</span>
+              <span id="codex-elapsed-time" class="info-value">-</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- =========================================================
+         Daemons & Queue Section
+         ========================================================= -->
+    <section>
+      <h2 class="section-title">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="2" y="2" width="20" height="8" rx="2" ry="2"></rect>
+          <rect x="2" y="14" width="20" height="8" rx="2" ry="2"></rect>
+          <line x1="6" y1="6" x2="6.01" y2="6"></line>
+          <line x1="6" y1="18" x2="6.01" y2="18"></line>
+        </svg>
+        데몬 및 이벤트 큐
+      </h2>
+
+      <div class="grid-2">
+        <!-- Daemons Card -->
+        <div class="card" style="display:flex; flex-direction:column; gap:10px;">
+          <div style="font-weight:700; font-size:13px; color:var(--text-secondary);">백그라운드 데몬</div>
+
+          <!-- Watchdog -->
+          <div class="daemon-item">
+            <div class="daemon-info">
+              <span class="daemon-name">Watchdog 감시 데몬</span>
+              <span class="daemon-sub">watchdog-v2.sh · 데드라인/Stall 감시</span>
+            </div>
+            <span id="daemon-watchdog-chip" class="chip status-done">확인중</span>
+          </div>
+
+          <!-- Listener -->
+          <div class="daemon-item">
+            <div class="daemon-info">
+              <span class="daemon-name">Sonnet 이벤트 리스너</span>
+              <span class="daemon-sub">sonnet-event-wait.sh · Outbox FIFO</span>
+            </div>
+            <span id="daemon-listener-chip" class="chip status-done">확인중</span>
+          </div>
+        </div>
+
+        <!-- Event Queue Summary Card -->
+        <div class="card" style="display:flex; flex-direction:column; gap:8px;">
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <span style="font-weight:700; font-size:13px; color:var(--text-secondary);">이벤트 Outbox 큐 현황</span>
+            <span id="queue-elapsed-badge" class="meta-chip" style="display:none;">큐 경과: -</span>
+          </div>
+
+          <div class="queue-stats-row">
+            <div class="queue-stat-box">
+              <div id="stat-pending" class="queue-stat-num">0</div>
+              <div class="queue-stat-label">대기 (Pending)</div>
+            </div>
+            <div class="queue-stat-box">
+              <div id="stat-inflight" class="queue-stat-num">0</div>
+              <div class="queue-stat-label">처리중 (Inflight)</div>
+            </div>
+            <div class="queue-stat-box">
+              <div id="stat-archive" class="queue-stat-num">0</div>
+              <div class="queue-stat-label">보관 (Archive)</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- =========================================================
+         Recent Tasks Timeline
+         ========================================================= -->
+    <section>
+      <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;">
+        <h2 class="section-title" style="margin-bottom:0;">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="9 11 12 14 22 4"></polyline>
+            <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path>
+          </svg>
+          최근 작업 내역 (Tasks)
+        </h2>
+        <span id="tasks-count" class="count-badge">0건</span>
+      </div>
+
+      <div id="tasks-container" class="task-list">
+        <div class="card empty-state">작업 내역을 불러오는 중입니다...</div>
+      </div>
+    </section>
+
+    <!-- =========================================================
+         Recent Events Feed
+         ========================================================= -->
+    <section>
+      <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;">
+        <h2 class="section-title" style="margin-bottom:0;">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+            <polyline points="14 2 14 8 20 8"></polyline>
+            <line x1="16" y1="13" x2="8" y2="13"></line>
+            <line x1="16" y1="17" x2="8" y2="17"></line>
+            <polyline points="10 9 9 9 8 9"></polyline>
+          </svg>
+          이벤트 피드 (Recent Events)
+        </h2>
+        <span id="events-count" class="count-badge">0건</span>
+      </div>
+
+      <div id="events-container" class="event-list">
+        <div class="card empty-state">이벤트를 불러오는 중입니다...</div>
+      </div>
+    </section>
+
+    <footer style="text-align:center; padding: 20px 0; font-size:12px; color:var(--text-muted);">
+      AgentCommandChain v2 · Single-File Mobile-First Operations Dashboard
+    </footer>
+  </div>
+
+  <!-- =========================================================
+       Bottom Sheet / Drawer Modal (Task & Event Details)
+       ========================================================= -->
+  <div id="detail-sheet-backdrop" class="bottom-sheet-backdrop" role="dialog" aria-modal="true" aria-hidden="true">
+    <div class="bottom-sheet-drawer" role="document">
+      <div class="sheet-handle-bar" aria-hidden="true">
+        <div class="sheet-handle"></div>
+      </div>
+      <div class="sheet-header">
+        <div class="sheet-title-group">
+          <h2 id="sheet-title" class="sheet-title">상세 정보</h2>
+          <span id="sheet-subtitle" class="sheet-subtitle"></span>
+        </div>
+        <button id="btn-sheet-close" class="btn-sheet-close" aria-label="닫기" title="닫기 (ESC)">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" y1="6" x2="6" y2="18"></line>
+            <line x1="6" y1="6" x2="18" y2="18"></line>
+          </svg>
+        </button>
+      </div>
+      <div id="sheet-content" class="sheet-content">
+        <!-- Dynamically populated via Safe DOM APIs -->
+      </div>
+    </div>
+  </div>
+
+  <!-- =========================================================
+       Pure Inline JavaScript (Strictly DOM-based)
+       ========================================================= -->
+  <script>
+    (function () {
+      'use strict';
+
+      /* -----------------------------------------------------------
+         State Management & Configuration
+         ----------------------------------------------------------- */
+      var POLL_INTERVAL = 3000;
+      var currentDelay = POLL_INTERVAL;
+      var MAX_DELAY = 30000;
+      var pollTimer = null;
+      var lastSuccessTimestamp = null;
+      var isPolling = false;
+      var latestState = null;
+
+      // Bottom Sheet State
+      var activeSheetType = null; // 'task' | 'event' | null
+      var activeSheetId = null;
+      var taskDetailPollTimeout = null;
+
+      /* -----------------------------------------------------------
+         DOM Elements
+         ----------------------------------------------------------- */
+      var statusPill = document.getElementById('status-pill');
+      var statusPillText = document.getElementById('status-pill-text');
+      var btnRefresh = document.getElementById('btn-refresh');
+      var metaSession = document.getElementById('meta-session');
+      var metaGit = document.getElementById('meta-git');
+      var metaTime = document.getElementById('meta-time');
+      var disconnectBanner = document.getElementById('disconnect-banner');
+      var disconnectMsg = document.getElementById('disconnect-msg');
+      var btnRetry = document.getElementById('btn-retry');
+
+      // SVG Elements
+      var nodeSonnet = document.getElementById('node-sonnet');
+      var nodeAgy = document.getElementById('node-agy');
+      var nodeCodex = document.getElementById('node-codex');
+      var nodeSubagents = document.getElementById('node-subagents');
+      var nodeOutbox = document.getElementById('node-outbox');
+      var nodeListener = document.getElementById('node-listener');
+      var nodeWatchdog = document.getElementById('node-watchdog');
+
+      var badgeSonnetText = document.getElementById('badge-sonnet-text');
+      var badgeAgyText = document.getElementById('badge-agy-text');
+      var badgeCodexText = document.getElementById('badge-codex-text');
+      var badgeSubagentsText = document.getElementById('badge-subagents-text');
+      var badgeOutboxText = document.getElementById('badge-outbox-text');
+      var badgeListenerText = document.getElementById('badge-listener-text');
+      var badgeWatchdogText = document.getElementById('badge-watchdog-text');
+
+      var pathSonnetAgy = document.getElementById('path-sonnet-agy');
+      var pathSonnetCodex = document.getElementById('path-sonnet-codex');
+      var pathAgySubagents = document.getElementById('path-agy-subagents');
+      var pathAgyOutbox = document.getElementById('path-agy-outbox');
+      var pathOutboxListener = document.getElementById('path-outbox-listener');
+      var pathListenerSonnet = document.getElementById('path-listener-sonnet');
+
+      // Worker Elements
+      var cardSonnet = document.getElementById('card-sonnet');
+      var cardAgy = document.getElementById('card-agy');
+      var cardCodex = document.getElementById('card-codex');
+
+      var sonnetWinStatus = document.getElementById('sonnet-win-status');
+      var sonnetCmdStatus = document.getElementById('sonnet-cmd-status');
+      var sonnetBusyStatus = document.getElementById('sonnet-busy-status');
+      var sonnetBusyLabel = document.getElementById('sonnet-busy-label');
+      var sonnetTaskId = document.getElementById('sonnet-task-id');
+
+      var agyModeBadge = document.getElementById('agy-mode-badge');
+      var agyWinStatus = document.getElementById('agy-win-status');
+      var agyCmdStatus = document.getElementById('agy-cmd-status');
+      var agyBusyStatus = document.getElementById('agy-busy-status');
+      var agyBusyLabel = document.getElementById('agy-busy-label');
+      var agyTaskId = document.getElementById('agy-task-id');
+      var agyElapsedRow = document.getElementById('agy-elapsed-row');
+      var agyElapsedTime = document.getElementById('agy-elapsed-time');
+
+      var codexModeBadge = document.getElementById('codex-mode-badge');
+      var codexWinStatus = document.getElementById('codex-win-status');
+      var codexCmdStatus = document.getElementById('codex-cmd-status');
+      var codexBusyStatus = document.getElementById('codex-busy-status');
+      var codexBusyLabel = document.getElementById('codex-busy-label');
+      var codexTaskId = document.getElementById('codex-task-id');
+      var codexElapsedRow = document.getElementById('codex-elapsed-row');
+      var codexElapsedTime = document.getElementById('codex-elapsed-time');
+
+      // Daemon & Queue Elements
+      var daemonWatchdogChip = document.getElementById('daemon-watchdog-chip');
+      var daemonListenerChip = document.getElementById('daemon-listener-chip');
+      var statPending = document.getElementById('stat-pending');
+      var statInflight = document.getElementById('stat-inflight');
+      var statArchive = document.getElementById('stat-archive');
+      var queueElapsedBadge = document.getElementById('queue-elapsed-badge');
+
+      // Tasks & Events Containers
+      var tasksContainer = document.getElementById('tasks-container');
+      var tasksCount = document.getElementById('tasks-count');
+      var eventsContainer = document.getElementById('events-container');
+      var eventsCount = document.getElementById('events-count');
+
+      // Bottom Sheet Elements
+      var detailSheetBackdrop = document.getElementById('detail-sheet-backdrop');
+      var sheetTitle = document.getElementById('sheet-title');
+      var sheetSubtitle = document.getElementById('sheet-subtitle');
+      var btnSheetClose = document.getElementById('btn-sheet-close');
+      var sheetContent = document.getElementById('sheet-content');
+
+      /* -----------------------------------------------------------
+         Helper DOM Builder (Strictly Safe DOM APIs)
+         ----------------------------------------------------------- */
+      var SVG_NS = 'http://www.w3.org/2000/svg';
+
+      function el(tag, attributes, children) {
+        var element = document.createElement(tag);
+        if (attributes) {
+          for (var key in attributes) {
+            if (Object.prototype.hasOwnProperty.call(attributes, key)) {
+              var val = attributes[key];
+              if (key === 'className') {
+                element.className = val;
+              } else if (key === 'textContent') {
+                element.textContent = val;
+              } else if (key.indexOf('on') === 0 && typeof val === 'function') {
+                element.addEventListener(key.substring(2).toLowerCase(), val);
+              } else if (val !== null && val !== undefined) {
+                element.setAttribute(key, String(val));
+              }
+            }
+          }
+        }
+        if (children) {
+          if (!Array.isArray(children)) {
+            children = [children];
+          }
+          for (var i = 0; i < children.length; i++) {
+            var child = children[i];
+            if (child == null) continue;
+            if (typeof child === 'string' || typeof child === 'number') {
+              element.appendChild(document.createTextNode(String(child)));
+            } else if (child instanceof Node) {
+              element.appendChild(child);
+            }
+          }
+        }
+        return element;
+      }
+
+      function svgEl(tag, attrs, children) {
+        var elem = document.createElementNS(SVG_NS, tag);
+        if (attrs) {
+          for (var k in attrs) {
+            if (Object.prototype.hasOwnProperty.call(attrs, k)) {
+              elem.setAttribute(k, String(attrs[k]));
+            }
+          }
+        }
+        if (children) {
+          if (!Array.isArray(children)) children = [children];
+          for (var i = 0; i < children.length; i++) {
+            if (children[i]) elem.appendChild(children[i]);
+          }
+        }
+        return elem;
+      }
+
+      function clearElement(element) {
+        while (element.firstChild) {
+          element.removeChild(element.firstChild);
+        }
+      }
+
+      /* -----------------------------------------------------------
+         SVG Icon Generators (Safe DOM)
+         ----------------------------------------------------------- */
+      function createChevronIcon() {
+        return svgEl('svg', {
+          width: '14', height: '14', viewBox: '0 0 24 24',
+          fill: 'none', stroke: 'currentColor', 'stroke-width': '2.2',
+          'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+          style: 'color: var(--text-muted); flex-shrink: 0;'
+        }, [
+          svgEl('polyline', { points: '9 18 15 12 9 6' })
+        ]);
+      }
+
+      function createSpinnerIcon() {
+        return svgEl('svg', {
+          width: '28', height: '28', viewBox: '0 0 24 24',
+          fill: 'none', stroke: 'currentColor', 'stroke-width': '2.5',
+          'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+          class: 'spin-icon'
+        }, [
+          svgEl('circle', { cx: '12', cy: '12', r: '10', 'stroke-opacity': '0.25' }),
+          svgEl('path', { d: 'M12 2a10 10 0 0 1 10 10' })
+        ]);
+      }
+
+      function createStepIcon(iconType) {
+        if (iconType === 'model') {
+          return svgEl('svg', {
+            width: '12', height: '12', viewBox: '0 0 24 24',
+            fill: 'none', stroke: 'currentColor', 'stroke-width': '2',
+            'stroke-linecap': 'round', 'stroke-linejoin': 'round'
+          }, [
+            svgEl('path', { d: 'M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z' })
+          ]);
+        }
+        if (iconType === 'tool') {
+          return svgEl('svg', {
+            width: '12', height: '12', viewBox: '0 0 24 24',
+            fill: 'none', stroke: 'currentColor', 'stroke-width': '2',
+            'stroke-linecap': 'round', 'stroke-linejoin': 'round'
+          }, [
+            svgEl('path', { d: 'M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z' })
+          ]);
+        }
+        if (iconType === 'subagent') {
+          return svgEl('svg', {
+            width: '12', height: '12', viewBox: '0 0 24 24',
+            fill: 'none', stroke: 'currentColor', 'stroke-width': '2',
+            'stroke-linecap': 'round', 'stroke-linejoin': 'round'
+          }, [
+            svgEl('circle', { cx: '12', cy: '12', r: '3' }),
+            svgEl('path', { d: 'M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z' })
+          ]);
+        }
+        return svgEl('svg', {
+          width: '12', height: '12', viewBox: '0 0 24 24',
+          fill: 'none', stroke: 'currentColor', 'stroke-width': '2',
+          'stroke-linecap': 'round', 'stroke-linejoin': 'round'
+        }, [
+          svgEl('polyline', { points: '4 17 10 11 4 5' }),
+          svgEl('line', { x1: '12', y1: '19', x2: '20', y2: '19' })
+        ]);
+      }
+
+      /* -----------------------------------------------------------
+         Time & String Formatters
+         ----------------------------------------------------------- */
+      function parseTimestamp(val) {
+        if (!val) return null;
+        if (typeof val === 'number') {
+          // If in seconds (10 digits), convert to ms
+          return val < 10000000000 ? val * 1000 : val;
+        }
+        var parsed = Date.parse(val);
+        return isNaN(parsed) ? null : parsed;
+      }
+
+      function formatRelativeTime(val) {
+        var ms = parseTimestamp(val);
+        if (!ms) return '-';
+        var diff = Math.floor((Date.now() - ms) / 1000);
+        if (diff < 5) return '방금 전';
+        if (diff < 60) return diff + '초 전';
+        if (diff < 3600) return Math.floor(diff / 60) + '분 전';
+        if (diff < 86400) return Math.floor(diff / 3600) + '시간 전';
+        return Math.floor(diff / 86400) + '일 전';
+      }
+
+      function formatDuration(sec) {
+        if (sec === null || sec === undefined) return '-';
+        sec = Math.round(Number(sec));
+        if (isNaN(sec) || sec < 0) return '-';
+        if (sec < 60) return sec + '초';
+        var m = Math.floor(sec / 60);
+        var s = sec % 60;
+        if (m < 60) return m + '분 ' + s + '초';
+        var h = Math.floor(m / 60);
+        return h + '시간 ' + (m % 60) + '분';
+      }
+
+      function formatClock(val) {
+        var d = val ? new Date(parseTimestamp(val) || Date.now()) : new Date();
+        var pad = function (n) { return n < 10 ? '0' + n : String(n); };
+        return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+      }
+
+      function formatStepTime(val) {
+        if (!val) return '';
+        var ms = parseTimestamp(val);
+        if (ms) {
+          return formatClock(ms);
+        }
+        return String(val);
+      }
+
+      /* -----------------------------------------------------------
+         Bottom Sheet Lifecycle & Handlers
+         ----------------------------------------------------------- */
+      function isSheetOpen() {
+        return detailSheetBackdrop.classList.contains('active');
+      }
+
+      function openSheet() {
+        detailSheetBackdrop.classList.add('active');
+        detailSheetBackdrop.setAttribute('aria-hidden', 'false');
+        document.body.style.overflow = 'hidden';
+      }
+
+      function closeSheet() {
+        detailSheetBackdrop.classList.remove('active');
+        detailSheetBackdrop.setAttribute('aria-hidden', 'true');
+        document.body.style.overflow = '';
+        activeSheetType = null;
+        activeSheetId = null;
+        stopTaskDetailPolling();
+      }
+
+      function stopTaskDetailPolling() {
+        if (taskDetailPollTimeout) {
+          clearTimeout(taskDetailPollTimeout);
+          taskDetailPollTimeout = null;
+        }
+      }
+
+      function renderSheetLoading(title, subtitle) {
+        sheetTitle.textContent = title;
+        sheetSubtitle.textContent = subtitle || '';
+        clearElement(sheetContent);
+        sheetContent.appendChild(
+          el('div', { className: 'sheet-loading-container' }, [
+            createSpinnerIcon(),
+            el('span', { className: 'sheet-loading-text', textContent: '데이터를 불러오는 중입니다...' })
+          ])
+        );
+      }
+
+      function renderSheetError(title, errorMsg, onRetry) {
+        sheetTitle.textContent = title;
+        sheetSubtitle.textContent = '';
+        clearElement(sheetContent);
+
+        var errContainer = el('div', { className: 'sheet-error-container' }, [
+          svgEl('svg', {
+            width: '32', height: '32', viewBox: '0 0 24 24',
+            fill: 'none', stroke: 'var(--status-error)', 'stroke-width': '2',
+            'stroke-linecap': 'round', 'stroke-linejoin': 'round'
+          }, [
+            svgEl('circle', { cx: '12', cy: '12', r: '10' }),
+            svgEl('line', { x1: '12', y1: '8', x2: '12', y2: '12' }),
+            svgEl('line', { x1: '12', y1: '16', x2: '12.01', y2: '16' })
+          ]),
+          el('div', { className: 'sheet-error-title', textContent: '상세 정보를 불러올 수 없습니다' }),
+          el('div', { className: 'sheet-error-msg', textContent: String(errorMsg || '서버 오류가 발생했습니다.') })
+        ]);
+
+        if (onRetry) {
+          errContainer.appendChild(
+            el('button', {
+              className: 'btn-retry',
+              type: 'button',
+              onClick: onRetry,
+              textContent: '다시 시도'
+            })
+          );
+        }
+
+        sheetContent.appendChild(errContainer);
+      }
+
+      /* -----------------------------------------------------------
+         Step Type Badge & Linked Status Resolvers
+         ----------------------------------------------------------- */
+      function getStepTypeInfo(typeStr) {
+        var t = (typeStr || '').toLowerCase();
+        if (t.indexOf('model') !== -1 || t.indexOf('response') !== -1 || t === 'planner_response') {
+          return { label: '모델 응답', className: 'step-badge-model', icon: 'model' };
+        }
+        if (t.indexOf('tool') !== -1) {
+          return { label: '도구 호출', className: 'step-badge-tool', icon: 'tool' };
+        }
+        if (t.indexOf('subagent') !== -1 || t.indexOf('sub_agent') !== -1) {
+          return { label: '서브에이전트', className: 'step-badge-subagent', icon: 'subagent' };
+        }
+        return { label: '시스템', className: 'step-badge-system', icon: 'system' };
+      }
+
+      function renderLinkedStatusBadge(statusVal) {
+        var s = (statusVal || 'none').toLowerCase();
+        var label = '트랜스크립트 없음';
+        var cls = 'chip status-idle status-muted';
+
+        if (s === 'exact') {
+          label = '정확한 연결';
+          cls = 'chip status-done status-online';
+        } else if (s === 'partial') {
+          label = '일부만 연결';
+          cls = 'chip status-warning';
+        } else if (s === 'inferred') {
+          label = '추정 (구간 미확인)';
+          cls = 'chip status-info';
+        } else if (s === 'none') {
+          label = '트랜스크립트 없음';
+          cls = 'chip status-idle status-muted';
+        }
+
+        return el('span', { className: cls }, [
+          el('span', { className: 'pulse-dot', 'aria-hidden': 'true' }),
+          el('span', { textContent: label })
+        ]);
+      }
+
+      /* -----------------------------------------------------------
+         Task Detail Sheet Content & Fetcher
+         ----------------------------------------------------------- */
+      async function openTaskDetail(taskId, isBackgroundRefresh) {
+        if (!taskId) return;
+
+        stopTaskDetailPolling();
+        activeSheetType = 'task';
+        activeSheetId = taskId;
+
+        if (!isBackgroundRefresh) {
+          renderSheetLoading('작업 상세 (Task Details)', taskId);
+          openSheet();
+        }
+
+        try {
+          var controller = new AbortController();
+          var timeoutId = setTimeout(function () { controller.abort(); }, 5000);
+
+          var response = await fetch('/api/task/' + encodeURIComponent(taskId), {
+            headers: { 'Cache-Control': 'no-cache' },
+            signal: controller.signal
+          });
+          clearTimeout(timeoutId);
+
+          if (!response.ok) {
+            throw new Error('HTTP ' + response.status + ' (' + response.statusText + ')');
+          }
+
+          var taskData = await response.json();
+
+          // Guard against rapid transitions
+          if (activeSheetType !== 'task' || activeSheetId !== taskId || !isSheetOpen()) {
+            return;
+          }
+
+          renderTaskDetailContent(taskData);
+
+          // Active Task Polling: If status === 'running', poll every 3000ms while sheet is open
+          var isRunningStatus = (taskData.meta && taskData.meta.status === 'running') || taskData.status === 'running';
+          if (isRunningStatus) {
+            stopTaskDetailPolling();
+            taskDetailPollTimeout = setTimeout(function () {
+              if (activeSheetType === 'task' && activeSheetId === taskId && isSheetOpen()) {
+                openTaskDetail(taskId, true);
+              }
+            }, 3000);
+          }
+        } catch (err) {
+          if (!isBackgroundRefresh && activeSheetType === 'task' && activeSheetId === taskId) {
+            renderSheetError('작업 상세 (Task Details)', err.message, function () {
+              openTaskDetail(taskId, false);
+            });
+          }
+        }
+      }
+
+      function renderTaskDetailContent(t) {
+        var m = t.meta || t;
+        var id = m.id || m.task_id || t.id || activeSheetId;
+        var worker = m.worker || t.worker || 'worker';
+        var mode = m.mode || t.mode || 'oneshot';
+        var status = m.status || t.status || 'unknown';
+        var isRunning = status === 'running';
+
+        sheetTitle.textContent = '작업 상세 (Task Details)';
+        sheetSubtitle.textContent = id;
+        clearElement(sheetContent);
+
+        var statusClass = 'status-done';
+        var statusLabel = '완료 (Done)';
+        if (isRunning) {
+          statusClass = 'status-running';
+          statusLabel = '실행중 (Running)';
+        } else if (status === 'error' || (m.exit_code !== null && m.exit_code !== undefined && m.exit_code !== 0)) {
+          statusClass = 'status-error';
+          statusLabel = '오류 (Error)';
+        }
+
+        var durationVal = (m.duration_s !== null && m.duration_s !== undefined) ? m.duration_s : t.duration_s;
+        var durationStr = (durationVal !== null && durationVal !== undefined)
+          ? formatDuration(durationVal)
+          : (isRunning ? '진행중' : '-');
+
+        var exitCodeVal = (m.exit_code !== null && m.exit_code !== undefined) ? m.exit_code : t.exit_code;
+        var exitCodeStr = (exitCodeVal !== null && exitCodeVal !== undefined)
+          ? String(exitCodeVal)
+          : '-';
+
+        var deadlineVal = m.deadline_at || m.deadline_epoch || m.deadline || t.deadline_at || t.deadline_epoch || t.deadline;
+        var deadlineStr = deadlineVal
+          ? formatClock(deadlineVal)
+          : '-';
+
+        var promptTitleStr = t.prompt_title || t.title || t.prompt || ('작업 #' + id);
+        var linkedStatusStr = t.linked || (t.meta && t.meta.linked) || t.linked_status || t.transcript_link_status || t.transcript_link || 'none';
+        var isTruncatedBefore = (t.truncated_before === true || t.truncated_before === 'true') || (t.meta && (t.meta.truncated_before === true || t.meta.truncated_before === 'true'));
+
+        // 1. Prompt Title Card (Prominently displayed clean heading)
+        var promptCard = el('div', { className: 'sheet-prompt-card' }, [
+          el('div', { className: 'sheet-prompt-badge', textContent: '프롬프트 / 작업 목표' }),
+          el('h3', { className: 'sheet-prompt-title', textContent: promptTitleStr })
+        ]);
+        sheetContent.appendChild(promptCard);
+
+        // 2. Meta Card
+        var metaCard = el('div', { className: 'sheet-meta-card' }, [
+          el('div', { className: 'sheet-meta-grid' }, [
+            el('div', { className: 'sheet-meta-item' }, [
+              el('span', { className: 'sheet-meta-label', textContent: '작업 ID' }),
+              el('span', { className: 'sheet-meta-val', textContent: id })
+            ]),
+            el('div', { className: 'sheet-meta-item' }, [
+              el('span', { className: 'sheet-meta-label', textContent: '상태' }),
+              el('span', { className: 'sheet-meta-val' }, [
+                el('span', { className: 'chip ' + statusClass, textContent: statusLabel })
+              ])
+            ]),
+            el('div', { className: 'sheet-meta-item' }, [
+              el('span', { className: 'sheet-meta-label', textContent: '워커 / 모드' }),
+              el('span', { className: 'sheet-meta-val' }, [
+                el('span', { className: 'badge-chip', textContent: worker }),
+                el('span', { className: 'badge-chip', textContent: mode })
+              ])
+            ]),
+            el('div', { className: 'sheet-meta-item' }, [
+              el('span', { className: 'sheet-meta-label', textContent: '소요 시간' }),
+              el('span', { className: 'sheet-meta-val', textContent: durationStr })
+            ]),
+            el('div', { className: 'sheet-meta-item' }, [
+              el('span', { className: 'sheet-meta-label', textContent: '종료 코드' }),
+              el('span', { className: 'sheet-meta-val', textContent: exitCodeStr })
+            ]),
+            el('div', { className: 'sheet-meta-item' }, [
+              el('span', { className: 'sheet-meta-label', textContent: '데드라인' }),
+              el('span', { className: 'sheet-meta-val', textContent: deadlineStr })
+            ]),
+            el('div', { className: 'sheet-meta-item span-2', style: 'grid-column: span 2;' }, [
+              el('span', { className: 'sheet-meta-label', textContent: '트랜스크립트 링크 상태' }),
+              el('span', { className: 'sheet-meta-val' }, [
+                renderLinkedStatusBadge(linkedStatusStr)
+              ])
+            ])
+          ])
+        ]);
+        sheetContent.appendChild(metaCard);
+
+        // 3. Progress Timeline
+        var timeline = t.timeline || [];
+        var timelineSection = el('div', { style: 'display:flex; flex-direction:column; gap:8px;' }, [
+          el('div', { className: 'sheet-section-header' }, [
+            el('span', { textContent: '진행 타임라인 (Timeline)' }),
+            el('span', { className: 'count-badge', textContent: timeline.length + '단계' })
+          ])
+        ]);
+
+        if (isTruncatedBefore) {
+          timelineSection.appendChild(
+            el('div', {
+              className: 'sheet-truncation-banner',
+              role: 'note',
+              textContent: 'ℹ 이전 스텝 생략 (파일 후미 2MB 창 초과)'
+            })
+          );
+        }
+
+        if (timeline.length === 0) {
+          var linkedNorm = (linkedStatusStr || 'none').toLowerCase();
+          var emptyMsg = '표시할 타임라인 스텝이 없습니다.';
+          if (linkedNorm === 'inferred' || linkedNorm === 'none') {
+            emptyMsg = '이 작업의 트랜스크립트 구간을 찾지 못했습니다.';
+          }
+          timelineSection.appendChild(
+            el('div', { className: 'sheet-empty-state sheet-notice-box', role: 'note', textContent: emptyMsg })
+          );
+        } else {
+          var timelineList = el('div', { className: 'sheet-timeline' });
+          for (var i = 0; i < timeline.length; i++) {
+            var step = timeline[i];
+            var stepTypeInfo = getStepTypeInfo(step.type || step.step_type);
+            var rawIdx = (step.step_index !== undefined && step.step_index !== null)
+              ? step.step_index
+              : ((step.index !== undefined && step.index !== null) ? step.index : (i + 1));
+            var stepIdxStr = '#' + rawIdx;
+            var stepTimeStr = formatStepTime(step.timestamp || step.created_at);
+
+            var stepItem = el('div', { className: 'sheet-timeline-item' }, [
+              el('div', { className: 'sheet-timeline-head' }, [
+                el('div', { style: 'display:flex; align-items:center; gap:6px; flex-wrap:wrap;' }, [
+                  el('span', { className: 'meta-chip', style: 'font-weight:700;', textContent: stepIdxStr }),
+                  el('span', { className: 'sheet-timeline-type ' + stepTypeInfo.className }, [
+                    createStepIcon(stepTypeInfo.icon),
+                    el('span', { textContent: stepTypeInfo.label })
+                  ])
+                ]),
+                stepTimeStr ? el('span', { style: 'font-size:11px; color:var(--text-muted); font-family:var(--font-mono);', textContent: stepTimeStr }) : null
+              ]),
+              el('div', {
+                className: 'sheet-timeline-summary',
+                textContent: step.summary || step.content || step.text || '(요약 없음)'
+              })
+            ]);
+            timelineList.appendChild(stepItem);
+          }
+          timelineSection.appendChild(timelineList);
+        }
+        sheetContent.appendChild(timelineSection);
+
+        // 4. Output Log Tail (Collapsible section with last 8KB of log)
+        var outputLog = t.output_tail || t.output_log || t.output_log_tail || t.log_tail || t.log || '';
+        var logDetails = el('details', { className: 'sheet-details', open: '' }, [
+          el('summary', { className: 'sheet-summary-toggle' }, [
+            el('span', { textContent: '실행 로그 (마지막 8KB)' }),
+            el('span', { className: 'meta-chip', textContent: '펼치기 / 접기' })
+          ])
+        ]);
+
+        if (outputLog && outputLog.trim().length > 0) {
+          logDetails.appendChild(
+            el('div', { className: 'log-scroll-box' }, [
+              el('pre', { className: 'log-code-pre', textContent: outputLog })
+            ])
+          );
+        } else {
+          logDetails.appendChild(
+            el('div', { className: 'sheet-empty-state', textContent: '로그 없음 (No logs available)' })
+          );
+        }
+        sheetContent.appendChild(logDetails);
+
+        // 5. Connected Events
+        var connectedEvents = t.events || t.connected_events || [];
+        if (connectedEvents.length === 0 && latestState && latestState.events && Array.isArray(latestState.events.recent)) {
+          // Fallback cross-reference from state feed
+          connectedEvents = latestState.events.recent.filter(function (e) {
+            return e.task_id === id;
+          });
+        }
+
+        var eventsSection = el('div', { style: 'display:flex; flex-direction:column; gap:8px;' }, [
+          el('div', { className: 'sheet-section-header' }, [
+            el('span', { textContent: '연결된 이벤트 (Connected Events)' }),
+            el('span', { className: 'count-badge', textContent: connectedEvents.length + '건' })
+          ])
+        ]);
+
+        if (connectedEvents.length === 0) {
+          eventsSection.appendChild(
+            el('div', { className: 'sheet-empty-state', textContent: '연결된 이벤트가 없습니다.' })
+          );
+        } else {
+          var eventsList = el('div', { className: 'sheet-events-list' });
+          for (var j = 0; j < connectedEvents.length; j++) {
+            (function (evt) {
+              var eKindClass = 'event-kind-default';
+              var eKindLabel = evt.kind || 'EVENT';
+              if (evt.kind === 'done') {
+                eKindClass = 'event-kind-done';
+                eKindLabel = '완료 (DONE)';
+              } else if (evt.kind === 'started') {
+                eKindClass = 'event-kind-started';
+                eKindLabel = '시작 (STARTED)';
+              } else if (evt.kind === 'error') {
+                eKindClass = 'event-kind-error';
+                eKindLabel = '오류 (ERROR)';
+              } else if (evt.kind === 'stalled') {
+                eKindClass = 'event-kind-stalled';
+                eKindLabel = '지연 (STALLED)';
+              }
+
+              var eTimeStr = formatRelativeTime(evt.created_epoch || evt.timestamp);
+
+              var eventCard = el('div', {
+                className: 'sheet-event-card',
+                role: 'button',
+                tabindex: '0',
+                title: '클릭하여 이벤트 상세 보기',
+                onClick: function () {
+                  openEventDetail(evt.id || evt.event_id);
+                },
+                onKeydown: function (e) {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    openEventDetail(evt.id || evt.event_id);
+                  }
+                }
+              }, [
+                el('div', { style: 'display:flex; align-items:center; justify-content:space-between; gap:6px;' }, [
+                  el('div', { style: 'display:flex; align-items:center; gap:6px; flex-wrap:wrap;' }, [
+                    el('span', { className: 'event-kind-badge ' + eKindClass, textContent: eKindLabel }),
+                    el('span', { className: 'meta-chip', style: 'font-weight:700;', textContent: evt.id || '-' }),
+                    evt.source ? el('span', { className: 'meta-chip', textContent: evt.source }) : null
+                  ]),
+                  el('div', { style: 'display:flex; align-items:center; gap:4px;' }, [
+                    el('span', { style: 'font-size:11px; color:var(--text-muted);', textContent: eTimeStr }),
+                    createChevronIcon()
+                  ])
+                ]),
+                el('div', {
+                  className: 'event-summary-box',
+                  textContent: evt.summary || '(요약 없음)'
+                })
+              ]);
+              eventsList.appendChild(eventCard);
+            })(connectedEvents[j]);
+          }
+          eventsSection.appendChild(eventsList);
+        }
+        sheetContent.appendChild(eventsSection);
+      }
+
+      /* -----------------------------------------------------------
+         Event Detail Sheet Content & Fetcher
+         ----------------------------------------------------------- */
+      async function openEventDetail(eventId) {
+        if (!eventId) return;
+
+        stopTaskDetailPolling();
+        activeSheetType = 'event';
+        activeSheetId = eventId;
+
+        renderSheetLoading('이벤트 상세 (Event Details)', eventId);
+        openSheet();
+
+        try {
+          var controller = new AbortController();
+          var timeoutId = setTimeout(function () { controller.abort(); }, 5000);
+
+          var response = await fetch('/api/event/' + encodeURIComponent(eventId), {
+            headers: { 'Cache-Control': 'no-cache' },
+            signal: controller.signal
+          });
+          clearTimeout(timeoutId);
+
+          if (!response.ok) {
+            throw new Error('HTTP ' + response.status + ' (' + response.statusText + ')');
+          }
+
+          var eventData = await response.json();
+
+          if (activeSheetType !== 'event' || activeSheetId !== eventId || !isSheetOpen()) {
+            return;
+          }
+
+          renderEventDetailContent(eventData);
+        } catch (err) {
+          if (activeSheetType === 'event' && activeSheetId === eventId) {
+            renderSheetError('이벤트 상세 (Event Details)', err.message, function () {
+              openEventDetail(eventId);
+            });
+          }
+        }
+      }
+
+      function renderEventDetailContent(evt) {
+        sheetTitle.textContent = '이벤트 상세 (Event Details)';
+        sheetSubtitle.textContent = evt.id || evt.event_id || activeSheetId;
+        clearElement(sheetContent);
+
+        var kindClass = 'event-kind-default';
+        var kindLabel = evt.kind || 'EVENT';
+        if (evt.kind === 'done') {
+          kindClass = 'event-kind-done';
+          kindLabel = '완료 (DONE)';
+        } else if (evt.kind === 'started') {
+          kindClass = 'event-kind-started';
+          kindLabel = '시작 (STARTED)';
+        } else if (evt.kind === 'error') {
+          kindClass = 'event-kind-error';
+          kindLabel = '오류 (ERROR)';
+        } else if (evt.kind === 'stalled') {
+          kindClass = 'event-kind-stalled';
+          kindLabel = '지연 (STALLED)';
+        }
+
+        var timeStr = '-';
+        var epoch = evt.timestamp || evt.created_epoch || evt.created_at;
+        if (epoch) {
+          timeStr = formatClock(epoch) + ' (' + formatRelativeTime(epoch) + ')';
+        }
+
+        var exitCodeStr = (evt.exit_code !== null && evt.exit_code !== undefined)
+          ? String(evt.exit_code)
+          : '-';
+
+        // 1. Meta Card
+        var metaCard = el('div', { className: 'sheet-meta-card' }, [
+          el('div', { className: 'sheet-meta-grid' }, [
+            el('div', { className: 'sheet-meta-item' }, [
+              el('span', { className: 'sheet-meta-label', textContent: '이벤트 ID' }),
+              el('span', { className: 'sheet-meta-val', textContent: evt.id || evt.event_id || '-' })
+            ]),
+            el('div', { className: 'sheet-meta-item' }, [
+              el('span', { className: 'sheet-meta-label', textContent: '이벤트 종류' }),
+              el('span', { className: 'sheet-meta-val' }, [
+                el('span', { className: 'event-kind-badge ' + kindClass, textContent: kindLabel })
+              ])
+            ]),
+            el('div', { className: 'sheet-meta-item' }, [
+              el('span', { className: 'sheet-meta-label', textContent: '발신원 (Source)' }),
+              el('span', { className: 'sheet-meta-val' }, [
+                el('span', { className: 'meta-chip', textContent: evt.source || '-' })
+              ])
+            ]),
+            el('div', { className: 'sheet-meta-item' }, [
+              el('span', { className: 'sheet-meta-label', textContent: '종료 코드' }),
+              el('span', { className: 'sheet-meta-val', textContent: exitCodeStr })
+            ]),
+            el('div', { className: 'sheet-meta-item', style: 'grid-column: span 2;' }, [
+              el('span', { className: 'sheet-meta-label', textContent: '발생 시각' }),
+              el('span', { className: 'sheet-meta-val', textContent: timeStr })
+            ])
+          ])
+        ]);
+        sheetContent.appendChild(metaCard);
+
+        // 2. Full Event Summary (Safely inserted via textContent)
+        var summarySection = el('div', { style: 'display:flex; flex-direction:column; gap:8px;' }, [
+          el('div', { className: 'sheet-section-header' }, [
+            el('span', { textContent: '이벤트 요약 내용 (Summary)' })
+          ]),
+          el('div', {
+            className: 'event-full-summary-box',
+            textContent: evt.summary || '(요약 내용 없음)'
+          })
+        ]);
+        sheetContent.appendChild(summarySection);
+
+        // 3. Linked Task Button (If task_id exists, open Task Detail)
+        if (evt.task_id) {
+          var taskActionSection = el('div', { style: 'margin-top: 4px;' }, [
+            el('button', {
+              className: 'btn-action',
+              type: 'button',
+              onClick: function () {
+                openTaskDetail(evt.task_id);
+              }
+            }, [
+              svgEl('svg', {
+                width: '16', height: '16', viewBox: '0 0 24 24',
+                fill: 'none', stroke: 'currentColor', 'stroke-width': '2.2',
+                'stroke-linecap': 'round', 'stroke-linejoin': 'round'
+              }, [
+                svgEl('polyline', { points: '9 11 12 14 22 4' }),
+                svgEl('path', { d: 'M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11' })
+              ]),
+              el('span', { textContent: '연결된 작업 보기 (' + evt.task_id + ')' })
+            ])
+          ]);
+          sheetContent.appendChild(taskActionSection);
+        }
+      }
+
+      /* -----------------------------------------------------------
+         Polling & Fetch Engine
+         ----------------------------------------------------------- */
+      async function pollState() {
+        if (isPolling) return;
+        isPolling = true;
+        btnRefresh.classList.add('spinning');
+
+        try {
+          var controller = new AbortController();
+          var timeoutId = setTimeout(function () { controller.abort(); }, 5000);
+
+          var response = await fetch('/api/state', {
+            headers: { 'Cache-Control': 'no-cache' },
+            signal: controller.signal
+          });
+          clearTimeout(timeoutId);
+
+          if (!response.ok) {
+            throw new Error('HTTP ' + response.status);
+          }
+
+          var data = await response.json();
+          handlePollSuccess(data);
+        } catch (err) {
+          handlePollError(err);
+        } finally {
+          isPolling = false;
+          btnRefresh.classList.remove('spinning');
+          scheduleNextPoll();
+        }
+      }
+
+      function scheduleNextPoll() {
+        if (pollTimer) clearTimeout(pollTimer);
+        pollTimer = setTimeout(pollState, currentDelay);
+      }
+
+      function handlePollSuccess(data) {
+        lastSuccessTimestamp = Date.now();
+        currentDelay = POLL_INTERVAL; // Reset backoff
+        latestState = data;
+
+        // Update Status Pill
+        statusPill.className = 'status-pill online';
+        statusPillText.textContent = '온라인';
+
+        // Hide Disconnection Banner
+        disconnectBanner.classList.remove('show');
+
+        // Render Data
+        renderDashboard(data);
+      }
+
+      function handlePollError() {
+        // Update Status Pill
+        statusPill.className = 'status-pill offline';
+        statusPillText.textContent = '오프라인';
+
+        // Show Disconnection Banner
+        disconnectBanner.classList.add('show');
+        updateDisconnectMessage();
+
+        // Exponential backoff: 3s -> 6s -> 12s -> 24s -> 30s max
+        currentDelay = Math.min(currentDelay * 2, MAX_DELAY);
+      }
+
+      function updateDisconnectMessage() {
+        if (!lastSuccessTimestamp) {
+          disconnectMsg.textContent = '서버 연결 실패 - 서버 응답이 없습니다. (재시도 대기: ' + Math.round(currentDelay / 1000) + '초)';
+        } else {
+          var diff = Math.max(1, Math.round((Date.now() - lastSuccessTimestamp) / 1000));
+          disconnectMsg.textContent = '서버 연결 끊김 - 마지막 갱신 ' + diff + '초 전 (다음 재시도 ' + Math.round(currentDelay / 1000) + '초 후)';
+        }
+      }
+
+      /* -----------------------------------------------------------
+         Render Dashboard Sections
+         ----------------------------------------------------------- */
+      function renderDashboard(data) {
+        renderHeader(data);
+        renderWorkflowDiagram(data);
+        renderWorkers(data);
+        renderDaemonsAndQueue(data);
+        renderTasks(data.tasks);
+        renderEvents(data.events);
+      }
+
+      /* Top Header */
+      function renderHeader(data) {
+        var server = data.server || {};
+        var session = data.session || {};
+
+        metaSession.textContent = session.name || server.runtime_name || 'agentchain';
+
+        var gitHead = (server.git && server.git.head) ? server.git.head : '-';
+        var gitTags = (server.git && server.git.tags && server.git.tags.length > 0) ? ' (' + server.git.tags[0] + ')' : '';
+        metaGit.textContent = gitHead + gitTags;
+
+        metaTime.textContent = formatClock(server.time);
+      }
+
+      /* Workflow Diagram (SVG) */
+      function renderWorkflowDiagram(data) {
+        var workers = data.workers || {};
+        var daemons = data.daemons || {};
+        var events = data.events || {};
+        var session = data.session || {};
+        var windows = session.windows || [];
+
+        var sonnetWin = null;
+        for (var wIdx = 0; wIdx < windows.length; wIdx++) {
+          if (windows[wIdx].name === 'sonnet' || windows[wIdx].id === 'sonnet') {
+            sonnetWin = windows[wIdx];
+            break;
+          }
+        }
+        var sonnetIsClaude = sonnetWin && (sonnetWin.pane_command === 'claude');
+
+        var agy = workers.agy || {};
+        var codex = workers.codex || {};
+
+        var isAgyBusy = !!agy.busy_task_id;
+        var isCodexBusy = !!codex.busy_task_id;
+        var isAnyBusy = isAgyBusy || isCodexBusy;
+
+        // Sonnet Node
+        if (isAnyBusy) {
+          nodeSonnet.setAttribute('class', 'node state-running');
+          badgeSonnetText.textContent = '감독중';
+        } else {
+          nodeSonnet.setAttribute('class', 'node state-idle');
+          badgeSonnetText.textContent = '감독대기';
+        }
+
+        // agy Node & Badge
+        if (isAgyBusy) {
+          nodeAgy.setAttribute('class', 'node state-running');
+          badgeAgyText.textContent = '가동: ' + agy.busy_task_id;
+          pathSonnetAgy.setAttribute('class', 'flow-line active');
+          pathAgySubagents.setAttribute('class', 'flow-line active');
+          pathAgyOutbox.setAttribute('class', 'flow-line active');
+
+          nodeSubagents.setAttribute('class', 'node state-running');
+          badgeSubagentsText.textContent = '위임실행';
+        } else {
+          nodeAgy.setAttribute('class', 'node state-idle');
+          badgeAgyText.textContent = (agy.mode === 'resident' ? '상주 유휴' : '유휴');
+          pathSonnetAgy.setAttribute('class', 'flow-line');
+          pathAgySubagents.setAttribute('class', 'flow-line');
+          pathAgyOutbox.setAttribute('class', 'flow-line');
+
+          nodeSubagents.setAttribute('class', 'node state-idle');
+          badgeSubagentsText.textContent = '대기';
+        }
+
+        // Codex Node & Badge
+        if (isCodexBusy) {
+          nodeCodex.setAttribute('class', 'node state-running');
+          badgeCodexText.textContent = '가동: ' + codex.busy_task_id;
+          pathSonnetCodex.setAttribute('class', 'flow-line active');
+        } else {
+          nodeCodex.setAttribute('class', 'node state-idle');
+          badgeCodexText.textContent = '유휴';
+          pathSonnetCodex.setAttribute('class', 'flow-line');
+        }
+
+        // Outbox Node & Badge
+        var pendingCount = (events && typeof events.pending_count === 'number') ? events.pending_count : 0;
+        if (pendingCount > 0) {
+          nodeOutbox.setAttribute('class', 'node state-running');
+          badgeOutboxText.textContent = pendingCount + '건 대기중';
+          pathOutboxListener.setAttribute('class', 'flow-line active');
+        } else {
+          nodeOutbox.setAttribute('class', 'node state-idle');
+          badgeOutboxText.textContent = '0건 대기';
+          pathOutboxListener.setAttribute('class', 'flow-line');
+        }
+
+        // Listener Node & Badge
+        var listenerAlive = daemons.listener && daemons.listener.alive;
+        if (listenerAlive) {
+          nodeListener.setAttribute('class', 'node state-running');
+          badgeListenerText.textContent = '가동 (PID:' + (daemons.listener.pid || '-') + ')';
+          pathListenerSonnet.setAttribute('class', pendingCount > 0 ? 'flow-line return-active' : 'flow-line');
+        } else if (sonnetIsClaude) {
+          nodeListener.setAttribute('class', 'node state-running');
+          badgeListenerText.textContent = 'Sonnet 작업중';
+          pathListenerSonnet.setAttribute('class', 'flow-line');
+        } else {
+          nodeListener.setAttribute('class', 'node state-dead');
+          badgeListenerText.textContent = '꺼짐';
+          pathListenerSonnet.setAttribute('class', 'flow-line');
+        }
+
+        // Watchdog Node & Badge
+        var watchdogAlive = daemons.watchdog && daemons.watchdog.alive;
+        if (watchdogAlive) {
+          nodeWatchdog.setAttribute('class', 'node state-running');
+          badgeWatchdogText.textContent = '가동중 (PID: ' + (daemons.watchdog.pid || '-') + ')';
+        } else {
+          nodeWatchdog.setAttribute('class', 'node state-error');
+          badgeWatchdogText.textContent = '중지됨 (오류 감지)';
+        }
+      }
+
+      /* Workers Cards */
+      function renderWorkers(data) {
+        var workers = data.workers || {};
+        var session = data.session || {};
+        var windows = session.windows || [];
+
+        function findWin(name) {
+          for (var i = 0; i < windows.length; i++) {
+            if (windows[i].name === name || windows[i].id === name) return windows[i];
+          }
+          return null;
+        }
+
+        var sonnetWin = findWin('sonnet');
+        var agyWin = findWin('agy');
+        var codexWin = findWin('codex');
+
+        var agy = workers.agy || {};
+        var codex = workers.codex || {};
+
+        // 1. Sonnet Card
+        sonnetWinStatus.textContent = sonnetWin ? (sonnetWin.active ? '활성 (Active)' : '비활성') : '-';
+        sonnetCmdStatus.textContent = sonnetWin ? (sonnetWin.pane_command || 'claude') : '-';
+
+        var isAnyBusy = !!(agy.busy_task_id || codex.busy_task_id);
+        if (isAnyBusy) {
+          sonnetBusyStatus.className = 'state-indicator busy';
+          sonnetBusyLabel.textContent = '작업 감독중';
+          sonnetTaskId.textContent = agy.busy_task_id || codex.busy_task_id || '-';
+          cardSonnet.classList.add('busy');
+        } else {
+          sonnetBusyStatus.className = 'state-indicator idle';
+          sonnetBusyLabel.textContent = '감독 대기';
+          sonnetTaskId.textContent = '-';
+          cardSonnet.classList.remove('busy');
+        }
+
+        // 2. agy Card
+        agyModeBadge.textContent = agy.mode === 'resident' ? '상주 (Resident)' : '단발 (Oneshot)';
+        agyModeBadge.className = 'badge-chip ' + (agy.mode === 'resident' ? 'mode-resident' : 'mode-oneshot');
+        agyWinStatus.textContent = agyWin ? (agyWin.active ? '활성 (Active)' : '비활성') : '-';
+        agyCmdStatus.textContent = agyWin ? (agyWin.pane_command || 'agy') : '-';
+
+        if (agy.busy_task_id) {
+          agyBusyStatus.className = 'state-indicator busy';
+          agyBusyLabel.textContent = '실행중';
+          agyTaskId.textContent = agy.busy_task_id;
+          cardAgy.classList.add('busy');
+          agyElapsedRow.style.display = 'flex';
+          agyElapsedTime.textContent = formatDuration(data.queue && data.queue.busy_elapsed_s);
+        } else {
+          agyBusyStatus.className = 'state-indicator idle';
+          agyBusyLabel.textContent = '유휴';
+          agyTaskId.textContent = '-';
+          cardAgy.classList.remove('busy');
+          agyElapsedRow.style.display = 'none';
+        }
+
+        // 3. Codex Card
+        codexModeBadge.textContent = codex.mode === 'resident' ? '상주 (Resident)' : '단발 (Oneshot)';
+        codexModeBadge.className = 'badge-chip ' + (codex.mode === 'resident' ? 'mode-resident' : 'mode-oneshot');
+        codexWinStatus.textContent = codexWin ? (codexWin.active ? '활성 (Active)' : '비활성') : '-';
+        codexCmdStatus.textContent = codexWin ? (codexWin.pane_command || 'bash') : '-';
+
+        if (codex.busy_task_id) {
+          codexBusyStatus.className = 'state-indicator busy';
+          codexBusyLabel.textContent = '실행중';
+          codexTaskId.textContent = codex.busy_task_id;
+          cardCodex.classList.add('busy');
+          codexElapsedRow.style.display = 'flex';
+          codexElapsedTime.textContent = formatDuration(data.queue && data.queue.busy_elapsed_s);
+        } else {
+          codexBusyStatus.className = 'state-indicator idle';
+          codexBusyLabel.textContent = '유휴';
+          codexTaskId.textContent = '-';
+          cardCodex.classList.remove('busy');
+          codexElapsedRow.style.display = 'none';
+        }
+      }
+
+      /* Daemons & Queue (with Requirement 5 improvement) */
+      function renderDaemonsAndQueue(data) {
+        var daemons = data.daemons || {};
+        var events = data.events || {};
+        var queue = data.queue || {};
+        var session = data.session || {};
+        var windows = session.windows || [];
+
+        // Check Sonnet window state
+        var sonnetWin = null;
+        for (var wIdx = 0; wIdx < windows.length; wIdx++) {
+          if (windows[wIdx].name === 'sonnet' || windows[wIdx].id === 'sonnet') {
+            sonnetWin = windows[wIdx];
+            break;
+          }
+        }
+        var sonnetIsClaude = sonnetWin && (sonnetWin.pane_command === 'claude');
+
+        // Watchdog chip
+        if (daemons.watchdog && daemons.watchdog.alive) {
+          daemonWatchdogChip.className = 'chip status-done';
+          daemonWatchdogChip.textContent = '정상 가동 (PID ' + (daemons.watchdog.pid || '-') + ')';
+        } else {
+          daemonWatchdogChip.className = 'chip status-error';
+          daemonWatchdogChip.textContent = '중지됨';
+        }
+
+        // Listener chip (Requirement 5)
+        if (daemons.listener && daemons.listener.alive) {
+          daemonListenerChip.className = 'chip status-done';
+          daemonListenerChip.textContent = '정상 가동 (PID ' + (daemons.listener.pid || '-') + ')';
+        } else if (sonnetIsClaude) {
+          daemonListenerChip.className = 'chip status-info';
+          daemonListenerChip.textContent = 'Sonnet 작업 중(대기 훅은 턴 종료 시 기동)';
+        } else {
+          daemonListenerChip.className = 'chip status-error';
+          daemonListenerChip.textContent = '꺼짐';
+        }
+
+        // Queue counts
+        statPending.textContent = String((events && events.pending_count) || 0);
+        statInflight.textContent = String((events && events.inflight_count) || 0);
+        statArchive.textContent = String((events && events.archive_count) || 0);
+
+        if (queue && typeof queue.busy_elapsed_s === 'number' && queue.busy_elapsed_s > 0) {
+          queueElapsedBadge.style.display = 'inline-flex';
+          queueElapsedBadge.textContent = '작업 경과: ' + formatDuration(queue.busy_elapsed_s);
+        } else {
+          queueElapsedBadge.style.display = 'none';
+        }
+      }
+
+      /* Task Timeline (Safe DOM construction & Click opens Task Detail) */
+      function renderTasks(tasks) {
+        clearElement(tasksContainer);
+
+        if (!tasks || !Array.isArray(tasks) || tasks.length === 0) {
+          tasksCount.textContent = '0건';
+          tasksContainer.appendChild(
+            el('div', { className: 'card empty-state', textContent: '최근 실행된 작업 내역이 없습니다.' })
+          );
+          return;
+        }
+
+        tasksCount.textContent = tasks.length + '건';
+
+        for (var i = 0; i < tasks.length; i++) {
+          (function (t) {
+            var isRunning = t.status === 'running';
+
+            var statusClass = 'status-done';
+            var statusLabel = '완료';
+            if (isRunning) {
+              statusClass = 'status-running';
+              statusLabel = '실행중';
+            } else if (t.status === 'error' || (t.exit_code !== null && t.exit_code !== undefined && t.exit_code !== 0)) {
+              statusClass = 'status-error';
+              statusLabel = '오류 (코드 ' + (t.exit_code !== null ? t.exit_code : 1) + ')';
+            }
+
+            var durationStr = (t.duration_s !== null && t.duration_s !== undefined)
+              ? formatDuration(t.duration_s)
+              : (isRunning ? '진행중' : '-');
+
+            var timeStr = formatRelativeTime(t.started_at);
+
+            var taskCard = el('div', {
+              className: 'task-item clickable' + (isRunning ? ' running' : ''),
+              role: 'button',
+              tabindex: '0',
+              title: '클릭하여 작업 상세 보기',
+              onClick: function () {
+                openTaskDetail(t.id);
+              },
+              onKeydown: function (e) {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  openTaskDetail(t.id);
+                }
+              }
+            }, [
+              el('div', { className: 'task-item-header' }, [
+                el('div', { style: 'display:flex; align-items:center; gap:8px;' }, [
+                  el('span', { className: 'task-id-badge', textContent: t.id || '작업 ID 없음' }),
+                  el('span', { className: 'meta-chip', textContent: (t.worker || 'worker') + (t.mode ? ' · ' + t.mode : '') })
+                ]),
+                el('div', { style: 'display:flex; align-items:center; gap:6px;' }, [
+                  el('span', { className: 'chip ' + statusClass, textContent: statusLabel }),
+                  createChevronIcon()
+                ])
+              ]),
+              el('div', { className: 'task-meta-row' }, [
+                el('span', {}, ['소요: ', el('strong', { textContent: durationStr })]),
+                el('span', {}, ['시작: ', el('span', { textContent: timeStr })]),
+                (t.exit_code !== null && t.exit_code !== undefined)
+                  ? el('span', {}, ['종료코드: ', el('strong', { textContent: String(t.exit_code) })])
+                  : null
+              ])
+            ]);
+
+            tasksContainer.appendChild(taskCard);
+          })(tasks[i]);
+        }
+      }
+
+      /* Event Feed (Safe DOM construction & Click opens Event Detail) */
+      function renderEvents(eventsData) {
+        clearElement(eventsContainer);
+        var recent = eventsData && eventsData.recent;
+
+        if (!recent || !Array.isArray(recent) || recent.length === 0) {
+          eventsCount.textContent = '0건';
+          eventsContainer.appendChild(
+            el('div', { className: 'card empty-state', textContent: '수신된 최근 이벤트가 없습니다.' })
+          );
+          return;
+        }
+
+        eventsCount.textContent = recent.length + '건';
+
+        for (var i = 0; i < recent.length; i++) {
+          (function (evt) {
+            var kindClass = 'event-kind-default';
+            var kindLabel = evt.kind || 'EVENT';
+            if (evt.kind === 'done') {
+              kindClass = 'event-kind-done';
+              kindLabel = '완료 (DONE)';
+            } else if (evt.kind === 'started') {
+              kindClass = 'event-kind-started';
+              kindLabel = '시작 (STARTED)';
+            } else if (evt.kind === 'error') {
+              kindClass = 'event-kind-error';
+              kindLabel = '오류 (ERROR)';
+            } else if (evt.kind === 'stalled') {
+              kindClass = 'event-kind-stalled';
+              kindLabel = '지연 (STALLED)';
+            }
+
+            var timeLabel = formatRelativeTime(evt.created_epoch);
+
+            var eventItem = el('div', {
+              className: 'event-item clickable',
+              role: 'button',
+              tabindex: '0',
+              title: '클릭하여 이벤트 상세 보기',
+              onClick: function () {
+                openEventDetail(evt.id);
+              },
+              onKeydown: function (e) {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  openEventDetail(evt.id);
+                }
+              }
+            }, [
+              el('div', { className: 'event-item-top' }, [
+                el('div', { style: 'display:flex; align-items:center; gap:6px; flex-wrap:wrap;' }, [
+                  el('span', { className: 'event-kind-badge ' + kindClass, textContent: kindLabel }),
+                  evt.source ? el('span', { className: 'meta-chip', textContent: '발신: ' + evt.source }) : null,
+                  evt.task_id ? el('span', { className: 'meta-chip', style: 'font-weight:700;', textContent: evt.task_id }) : null
+                ]),
+                el('div', { style: 'display:flex; align-items:center; gap:4px;' }, [
+                  el('span', { style: 'font-size:11px; color:var(--text-muted);', textContent: timeLabel }),
+                  createChevronIcon()
+                ])
+              ]),
+              el('div', {
+                className: 'event-summary-box',
+                textContent: evt.summary || '(요약 내용 없음)'
+              })
+            ]);
+
+            eventsContainer.appendChild(eventItem);
+          })(recent[i]);
+        }
+      }
+
+      /* -----------------------------------------------------------
+         1-Second Real-Time Ticker
+         ----------------------------------------------------------- */
+      setInterval(function () {
+        // 1. Current clock
+        if (metaTime) {
+          metaTime.textContent = formatClock();
+        }
+
+        // 2. Disconnect banner counter
+        if (disconnectBanner.classList.contains('show')) {
+          updateDisconnectMessage();
+        }
+
+        // 3. Busy elapsed counter increment
+        if (latestState && latestState.queue && typeof latestState.queue.busy_elapsed_s === 'number') {
+          latestState.queue.busy_elapsed_s += 1;
+          var durStr = formatDuration(latestState.queue.busy_elapsed_s);
+          if (agyElapsedRow.style.display !== 'none') {
+            agyElapsedTime.textContent = durStr;
+          }
+          if (codexElapsedRow.style.display !== 'none') {
+            codexElapsedTime.textContent = durStr;
+          }
+          if (queueElapsedBadge.style.display !== 'none') {
+            queueElapsedBadge.textContent = '작업 경과: ' + durStr;
+          }
+        }
+      }, 1000);
+
+      /* -----------------------------------------------------------
+         User Interactions & Listeners
+         ----------------------------------------------------------- */
+      btnRefresh.addEventListener('click', function () {
+        if (!isPolling) {
+          currentDelay = POLL_INTERVAL;
+          pollState();
+        }
+      });
+
+      btnRetry.addEventListener('click', function () {
+        if (!isPolling) {
+          currentDelay = POLL_INTERVAL;
+          pollState();
+        }
+      });
+
+      // Bottom Sheet Backdrop Click to Close
+      detailSheetBackdrop.addEventListener('click', function (e) {
+        if (e.target === detailSheetBackdrop) {
+          closeSheet();
+        }
+      });
+
+      // Close Button Click
+      btnSheetClose.addEventListener('click', function () {
+        closeSheet();
+      });
+
+      // ESC Key to Close
+      window.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape' || e.key === 'Esc') {
+          if (isSheetOpen()) {
+            closeSheet();
+          }
+        }
+      });
+
+      // Initial Poll
+      pollState();
+    })();
+  </script>
+</body>
+</html>

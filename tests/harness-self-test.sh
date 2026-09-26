@@ -393,6 +393,49 @@ else
   fail_case 18 "H3: run_real_agy_isolated guard" "abort_real=$c18_abort_real, abort_notemp=$c18_abort_notemp, valid_ok=$c18_valid_ok"
 fi
 
+# ------------------------------------------------------------------
+# 19. H1: config.env alteration detected and rejected (hash mismatch & removal)
+# ------------------------------------------------------------------
+FAKE_CONF_REPO="$TEST_TMP/fake_conf_repo"
+mkdir -p "$FAKE_CONF_REPO"
+echo "SECRET_VAR=original_value_12345" > "$FAKE_CONF_REPO/config.env"
+FAKE_CONF_SIG="$TEST_TMP/fake_conf_pre.txt"
+snapshot_config_env "$FAKE_CONF_REPO" "$FAKE_CONF_SIG"
+
+c19_base_ok=false
+if verify_config_env "$FAKE_CONF_REPO" "$FAKE_CONF_SIG" >/dev/null 2>&1; then
+  c19_base_ok=true
+fi
+
+# 1. Modify config.env
+echo "SECRET_VAR=tampered_value_67890" > "$FAKE_CONF_REPO/config.env"
+c19_mod_err="$TEST_TMP/c19_mod_err.log"
+c19_mod_fail=false
+if ! verify_config_env "$FAKE_CONF_REPO" "$FAKE_CONF_SIG" 2>"$c19_mod_err"; then
+  c19_mod_fail=true
+fi
+
+# 2. Delete config.env
+rm -f "$FAKE_CONF_REPO/config.env"
+c19_rm_err="$TEST_TMP/c19_rm_err.log"
+c19_rm_fail=false
+if ! verify_config_env "$FAKE_CONF_REPO" "$FAKE_CONF_SIG" 2>"$c19_rm_err"; then
+  c19_rm_fail=true
+fi
+
+if [[ "$c19_base_ok" == "true" && "$c19_mod_fail" == "true" && "$c19_rm_fail" == "true" ]] && \
+   grep -q "FATAL ISOLATION VIOLATION" "$c19_mod_err" && \
+   grep -q "modified" "$c19_mod_err" && \
+   grep -q "FATAL ISOLATION VIOLATION" "$c19_rm_err" && \
+   grep -q "removed" "$c19_rm_err" && \
+   ! grep -q "original_value" "$c19_mod_err" && \
+   ! grep -q "tampered_value" "$c19_mod_err"; then
+  pass_case 19 "H1: config.env modification and removal detected and rejected with hash (zero content leak)"
+else
+  fail_case 19 "H1: config.env alteration detection" "base=$c19_base_ok, mod_fail=$c19_mod_fail, rm_fail=$c19_rm_fail, mod_err=$(cat "$c19_mod_err" 2>/dev/null || true)"
+fi
+
+
 echo "=================================================================="
 echo "harness-self-test.sh Summary: PASSED=$PASSED, FAILED=$FAILED"
 echo "=================================================================="

@@ -16,7 +16,11 @@ _ENV_CODEX_MODE="${CODEX_MODE:-}"
 
 cd "$HERE"
 
-if [[ -f config.env ]]; then
+_CFG_ENV="${ACC_CONFIG_ENV:-$HERE/config.env}"
+if [[ -f "$_CFG_ENV" ]]; then
+  # shellcheck disable=SC1091
+  source "$_CFG_ENV"
+elif [[ -f config.env ]]; then
   # shellcheck disable=SC1091
   source config.env
 fi

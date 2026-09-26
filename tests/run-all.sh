@@ -74,6 +74,7 @@ run_suite "watchdog-resident-test.sh"
 run_suite "bootstrap-resident-test.sh"
 run_suite "harness-self-test.sh"
 run_suite "codex-fail-closed-test.sh"
+run_suite "dashboard-test.sh"
 
 end_time=$(date +%s)
 elapsed=$((end_time - start_time))

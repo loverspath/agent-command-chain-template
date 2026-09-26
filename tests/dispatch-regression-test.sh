@@ -104,7 +104,7 @@ assert_safe_runtime "$p3_def_rt"
 mkdir -p "$p3_def_rt"
 printf 'bootstrap_version=2\n' > "$p3_def_rt/bootstrap_version"
 
-tmux send-keys -t "$TEST_SESSION:sonnet" "cd '$HERE' && env -i PATH=\"\$PATH\" HOME='$TEST_HOME' TMUX=\"\$TMUX\" PROJECT_DIR='$TEST_TMP' ./bin/dispatch.sh agy --dry-run >'$p3_out' 2>'$p3_err'; echo \$? > '$p3_rc_file'" C-m
+tmux send-keys -t "$TEST_SESSION:sonnet" "cd '$HERE' && env -i PATH=\"\$PATH\" HOME='$TEST_HOME' TMUX=\"\$TMUX\" PROJECT_DIR='$TEST_TMP' ACC_CONFIG_ENV='$ACC_CONFIG_ENV' ./bin/dispatch.sh agy --dry-run >'$p3_out' 2>'$p3_err'; echo \$? > '$p3_rc_file'" C-m
 
 waited=0
 while [[ ! -f "$p3_rc_file" ]] && (( waited < 40 )); do

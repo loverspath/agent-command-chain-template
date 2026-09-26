@@ -353,6 +353,62 @@ sys.exit(0)
   python3 -c "$py_code" "$repo" "$in_file"
 }
 
+# config.env 스냅샷 (H1-config: SHA256 앞 12자 기록, 내용 절대 출력/저장 금지)
+snapshot_config_env() {
+  local repo="${1:-${HERE_OVERRIDE:-$HERE}}"
+  local out_file="${2:-$TEST_TMP/config_env_pre.txt}"
+  mkdir -p "$(dirname "$out_file")"
+  if [[ -f "$repo/config.env" ]]; then
+    python3 -c '
+import sys, hashlib
+try:
+    with open(sys.argv[1], "rb") as f:
+        print(hashlib.sha256(f.read()).hexdigest()[:12])
+except Exception:
+    sys.exit(1)
+' "$repo/config.env" > "$out_file"
+  else
+    rm -f "$out_file" 2>/dev/null || true
+  fi
+}
+
+# config.env 무오염 검증 (H1-config: SHA256 앞 12자 대조, 변경/삭제 시 FATAL 거부, 내용 절대 미출력)
+verify_config_env() {
+  local repo="${1:-${HERE_OVERRIDE:-$HERE}}"
+  local in_file="${2:-$TEST_TMP/config_env_pre.txt}"
+
+  if [[ ! -f "$in_file" ]]; then
+    if [[ -f "$repo/config.env" ]]; then
+      local post_sha
+      post_sha="$(python3 -c 'import sys, hashlib; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest()[:12])' "$repo/config.env" 2>/dev/null || echo "unknown")"
+      echo "[lib-isolated-env] FATAL ISOLATION VIOLATION: '$repo/config.env' was unexpectedly created during test! (pre=missing, post_sha12=$post_sha)" >&2
+      return 1
+    fi
+    return 0
+  fi
+
+  local pre_sha
+  pre_sha="$(tr -d ' \r\n' < "$in_file" 2>/dev/null || echo "")"
+  if [[ -z "$pre_sha" ]]; then
+    return 0
+  fi
+
+  if [[ ! -f "$repo/config.env" ]]; then
+    echo "[lib-isolated-env] FATAL ISOLATION VIOLATION: '$repo/config.env' was removed during test! (pre_sha12=$pre_sha, post=missing)" >&2
+    return 1
+  fi
+
+  local post_sha
+  post_sha="$(python3 -c 'import sys, hashlib; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest()[:12])' "$repo/config.env" 2>/dev/null || echo "unknown")"
+
+  if [[ "$pre_sha" != "$post_sha" ]]; then
+    echo "[lib-isolated-env] FATAL ISOLATION VIOLATION: '$repo/config.env' was modified during test! (pre_sha12=$pre_sha, post_sha12=$post_sha)" >&2
+    return 1
+  fi
+
+  return 0
+}
+
 # 임시 트리를 점유한 프로세스 대기 및 종료 회수 (H2)
 terminate_lingering_processes() {
   local target_dir="$1"
@@ -756,6 +812,18 @@ init_isolated_env() {
   # 시작 전 리포 상태 기록 (H1)
   snapshot_repo_status "$HERE" "$TEST_TMP/repo_pre_status.txt"
 
+  # 시작 전 실제 config.env 스냅샷 (H1-config: SHA256 앞 12자 기록)
+  snapshot_config_env "$HERE" "$TEST_TMP/config_env_pre.txt"
+
+  # 임시 격리 config.env 생성 (모든 테스트가 실제 config.env 대신 사용)
+  TEST_CONFIG_ENV="$TEST_TMP/config.env"
+  if [[ -f "$HERE/config.env.example" ]]; then
+    cp "$HERE/config.env.example" "$TEST_CONFIG_ENV"
+  else
+    printf 'SESSION_NAME=agentchain\nWORKER_MODE=oneshot\nBRIDGE_MODE=push\n' > "$TEST_CONFIG_ENV"
+  fi
+  export ACC_CONFIG_ENV="$TEST_CONFIG_ENV"
+
   # 시작 전 실제 Gemini 설정 스냅샷 (H3)
   snapshot_real_gemini_config "$REAL_HOME" "$TEST_TMP/real_gemini_pre_sig.json"
 
@@ -796,6 +864,14 @@ cleanup_isolated_env() {
   if [[ -f "${TEST_TMP:-}/repo_pre_status.txt" ]]; then
     if ! assert_no_repo_pollution "$HERE" "$TEST_TMP/repo_pre_status.txt"; then
       echo "[lib-isolated-env] Post-test check FAILED: Repository was polluted during test!" >&2
+      exit_code=99
+    fi
+  fi
+
+  # 종료 후 실제 config.env 무오염 검증 (H1-config: SHA256 앞 12자 불변 단언)
+  if [[ -f "${TEST_TMP:-}/config_env_pre.txt" ]]; then
+    if ! verify_config_env "$HERE" "$TEST_TMP/config_env_pre.txt"; then
+      echo "[lib-isolated-env] Post-test check FAILED: config.env was altered or removed during test!" >&2
       exit_code=99
     fi
   fi
@@ -841,6 +917,7 @@ run_clean() {
     PATH="$PATH" \
     HOME="$TEST_HOME" \
     TESTMARK="$TESTMARK" \
+    ACC_CONFIG_ENV="${ACC_CONFIG_ENV:-${TEST_CONFIG_ENV:-$TEST_TMP/config.env}}" \
     "${env_vars[@]}" \
     "$@"
 }
