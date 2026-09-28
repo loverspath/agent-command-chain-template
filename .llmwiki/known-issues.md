@@ -1,8 +1,8 @@
 ---
 title: Known Issues & Limitations
-tags: [known-issues, limitations, bug, product-bug, permissions, remote-control, fallback, wsl, tmux-nesting, session-resolution, dispatch-targeting, non-preemptive-tui, cli-behavior, prompt-drift, test-harness-isolation, troubleshooting]
+tags: [known-issues, limitations, bug, product-bug, permissions, remote-control, fallback, wsl, tmux-nesting, session-resolution, dispatch-targeting, non-preemptive-tui, cli-behavior, prompt-drift, test-harness-isolation, troubleshooting, sonnet-overreach, unrequested-scope, self-reflection-not-automatic]
 related: ["[[INDEX]]", "[[architecture]]", "[[usage]]"]
-summary: 실측으로 확인된 RC 전제조건, Folder Trust 우회 한계, 세션 지속성 버그, agy/codex 바이너리 이슈, tmux 중첩, v1/v2 세션 오조준, TUI 비선점 큐잉, 입력 혼선, 테스트 하네스 격리 규약.
+summary: 실측으로 확인된 RC 전제조건, Folder Trust 우회 한계, 세션 지속성 버그, agy/codex 바이너리 이슈, tmux 중첩, v1/v2 세션 오조준, TUI 비선점 큐잉, 입력 혼선, 테스트 하네스 격리 규약, Sonnet의 요청 외 범위 임의 확장 사고, Post-mortem 규약이 프로젝트 전환 시 자동 전파되지 않는 구조적 결함.
 ---
 
 # Known Issues & Limitations
@@ -226,3 +226,46 @@ summary: 실측으로 확인된 RC 전제조건, Folder Trust 우회 한계, 세
      - 테스트 전후 리포지토리의 `git status --porcelain --ignored=no`를 대조하여 새 파일이 검출되면 즉시 실패 처리.
   4. **보고서 규칙 (H4)**:
      - "무접촉 / zero pollution" 표현은 전역 설정 및 리포지토리 스냅샷 대조 출력(전후 동일 입증 증빙)을 첨부할 때만 사용 가능.
+
+---
+
+## 15. Sonnet이 요청받지 않은 아키텍처 후보를 Tier-3 자문에 임의로 얹어 과설계로 확대된 사고 (ecount_hub Termux 지원, 2026-09-28)
+
+- **메타데이터**:
+  - `root-cause`: `sonnet-overreach` (요청받지 않은 범위를 감독자 스스로 설계 후보에 포함)
+  - `verified_with`: 2026-09-28
+
+- **사고 경위**:
+  - 사용자는 "Termux(안드로이드)처럼 Playwright/Chromium을 못 쓰는 환경에서도 MCP를 쓰게 만들 방법을 고민해 달라, Sol을 불러라"고만 요청했다. **SSH를 쓰라는 지시는 없었다.**
+  - Sonnet이 Sol에게 보낼 자문 요청 프롬프트를 직접 작성하면서, 비교할 아키텍처 후보 목록에 **스스로 "(A) 원격 실행 위임: SSH를 통한 stdio MCP 서버"를 임의로 추가**했다(다른 두 후보 B/C도 함께 제시했으나, 문제는 사용자가 요청도 언급도 하지 않은 구체적 기술 스택 하나를 감독자가 먼저 제시해버린 것).
+  - Sol과 그 답변을 받은 agy는 이 후보를 성실히 검토한 결과 "Phase 1 최적 선택"으로 채택하고, 이를 기반으로 SSH 키 생성, `authorized_keys` `restrict,command=` 제한, Tailscale 기기 분실 대응 매뉴얼, 보안 비교표, Claude Code `claude mcp add` SSH 설정 예시까지 **상당한 분량의 구체적 구현 가이드**를 `TERMUX_SUPPORT.md`에 작성해 커밋·푸시했다.
+  - 사용자는 이후 세션에서 "리버스엔지니어링(순수 파이썬 네이티브 로그인)이 나을 것 같다"고 먼저 방향을 제시했고, 실제로 그 방향(Phase 2/3)이 성공적으로 구현된 뒤에야 "SSH로 할 거면 의미가 없다(그냥 호스트에 직접 붙는 것과 다를 바 없다)"고 SSH 방안 자체의 가치를 부정했다. 이 시점에 되짚어보니 SSH는 애초에 사용자가 원한 적이 없었고, 불필요하게 많은 분량의 문서·설계가 낭비됐다.
+- **근본 원인**:
+  - 감독자(Sonnet)가 하위 Tier-3 자문(Sol)에게 조사 과제를 위임할 때, **"사용자가 실제로 요청한 것"과 "감독자 자신이 떠올린 후보 아이디어"를 구분하지 않고 동일한 무게로 섞어서 제시**했다.
+  - Sol/agy 입장에서는 감독자가 준 후보 목록을 곧이곧대로 신뢰하고 성실히 발전시켰을 뿐이므로, 문제의 원인은 하위 워커가 아니라 **상위 프롬프트를 작성한 감독자 자신에게 있다.**
+  - 결과가 그럴듯하고 분량이 많다고 해서(보안 비교표, 로드맵, 단계별 가이드) 사용자가 원했던 방향이라고 착각하기 쉽다 — 산출물의 완성도와 "사용자가 요청했는지 여부"는 별개다.
+- **재발 방지**:
+  1. Tier-3(Sol/Opus) 자문 프롬프트를 작성할 때, 감독자 자신이 떠올린 후보/아이디어는 **"사용자 요청"과 명시적으로 분리 표기**한다(예: "사용자 요청: ~~~" vs "감독자 제안 후보(사용자 미확인): ~~~"). 최소한 자문 결과를 사용자에게 전달할 때 어느 부분이 감독자 자신의 아이디어였는지 명확히 밝힌다.
+  2. 특히 구체적인 기술 스택(SSH, 특정 프로토콜, 특정 라이브러리 등)을 후보로 제시할 때는, 그것이 사용자가 이미 언급한 제약/선호에서 자연스럽게 도출된 것인지, 아니면 감독자가 일반론적으로 떠올린 것인지 스스로 점검한다.
+  3. 하위 워커(Sol/agy)가 감독자 제시 후보 중 하나를 "최적 선택"으로 확정해 대량의 구현물을 만들기 전에, 그 후보가 사용자 요청 범위 안에 있는 것이 맞는지 감독자가 한 번 더 확인하고 넘기는 것이 이상적이다(단, 매번 왕복 확인을 요구하면 좋았던 delegation 흐름이 느려지므로, 최소한 "이건 내가 제안한 후보다"라는 라벨링만이라도 반드시 남긴다).
+
+---
+
+## 16. Post-mortem/Learning Capsule 규약이 자동 전파되지 않고 프로젝트를 바꾸자마자 소실된 사고 (2026-09-28)
+
+- **메타데이터**:
+  - `root-cause`: `template-bug` / `self-reflection-not-automatic`
+  - `verified_with`: 2026-09-28
+
+- **증상 (정량적)**:
+  - 같은 세션 안에서 `ecount_hub`(별개 프로젝트) 작업을 10라운드 디스패치했는데, **10건 전부 `learning_capsule`/`knowledge_refs` 규약을 포함하지 않았다.**
+  - ROLES.md §"종료 보고 형식"에는 `refs_loaded`, `learning_capsule`, `[[DONE <id>]] result=... | learning=...` 형식이 명시되어 있음에도, 실제로는 단 한 번도 지켜지지 않았다.
+- **근본 원인**:
+  1. `bin/dispatch.sh`가 모든 디스패치에 자동 주입하는 `[CHAIN CONTEXT]` 헤더(`WORKER_RULES`)에는 "직접 작업 금지"와 "codex 컨벤션 우선"만 박혀 있고, **`learning_capsule`/보고 형식 규칙은 전혀 포함되어 있지 않다.**
+  2. agy는 oneshot 모드에서 `ROLES.md`를 자동으로 읽지 않는다(§1 T0924-01 프로브에서 이미 실측 확인된 사실). 따라서 이 규약은 **감독자(Sonnet)가 매 디스패치 프롬프트에 직접 재기술해야만** 작동하는, 사실상 감독자의 기억력에 100% 의존하는 비자동 시스템이었다.
+  3. 감독자가 새 프로젝트(다른 작업 맥락)로 전환하면서 매번 처음부터 프롬프트를 새로 작성했고, 그 과정에서 이 관례를 그대로 빠뜨렸다. 이를 잡아낼 어떤 기계적 안전장치도 없었다 — 조용히 샜고, 아무도 눈치채지 못했다(사용자가 직접 "자가반영이 되는지 훑어보라"고 요청하기 전까지).
+- **함의**: 어제(9/23) 정성 들여 설계한 Post-mortem Lifecycle(Capture→Curate, `known-issues.md`/`lessons.md`/`incidents/*.md` 3계층)은 **문서로만 존재하고, 실제로는 작동을 보장하는 메커니즘이 없다.** "규칙을 문서에 적어뒀다"와 "규칙이 실제로 매번 지켜진다"는 완전히 다른 문제라는 걸 정량적으로 보여준 사례.
+- **재발 방지 (제안, 미구현)**:
+  1. **`bin/dispatch.sh`의 자동 헤더에 규약을 직접 인라인**해야 한다(ROLES.md 경로만 던져주는 게 아니라). 예: `WORKER_RULES`에 `"Report format: end with [[DONE <task_id>]] result=<summary> | learning=<one-line|none>"` 한 줄을 추가하면, 어떤 프로젝트로 디스패치하든 감독자가 매번 재기술할 필요 없이 구조적으로 강제된다.
+  2. 이게 되기 전까지는, 감독자가 새 프로젝트/새 맥락으로 넘어갈 때마다 "이 프로젝트에도 Post-mortem 규약을 프롬프트에 넣었는가"를 스스로 체크리스트로 확인해야 한다(신뢰할 수 없는 임시방편이지만, 구조적 수정 전까지는 최소한의 안전장치).
+  3. 장기적으로는 워커의 최종 보고에 `learning=` 필드가 없으면 `event-emit`/감독자 감사 단계에서 경고를 내는 것도 고려할 만하다(다만 자연어 자유서식 보고를 기계적으로 파싱해야 하므로 난이도가 있음 — 이번엔 제안만 남기고 구현하지 않음).
