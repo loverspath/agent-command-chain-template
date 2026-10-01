@@ -73,7 +73,7 @@ summary: 실측으로 확인된 RC 전제조건, Folder Trust 우회 한계, 세
 ## 7. codex CLI 실행 모드 및 WSL 네이티브 바이너리 설치
 
 - **대화형 TUI 모드 사용**: 초기에는 라우터 어댑터의 `codex exec --model ... -s danger-full-access`(one-shot) 형태를 사용했으나, 프롬프트가 주어지지 않으면 대화 지속 없이 즉시 종료되어 지속형 tmux 창에 적합하지 않았다. 따라서 `exec` 서브커맨드를 제외한 순수 대화형 TUI `codex`가 기본값으로 설정되었다.
-  - 모델명 `gpt-5.6-terra`, `gpt-5.6-sol`은 계정 `~/.codex/config.toml` 기본값과 일치함이 확인됨.
+  - 모델명은 `bin/resolve-model.sh`를 통해 계정 카탈로그/설정의 최신 지원 모델(sol 계열 등)로 자동 동적 해석됨.
 - **WSL 환경 설치 주의**: Windows 전용 npm 글로벌 설치본의 shim을 WSL의 node가 참조할 경우 `linux-x64` 네이티브 옵셔널 의존성 누락으로 구동이 실패한다. 반드시 **WSL 터미널 안에서 직접** `npm install -g @openai/codex@latest`를 실행하여 리눅스 네이티브 바이너리를 설치해야 한다.
 
 ---

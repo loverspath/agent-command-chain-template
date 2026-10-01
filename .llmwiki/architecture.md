@@ -20,12 +20,12 @@ summary: Sonnet/agy/Codex Terra/Sol-Opus 4계층 명령계통과 v2 Full-Push(FI
 | **1. 감독/디스패치** | Claude Sonnet | tmux window `sonnet` | 모니터링, 작업 분배, 감사, 사용자 명령 하달 | 사람과의 상시 소통 창구. 실질 작업은 스스로 하지 않고 agy/codex에 위임 |
 | **2. 라우터 겸 워커 총괄** | agy (Gemini 3.8 Flash) | tmux window `agy` | 난이도 판단 및 워커 서브에이전트 위임·총괄 | v2 단발 실행(oneshot 한 턴) 라우팅 또는 Stage 1 상주 TUI 모드. 직접 작업(Read/Bash/Edit) 금지 및 내장 도구 `invoke_subagent`로 위임. 실패 시 `[[BLOCKED]]` 에스컬레이션. (v1 상주 TUI responsive state는 legacy) |
 | **2-내부 Tier 2** | Codex Terra | tmux window `codex` | 중난도 작업 설계 및 직접 수행 | 단발 어댑터(`adapters/codex-oneshot.sh`) 또는 대화형 TUI 기동. agy가 자동 호출하지 않음 |
-| **2-내부 Tier 3** | Sol / Opus | 상시 창 없음 (필요 시 호출) | 최고난도 문제 및 전체 플래닝 상담 | codex 창의 커맨드를 `gpt-5.6-sol`로 전환하거나, Sonnet 창에서 `--model opus` 일회성 실행 |
+| **2-내부 Tier 3** | Sol / Opus | 상시 창 없음 (필요 시 호출) | 최고난도 문제 및 전체 플래닝 상담 | codex 창의 커맨드를 Sol 계열 최신(`resolve-model.sh sol`)으로 전환하거나, Sonnet 창에서 `--model opus` 일회성 실행 |
 
 ### 핵심 아키텍처 단순화 및 원칙
 - **계층 단순화**: Sonnet은 agy와 codex(Terra) 두 창만 직접 봅니다. eraweb-fork의 "Terra가 agy 보고를 정규화해서 Sol에게만 전달, agy는 Sol에 직접 보고 안 함" 규칙을 계층 구조 자체로 끌어올린 것입니다.
 - **agy → codex 자동 연동이 없는 이유**: eraweb-fork에서 agy가 Terra/Sol을 실제로 호출하는 로직은 `tools/router/src/adapters/*.ts`(Node `child_process.spawn`)에 있었으나, 본 템플릿은 외부 라우터 엔진 하네스를 배제하고 경량화하기 위해 해당 레이어를 의도적으로 제외했습니다. 따라서 codex 창은 agy와 자동으로 연동되지 않으며, Sonnet(또는 사람)이 agy 출력을 보고 필요하다고 판단되면 codex 창에 직접 `send-keys`로 작업을 넘깁니다. (진짜 자동 연동이 필요해지면 eraweb-fork의 라우터 어댑터를 참고하여 별도 구현)
-- **Sol/Opus가 상시 창이 없는 이유**: 사용 빈도가 낮고(최고난도 상담), 상시 프로세스를 켜두는 것보다 필요할 때 `codex` 창 커맨드를 `--model gpt-5.6-sol`로 바꾸거나 Sonnet 세션에서 `--model opus`로 일회성 실행하는 것이 자원상 훨씬 가볍기 때문입니다.
+- **Sol/Opus가 상시 창이 없는 이유**: 사용 빈도가 낮고(최고난도 상담), 상시 프로세스를 켜두는 것보다 필요할 때 `codex` 창 커맨드를 Sol 계열 최신(`resolve-model.sh sol`)으로 바꾸거나 Sonnet 세션에서 `--model opus`로 일회성 실행하는 것이 자원상 훨씬 가볍기 때문입니다.
 
 ---
 
@@ -215,7 +215,7 @@ v1 아키텍처는 추가적인 FIFO나 Outbox 없이 순수 tmux 내부 기능�
 tmux session: agentchain (config.env의 SESSION_NAME)
  ├─ window 0 "sonnet": claude --model sonnet --remote-control --add-dir <템플릿경로>
  ├─ window 1 "agy":    agy --new-project --mode plan (대화형, 지속)
- └─ window 2 "codex":  codex --model gpt-5.6-terra -s danger-full-access (대화형, 지속)
+ └─ window 2 "codex":  codex --model "$(bin/resolve-model.sh sol)" -s danger-full-access (대화형, 지속)
 ```
 
 - **동적 대상 디렉토리 (`PROJECT_DIR`)**: 세 창 모두 `bootstrap.sh`를 실행한 디렉토리(`PROJECT_DIR`)에서 시작합니다 (`-c "$PROJECT_DIR"`). 하드코딩된 프로젝트 경로는 없으며 실행 위치를 기준으로 동적으로 결정됩니다.

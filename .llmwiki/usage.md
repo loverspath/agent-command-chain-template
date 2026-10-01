@@ -280,7 +280,7 @@ Sonnet은 `capture-pane` 또는 `logs/agy.pane.log`를 주기적으로 검사하
 Sonnet(또는 사람)은 아래 규격에 맞추어 `send-keys`로 `codex` 창에 지시를 주입한다:
 
 ```bash
-tmux send-keys -t agentchain:codex "Model Role: GPT-5.6 TERRA
+tmux send-keys -t agentchain:codex "Model Role: Codex Terra
 Scope: src/core/auth.py
 
 ## Specification
@@ -297,7 +297,7 @@ agy에서 분리된 토큰 검증 로직 구현 및 엣지 케이스 단위 테�
 - **Codex Sol 상담**: Codex 창에서 프로세스를 종료하거나 커맨드를 변경하여 일회성으로 호출:
   ```bash
   tmux send-keys -t agentchain:codex C-c
-  tmux send-keys -t agentchain:codex "codex --model gpt-5.6-sol -s danger-full-access" C-m
+  tmux send-keys -t agentchain:codex 'codex --model "$(bin/resolve-model.sh sol)" -s danger-full-access' C-m
   ```
 - **Claude Opus 상담**: Sonnet 세션 내에서 일회성 플래닝/상담 명령을 `--model opus`로 실행.
 

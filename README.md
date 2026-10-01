@@ -18,7 +18,7 @@
 | **1. 감독/디스패치** | Claude Sonnet | 모니터링·감사, 작업 디스패치, 루프 관리, RC(원격제어) | 사람과의 상시 소통 창구. **사용자가 직접 요청하지 않는 한 실질 작업(문서/코드 작성/조사)은 스스로 하지 않고 agy/codex에 위임** |
 | **2. 라우터 겸 워커 총괄** | agy (Gemini 3.8 Flash) | 난이도 판단(hard routing) 및 서브에이전트 위임·총괄 | **메인 세션 직접 작업(Read/Bash/Edit) 금지 및 서브에이전트(`invoke_subagent`) 위임.** v2 단발 실행(oneshot 한 턴) 라우팅 또는 Stage 1 상주 TUI 모드. 소환 불가/실패 시 직접 처리 금지 및 `[[BLOCKED <id>]] reason=subagent-unavailable\|needs-terra` 보고. (v1 상주 TUI responsive state는 legacy) |
 | **2-내부 Tier 2** | Codex Terra | 중난이도 작업의 설계 및 직접 수행 | 별도 tmux 창(§2). agy가 자동 호출하진 않음 — 아래 "한계" 참고 |
-| **2-내부 Tier 3** | Sol / Opus | 최고난도 문제, 전체 플래닝 상담 | 상시 창 없음. 필요할 때 codex 창의 커맨드를 `--model gpt-5.6-sol`로 바꿔 send-keys, 또는 claude 쪽은 `--model opus`로 즉석 실행 |
+| **2-내부 Tier 3** | Sol / Opus | 최고난도 문제, 전체 플래닝 상담 | 상시 창 없음. 필요할 때 codex 창의 커맨드를 Sol 계열 최신(`resolve-model.sh sol`)으로 바꿔 send-keys, 또는 claude 쪽은 `--model opus`로 즉석 실행 |
 
 핵심 원칙:
 1. **계층 1 Sonnet(감독)은 사람과의 상시 소통 창구이자 agy/codex의 모니터링·감사가 주 역할이다.** 사용자가 Sonnet에게 직접 수행하라고 명시적으로 요구하지 않는 한, 문서 작성/코드 작성/조사 같은 실질적인 작업은 스스로 직접 처리하지 않고 agy 또는 codex(Terra/Sol)에 위임해야 한다.
@@ -66,7 +66,7 @@ v2는 tmux의 pull 모델(화면 스크래핑/폴링)의 지연과 불안정성�
 tmux session: agentchain (config.env의 SESSION_NAME)
  ├─ window 0 "sonnet": claude --model sonnet --remote-control --add-dir <템플릿경로>
  ├─ window 1 "agy":    agy --new-project --mode plan (대화형, 지속)
- └─ window 2 "codex":  codex --model gpt-5.6-terra -s danger-full-access (대화형, 지속 — `codex exec`는 one-shot이라 안 씀)
+ └─ window 2 "codex":  codex --model "$(bin/resolve-model.sh sol)" -s danger-full-access (대화형, 지속 — `codex exec`는 one-shot이라 안 씀)
 ```
 
 - **push 없음**: tmux는 근본적으로 pull입니다. 실시간성이 필요하면 `pipe-pane`으로 로그 파일을 만들고 tail하는 것이 근접한 비동기 감지 수단입니다.

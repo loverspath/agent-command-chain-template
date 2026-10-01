@@ -33,7 +33,7 @@
 >
 > agy가 스스로 codex를 부르진 않으니(§2 브리지 설계 참고), 네가 agy 출력을 보고
 > "이건 Terra급이다" 싶으면 직접 codex 창에 작업을 넘겨라. 가장 어려운 문제나 전체 플래닝이
-> 필요하면 codex 창의 커맨드를 `--model gpt-5.6-sol`로 바꾸거나, 네 자신을
+> 필요하면 codex 창의 커맨드를 Sol 계열 최신(resolve-model.sh sol)으로 바꾸거나, 네 자신을
 > `--model opus`로 일회성 실행해서 상담을 구해라. 무엇을 누구에게 위임했는지 사람에게
 > 요약 보고해라.
 > **[Tier 3 산출물 즉시 Research 등록 지침]**: Sol이든 Opus든 헤드리스 Sol이든 Tier 3 상담이나 조사 결과물이
@@ -88,7 +88,7 @@ agy 창에서 최초로 줄 지시 (eraweb-fork `CLI_START_HERE.md`의 첫 프�
 codex 창에 처음 작업을 넘길 때 (라우터 어댑터의 프롬프트 포맷을 그대로
 가져온 것):
 
-> Model Role: GPT-5.6 TERRA
+> Model Role: Codex Terra
 > Scope: <file|subsystem|...>
 >
 > ## Specification

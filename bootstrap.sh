@@ -178,7 +178,7 @@ tmux send-keys -t $SESSION_NAME:$CODEX_WINDOW "여기에 지시문" C-m
 - codex는 대화형(one-shot exec 아님)이라 계속 떠 있다. 작업 하나 끝나면 그 결과를
   읽고 다음 지시를 또 send-keys 하면 된다.
 - Sol/Opus(최고난도 상담)는 상시 창이 없다. 필요하면 codex 창 커맨드를
-  \`--model gpt-5.6-sol\`로 바꿔서 새로 켜거나, 네 자신을 \`--model opus\`로 일회성
+  Sol 계열 최신(\`bin/resolve-model.sh sol\`)으로 바꿔서 새로 켜거나, 네 자신을 \`--model opus\`로 일회성
   실행해서 상담을 구해라.
 - 사람이 새 명령을 내리면 알맞은 창에 전달하고, 진행상황을 요약해서 보고해라.
 

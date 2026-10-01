@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 사용법: resolve-model.sh <tier>   예) resolve-model.sh sol  ->  gpt-6.1-sol
+# 사용법: resolve-model.sh <tier>   예) resolve-model.sh sol  ->  gpt-<version>-sol
 # codex 모델 카탈로그에서 gpt-<버전>-<tier> 중 visibility=list 인 최신 버전을 출력한다.
 # 1) codex debug models (라이브 카탈로그, 타임아웃 30초)를 먼저 시도한다.
 # 2) 실패하거나 타임아웃 시 models_cache.json 파일(캐시)로 폴백한다.
