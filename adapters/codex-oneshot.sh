@@ -19,10 +19,11 @@ if [[ -z "${CODEX_MODEL:-}" ]]; then
     exit 65
   }
 fi
-echo "[codex-oneshot] model=$CODEX_MODEL tier=${CODEX_TIER:-sol}" >&2
+echo "[codex-oneshot] model=$CODEX_MODEL tier=${CODEX_TIER:-sol} effort=${CODEX_EFFORT:-medium}"
 
 exec codex exec \
   --model "$CODEX_MODEL" \
+  -c model_reasoning_effort="${CODEX_EFFORT:-medium}" \
   --skip-git-repo-check \
   -s danger-full-access \
   -C "$project_dir" \

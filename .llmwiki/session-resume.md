@@ -57,9 +57,9 @@ cat ~/.gemini/config/hooks.json
 누락되어 있다면 해당 경로의 스크립트를 Stop 훅으로 등록한다.
 
 ### 1.3 Codex Sol 모델 해석 및 쿼터 확인
-Codex 작업 디스패치는 모델 카탈로그(`~/.codex/models_cache.json`)에서 최신 모델을 자동 해석한다.
+Codex 작업 디스패치는 Sol 계열 최신 모델을 자동 해석(`bin/resolve-model.sh sol`)하여 선택하며, 수동 오버라이드(`CODEX_MODEL`)는 비상시에만 사용한다.
 ```bash
-# Sol 모델 해석 정상 여부 검증 (gpt-6-sol 등 최신 list 모델 반환 확인)
+# Sol 모델 해석 정상 여부 검증 (Sol 계열 최신 list 모델 반환 확인)
 ./bin/resolve-model.sh sol
 ```
 - **Codex 쿼터 고갈 점검 및 agy 폴백**:
@@ -72,6 +72,11 @@ git clone https://github.com/loverspath/agent-command-chain-template.git ~/agent
 cd ~/agent-command-chain-template
 cp config.env.example config.env
 ```
+복사한 `config.env`에서 다음 필수 항목들을 설정한다:
+1. `AGY_MODE=resident`: agy를 상주 TUI 모드로 기동 (Stage 1 지원).
+2. `CODEX_EFFORT=medium`: 상위 티어(Sol 등) 추론 강도를 medium으로 고정 (사용자 결정 반영).
+3. `HANDOFF_FILE`: 세션 재개 시 자동 참조할 인수인계서 경로 지정 (예: `HANDOFF_FILE=docs/RESUME_HANDOFF.md`).
+4. `PROJECT_DIR`: (선택 사항) 특정 프로젝트 디렉토리를 작업 대상으로 영구 고정할 경우 지정 (비워두면 부트스트랩 실행 위치가 기본 작업 대상이 됨).
 
 ---
 
@@ -88,9 +93,10 @@ cp config.env.example config.env
 | `SONNET_CMD` | `claude --model sonnet --remote-control` | `claude --model sonnet --remote-control` | Sonnet 기동 명령 (RC 자동 활성화) |
 | `AGY_CMD` | `agy --new-project --mode plan` | `agy --new-project --mode plan` | agy 대화형 기동 명령 (v1 레거시용) |
 | `AGY_RESIDENT_CMD` | `agy --dangerously-skip-permissions` | `agy --dangerously-skip-permissions` | agy 상주 TUI 기동 명령 (Stage 1 상주 모드) |
-| `CODEX_CMD` | `codex --model gpt-5.6-terra -s danger-full-access` | `codex --model gpt-5.6-terra -s danger-full-access` | Codex 대화형 기동 명령 |
-| `CODEX_TIER` | `sol` | `sol` | Codex 최상위 모델 티어 (`resolve-model.sh` 자동 해석) |
-| `CODEX_MODEL` | (미지정, 자동 해석) | (미지정) | 명시적 Codex 모델 지정 시 자동 해석 우회 |
+| `CODEX_CMD` | `codex --model $(bin/resolve-model.sh sol) -s danger-full-access` | `codex --model $(bin/resolve-model.sh sol) -s danger-full-access` | Codex 대화형 기동 명령 (v1 폴백용) |
+| `CODEX_TIER` | `sol` | `sol` | Codex 최상위 모델 티어 (Sol 계열 최신 자동 해석: `bin/resolve-model.sh sol`) |
+| `CODEX_MODEL` | (미지정, 자동 해석) | (미지정) | 명시적 Codex 모델 지정 시 자동 해석 우회 (비상시에만 수동 오버라이드) |
+| `CODEX_EFFORT` | `medium` | `medium` | Codex 추론 강도 (상위 티어는 medium 추론 강도 고정) |
 | `BRIDGE_MODE` | `push` | `push` | Full-Push 이벤트 통지 브리지 모드 (FIFO+asyncRewake) |
 | `WORKER_MODE` | `oneshot` | `oneshot` | 기본 워커 모드 (`oneshot` 또는 `resident`) |
 | `AGY_MODE` | `resident` | (미지정) | agy 상주 TUI 브리지 모드 (Stage 1 활성화) |
@@ -184,11 +190,12 @@ tmux 창 밖의 일반 셸 터미널에서 `claude`를 실행했거나, 브리�
    tmux list-windows -t agentchain-v2
    # 출력 결과에 sonnet, agy, codex 3개 윈도우가 모두 존재해야 함
    ```
-2. **agy 상주 TUI 준비 상태 확인**:
+2. **agy 상주 TUI 준비 상태 확인 (최초 1회성 상태 점검)**:
    ```bash
    tmux capture-pane -t agentchain-v2:agy -p | tail -n 5
    # 프롬프트 기호(>)가 보이고 유휴 대기 상태여야 함
    ```
+   *주의:* 이 명령은 세션 기동/재개 시 **최초 1회 상태 점검(sanity check)** 목적에 한하며, 작업 진행 중 주기적 폴링(polling) 용도로 사용하는 것은 전면 엄격 금지된다 (완료 통지는 Full-Push 이벤트 대기).
 3. **watchdog-v2 프로세스 생존 확인**:
    ```bash
    pgrep -fa "watchdog-v2.sh"
@@ -286,10 +293,11 @@ cat runtime/agentchain-v2-*/tasks/<task_id>/state
 
 Claude Sonnet(계층 1 감독자)으로서 지켜야 할 핵심 행동 규범이다:
 
-1. **역할 분담의 철칙**:
-   - **감독관(Sonnet)**: 사람과의 소통, 상위 아키텍처 설계, 작업 디스패치, 결과 감사(Audit), Git 커밋 및 머지.
-   - **구현 워커(agy & codex)**: 실제 코드 파일 편집, 대량 탐색, 정적 검사 실행.
-   - 감독관이 직접 수십 줄 이상의 코드를 작성하거나 툴 루프에 빠져 구현하지 않는다.
+1. **역할 분담의 철칙 (구현과 테스트는 agy, 감독은 설계·검수·머지)**:
+   - **감독관(Sonnet)**: 사람과의 소통, 상위 아키텍처 설계, 작업 디스패치, 결과 감사(Audit), Git 커밋 및 머지 담당. 감독관은 코드를 직접 수정하지 않으며 문서 정리 작업 역시 agy에게 위임한다.
+   - **구현 워커(agy & codex)**: 실제 코드 파일 편집, 문서 정리, 대량 탐색, 정적 검사 및 **단위/통합 테스트 실행 ("테스트도 agy가 한다" 원칙)**.
+   - Sol 쿼터 한도 소진 시에도 동일하게 agy가 구현과 테스트를 전담한다.
+   - 감독관이 직접 수십 줄 이상의 코드를 작성하거나 툴 루프에 빠져 구현·테스트를 대신하지 않는다.
 2. **화면 폴링 금지, Full-Push 이벤트 대기**:
    - `tmux capture-pane`이나 루프를 통한 주기적 상태 조회를 전면 금지한다.
    - 워커가 작업을 마치면 `[ACC_EVENT_BATCH]` 시스템 알림으로 자동 기상하므로, 디스패치 후에는 조용히 대기하라.

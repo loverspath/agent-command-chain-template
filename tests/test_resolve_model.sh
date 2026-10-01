@@ -9,6 +9,16 @@ TMP_DIR="$(mktemp -d /tmp/test-resolve-model-XXXXXX)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 CATALOG="$TMP_DIR/models_cache.json"
+FAKE_BIN="$TMP_DIR/bin"
+mkdir -p "$FAKE_BIN"
+export PATH="$FAKE_BIN:$PATH"
+
+# Default fake codex: fails by default so tests 2-4 test cache fallback
+cat > "$FAKE_BIN/codex" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$FAKE_BIN/codex"
 
 echo "=== Test 1: Invalid tier argument (exit 64) ==="
 # Missing tier
@@ -90,6 +100,75 @@ if [[ "$output" != "gpt-5.10-sol" ]]; then
   exit 1
 fi
 echo "PASS: Numeric version comparison (5.10 > 5.9)"
+
+echo "=== Test 5: Live catalog has newer version -> selects it ==="
+cat > "$FAKE_BIN/codex" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$*" == *"debug models"* ]]; then
+  cat <<'JSON'
+{
+  "models": [
+    {"slug": "gpt-6.2-sol", "visibility": "list"},
+    {"slug": "gpt-6-sol", "visibility": "list"}
+  ]
+}
+JSON
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$FAKE_BIN/codex"
+
+cat > "$CATALOG" <<'EOF'
+{
+  "models": [
+    {"slug": "gpt-6-sol", "visibility": "list"}
+  ]
+}
+EOF
+output="$(CODEX_MODELS_CACHE="$CATALOG" "$RESOLVE_SCRIPT" sol)"
+if [[ "$output" != "gpt-6.2-sol" ]]; then
+  echo "FAIL: Expected 'gpt-6.2-sol' from live catalog, got '$output'" >&2
+  exit 1
+fi
+echo "PASS: Live catalog has newer version and was selected"
+
+echo "=== Test 6: Live catalog fails -> falls back to cache file ==="
+cat > "$FAKE_BIN/codex" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$FAKE_BIN/codex"
+
+cat > "$CATALOG" <<'EOF'
+{
+  "models": [
+    {"slug": "gpt-6-sol", "visibility": "list"},
+    {"slug": "gpt-5.6-sol", "visibility": "list"}
+  ]
+}
+EOF
+output="$(CODEX_MODELS_CACHE="$CATALOG" "$RESOLVE_SCRIPT" sol)"
+if [[ "$output" != "gpt-6-sol" ]]; then
+  echo "FAIL: Expected 'gpt-6-sol' from fallback cache, got '$output'" >&2
+  exit 1
+fi
+echo "PASS: Live catalog fails and successfully falls back to cache file"
+
+echo "=== Test 7: Both live catalog and cache fail -> returns non-zero ==="
+cat > "$FAKE_BIN/codex" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$FAKE_BIN/codex"
+
+rc=0
+CODEX_MODELS_CACHE="$TMP_DIR/nonexistent.json" "$RESOLVE_SCRIPT" sol 2>/dev/null || rc=$?
+if [[ "$rc" -eq 0 ]]; then
+  echo "FAIL: Expected non-zero exit when both live and cache fail, got $rc" >&2
+  exit 1
+fi
+echo "PASS: Both fail returns non-zero (rc=$rc)"
 
 echo "All tests in test_resolve_model.sh passed successfully!"
 exit 0

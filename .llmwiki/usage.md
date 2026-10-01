@@ -46,9 +46,10 @@ chmod +x bootstrap.sh watchdog.sh bootstrap-v2.sh watchdog-v2.sh bin/*.sh adapte
 | `SONNET_CMD` | `claude --model sonnet --remote-control` | Sonnet 기동 명령. 부트스트랩 시 `--add-dir <템플릿경로>`가 세션 범위로 자동 부가됨 |
 | `AGY_CMD` | `agy --new-project --mode plan` | agy 대화형 기동 명령 (v1 레거시 상주용) |
 | `AGY_RESIDENT_CMD` | `agy --dangerously-skip-permissions` | agy 상주 TUI 기동 명령 (Stage 1 상주 모드) |
-| `CODEX_CMD` | `codex --model gpt-5.6-terra -s danger-full-access` | Codex 대화형 TUI 기동 명령 (`codex exec` one-shot 아님) |
-| `CODEX_TIER` | `sol` | Codex 모델 티어 (`resolve-model.sh`를 통해 최신 list 모델 자동 해석) |
-| `CODEX_MODEL` | (미지정) | 명시적 Codex 모델 지정 시 `resolve-model.sh` 자동 해석 우회 |
+| `CODEX_CMD` | `codex --model $(bin/resolve-model.sh sol) -s danger-full-access` | Codex 대화형 TUI 기동 명령 (v1 레거시/폴백 전용, v2에서는 adapters/codex-oneshot.sh 사용) |
+| `CODEX_TIER` | `sol` | Codex 모델 티어 (`bin/resolve-model.sh`를 통해 최신 list 모델 자동 해석) |
+| `CODEX_MODEL` | (미지정) | 명시적 Codex 모델 지정 시 `bin/resolve-model.sh` 자동 해석 우회 (비상용 수동 오버라이드, 평소 비워둠) |
+| `CODEX_EFFORT` | `medium` | Codex 추론 강도 (reasoning effort). 사용자 결정에 따라 상위 티어(Sol 등) 모델은 medium 추론 강도 고정 |
 | `AUTO_CONFIRM_TRUST` | `true` | 새 디렉토리 첫 진입 시 디렉토리 신뢰("trust this folder?") 대화형 확인 자동 승인 여부 |
 | `LOG_DIR` | `./logs` | 로그 및 자동 생성되는 세션 브리핑(`session_brief.md`) 저장 디렉토리 |
 | `WATCHDOG_INTERVAL` | `60` | 워치독 프로세스 생존 검사 주기 (초) |
