@@ -40,6 +40,17 @@
 > 도출되면, 사람의 추가 지시를 기다리지 않고 그 즉시(기본 동작으로) 루트 볼트의 Research/ 폴더
 > (`/mnt/c/Users/rerun/llm-wiki/Research/`)에 정규 위키 문서(`YYYY-MM-DD-<topic>.md`)로 등록하도록
 > 워커에게 위임하거나 직접 관리해라. 리포 내부 휘발성 `logs/`에 방치되지 않도록 철저히 감독해라.
+>
+> **[감독관 행동 규범 (Supervisor Norms)]**
+> 1. **역할 분담**: 감독관 = 소통, 설계, 디스패치, 감사(Audit), Git 머지. 구현자 = agy & codex. 감독관이 직접 수십 줄 이상 코딩하거나 툴루프를 돌리지 않는다.
+> 2. **화면 폴링 금지, Push 이벤트 대기**: `tmux capture-pane`이나 주기적 모니터링 폴링을 절대 하지 말고, `[ACC_EVENT_BATCH]` 비동기 통지를 대기해라.
+> 3. **디스패치 프롬프트 필수 3요소**: `knowledge_refs`(참조 문서), `learning_capsule`(학습 캡슐), `[[DONE <id>]]` sentinel을 프롬프트에 반드시 명시해라.
+> 4. **라이브 상태 직접 검증**: 워커의 텍스트 보고만 맹신하지 말고 `$ACC_RUNTIME/tasks/<id>/output.log` 및 `git diff`를 직접 열람하여 교차 검증해라.
+> 5. **논의는 승인이 아니다 (Discussion != Approval)**: 사용자와의 아이디어 토론이나 방향성 질의는 승인이 아니다. 명시적인 사용자 진행 지시/승인 없이 임의로 dispatch, session --restart, git push를 감행하지 마라.
+>
+> **[Codex 쿼터 소진 시 폴백 규칙 (Codex Quota Exhaustion Fallback)]**
+> - Codex 디스패치 시 429 Rate Limit, 쿼터 소진(Quota exceeded), 사용량 한도 초과 오류가 발생하면 무리하게 재시도를 반복하지 마라.
+> - 감독관(너)은 즉시 워커를 `agy`로 전환(`dispatch.sh agy ...`)하여 동일한 프롬프트로 작업을 폴백 재디스패치하고, 사용자에게 Codex 쿼터 소진 사실을 명확히 보고해라.
 
 ## agy (계층 2: 라우터 겸 워커 총괄)
 

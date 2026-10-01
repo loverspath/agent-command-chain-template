@@ -1,8 +1,8 @@
 ---
 title: Known Issues & Limitations
-tags: [known-issues, limitations, bug, product-bug, permissions, remote-control, fallback, wsl, tmux-nesting, session-resolution, dispatch-targeting, non-preemptive-tui, cli-behavior, prompt-drift, test-harness-isolation, troubleshooting, sonnet-overreach, unrequested-scope, self-reflection-not-automatic]
-related: ["[[INDEX]]", "[[architecture]]", "[[usage]]"]
-summary: 실측으로 확인된 RC 전제조건, Folder Trust 우회 한계, 세션 지속성 버그, agy/codex 바이너리 이슈, tmux 중첩, v1/v2 세션 오조준, TUI 비선점 큐잉, 입력 혼선, 테스트 하네스 격리 규약, Sonnet의 요청 외 범위 임의 확장 사고, Post-mortem 규약이 프로젝트 전환 시 자동 전파되지 않는 구조적 결함.
+tags: [known-issues, limitations, bug, product-bug, permissions, remote-control, fallback, wsl, tmux-nesting, session-resolution, dispatch-targeting, non-preemptive-tui, cli-behavior, prompt-drift, test-harness-isolation, troubleshooting, sonnet-overreach, unrequested-scope, self-reflection-not-automatic, stale-lease, auto-mode-classifier, resident-subagent, process-kill-safety, codex-quota-fallback, live-session-pollution]
+related: ["[[INDEX]]", "[[architecture]]", "[[usage]]", "[[session-resume]]"]
+summary: 실측으로 확인된 RC 전제조건, Folder Trust 우회 한계, 세션 지속성 버그, agy/codex 바이너리 이슈, tmux 중첩, v1/v2 세션 오조준, TUI 비선점 큐잉, 입력 혼선, 테스트 하네스 격리 규약, Sonnet의 요청 외 범위 임의 확장 사고, Post-mortem 누락 사고, stale lease 고착, auto-mode 분류기 차단, 상주 agy 대기 정체, 데몬 kill 세션 종료, Codex 쿼터 고갈, 라이브 런타임 오염 방지.
 ---
 
 # Known Issues & Limitations
@@ -269,3 +269,119 @@ summary: 실측으로 확인된 RC 전제조건, Folder Trust 우회 한계, 세
   1. **`bin/dispatch.sh`의 자동 헤더에 규약을 직접 인라인**해야 한다(ROLES.md 경로만 던져주는 게 아니라). 예: `WORKER_RULES`에 `"Report format: end with [[DONE <task_id>]] result=<summary> | learning=<one-line|none>"` 한 줄을 추가하면, 어떤 프로젝트로 디스패치하든 감독자가 매번 재기술할 필요 없이 구조적으로 강제된다.
   2. 이게 되기 전까지는, 감독자가 새 프로젝트/새 맥락으로 넘어갈 때마다 "이 프로젝트에도 Post-mortem 규약을 프롬프트에 넣었는가"를 스스로 체크리스트로 확인해야 한다(신뢰할 수 없는 임시방편이지만, 구조적 수정 전까지는 최소한의 안전장치).
   3. 장기적으로는 워커의 최종 보고에 `learning=` 필드가 없으면 `event-emit`/감독자 감사 단계에서 경고를 내는 것도 고려할 만하다(다만 자연어 자유서식 보고를 기계적으로 파싱해야 하므로 난이도가 있음 — 이번엔 제안만 남기고 구현하지 않음).
+
+---
+
+## 17. 워커 비정상 중단 후 state 파일이 running으로 고착되어 디스패치가 거절되는 문제 (exit 75, Stale Lease)
+
+- **메타데이터**:
+  - `root-cause`: `concurrency-control` / `stale-lease`
+  - `verified_with`: 2026-10-01 (운영 실측)
+- **증상**:
+  - `dispatch.sh` 실행 시 다음 에러와 함께 즉시 종료된다:
+    ```text
+    Error: Worker 'agy' is currently busy executing task 'agy-1727...'. Dispatch rejected.
+    ```
+    (종료 코드: exit 75)
+- **원인**:
+  - agy 상주 TUI 또는 워커 프로세스가 예기치 않게 종료되었거나 크래시되었으나, `tasks/<task_id>/state` 파일이 `status=running`으로 방치되고 `workers/<worker>.busy` 파일이 잔류함.
+  - `dispatch.sh`는 이중 디스패치 방지를 위해 `workers/<worker>.busy`에 기록된 활성 태스크의 `state` 파일 내 `status=running` 여부를 검사하므로, 해당 파일이 정리되지 않으면 무기한 디스패치를 거부함.
+- **대응 및 해결 방안**:
+  - 전용 복구 스크립트인 `bin/task-abandon.sh`를 실행한다:
+    ```bash
+    ./bin/task-abandon.sh <task_id>
+    # 또는 워커명 지정 자동 복구:
+    ./bin/task-abandon.sh agy
+    ```
+  - `bin/task-abandon.sh`는 `state` 파일의 상태를 `status=abandoned`로 원자적 치환하고, `workers/<worker>.busy` 파일을 즉각 삭제하여 다음 디스패치가 즉시 가능하도록 회수한다.
+  - 만약 워커 PID가 여전히 생존해 있다면 스크립트가 안전을 위해 수정을 거부하므로, 프로세스 종료를 동반하려면 `--force` 플래그를 붙인다 (`./bin/task-abandon.sh agy --force`).
+
+---
+
+## 18. Claude Code auto-mode 보안 분류기(classifier)에 의한 상태 파일 직접 편집 차단
+
+- **메타데이터**:
+  - `root-cause`: `cli-behavior` / `auto-mode-classifier`
+  - `verified_with`: 2026-10-01 (운영 실측)
+- **증상**:
+  - Claude Code의 auto-mode 환경에서 모델이 `sed`, `awk`, 셸 리다이렉션(`>`) 등을 사용해 `tasks/*/state` 파일을 직접 수정하여 복구하려고 시도하면, Claude Code의 안전 분류기(classifier)에 의해 도구 호출이 사전 차단(block)되고 사용자 승인 프롬프트가 뜨거나 명령이 실패한다.
+- **원인**:
+  - Claude Code auto-mode의 보안 정책이 시스템 내부 상태 파일이나 런타임 제어 파일을 임의로 변조하는 패턴을 고위험 행위로 분류하여 차단하기 때문이다.
+- **대응 및 해결 방안**:
+  - 모델이 셸 커맨드로 `state` 파일을 직접 변조하려고 시도하지 않는다.
+  - 대신 표준 복구 스크립트인 `bin/task-abandon.sh`를 호출하도록 하거나, 보안 분류기가 스크립트 실행까지 의심하는 경우 사용자에게 터미널에서 `!` 접두사(예: `! ./bin/task-abandon.sh <task_id>`)로 직접 실행해 줄 것을 요청한다.
+
+---
+
+## 19. Resident agy 상주 TUI가 사망한 서브에이전트를 무한정 대기하는 현상
+
+- **메타데이터**:
+  - `root-cause`: `cli-behavior` / `resident-subagent`
+  - `verified_with`: 2026-10-01 (운영 실측)
+- **증상**:
+  - `AGY_MODE=resident` 환경에서 agy 메인 라우터가 `invoke_subagent` 도구로 서브에이전트를 기동한 후, 서브에이전트가 예기치 않게 종료되었음에도 메인 TUI가 결과를 수신하지 못하고 무한정 대기(waiting_for_message) 상태에 머문다.
+- **원인**:
+  - Antigravity CLI의 서브에이전트 라이프사이클 관리에서 자식 에이전트의 충돌/사망 이벤트가 상위 TUI 세션의 턴 종료 트리거로 즉각 연결되지 못하는 엣지 케이스가 존재하기 때문이다.
+- **대응 및 해결 방안**:
+  - `watchdog-v2.sh`의 stall/deadline 감시 이벤트가 발생하면, 감독자(Sonnet)는 `bin/task-abandon.sh agy`를 실행해 태스크를 포기 처리한다.
+  - 이후 agy 윈도우에 `/clear` 명령을 전송하여 컨텍스트를 초기화하고 유휴 상태로 재무장(rearm) 지침을 주입한 뒤 작업을 재디스패치한다:
+    ```bash
+    tmux send-keys -t agentchain-v2:agy "/clear" Enter
+    sleep 1
+    tmux send-keys -l -t agentchain-v2:agy "ACC_ROLE: You are the resident router. Do not do file writing or coding directly. Always delegate via invoke_subagent and wait."
+    tmux send-keys -t agentchain-v2:agy Enter
+    ```
+
+---
+
+## 20. 별도 tmux 창에서 백그라운드 데몬 서버 PID 강제 kill 시 세션 전체 종료 사고
+
+- **메타데이터**:
+  - `root-cause`: `operation-mistake` / `process-kill-safety`
+  - `verified_with`: 2026-10-01 (운영 실측)
+- **증상**:
+  - 백그라운드 대시보드 서버(`dashboard/server.py`)나 모니터 데몬 프로세스를 종료하기 위해 `kill <pid>` 또는 `pkill`을 수행했을 때, 해당 tmux 윈도우나 세션 전체가 함께 닫혀버리는 참사가 발생한다.
+- **원인**:
+  - 해당 프로세스가 별도 백그라운드 데몬이 아니라 tmux 윈도우의 루트 셸(창 생성 시 실행된 PID 1격 셸)에서 직접 구동 중이었거나, `pkill -f` 명령이 부모 tmux 프로세스 또는 세션 셸의 매칭 패턴까지 광범위하게 포괄하여 죽였기 때문이다.
+- **대응 및 해결 방안**:
+  - **`pkill -f` 전면 금지**: 패턴 기반의 프로세스 강제 종료를 절대 사용하지 않는다.
+  - 대시보드 종료 시에는 반드시 전용 관리 스크립트(`dashboard/run.sh stop`)를 사용한다.
+  - 프로세스를 수동 종료해야 할 경우 반드시 `ps -ef --forest` 또는 `pgrep -P <pid>`로 프로세스 트리 계보를 확인하고, 윈도우의 리더 셸이 아닌 최하위 리프(leaf) 프로세스 PID만 정확히 지정하여 종료한다.
+  - 만약 윈도우가 닫혔다면, 세션을 전부 재생성하지 말고 `bootstrap-v2.sh`를 실행하여 누락된 윈도우만 안전하게 보완 복구한다.
+
+---
+
+## 21. Codex 쿼터 소진(Quota/Rate Limit Exhaustion) 시 대응 및 agy 폴백
+
+- **메타데이터**:
+  - `root-cause`: `resource-exhaustion` / `codex-quota-fallback`
+  - `verified_with`: 2026-10-01 (운영 실측)
+- **증상**:
+  - `dispatch.sh codex ...` 실행 시 OpenAI API 429 Rate Limit, 사용량 한도 초과(Quota exceeded), 또는 크레딧 소진 에러가 발생하며 태스크가 실패 상태(`status=error`)로 종료된다.
+- **원인**:
+  - 계정의 월간 사용 한도 도달 또는 단시간 대량 토큰 소비로 인한 일시적 API 차단.
+- **대응 및 해결 방안**:
+  - Codex가 쿼터 소진으로 실패한 경우 무리하게 재시도를 반복하지 않는다.
+  - 감독자(Sonnet)는 즉시 워커를 `agy`로 전환(fallback)하여 동일한 프롬프트로 작업을 재디스패치한다:
+    ```bash
+    SESSION_NAME=agentchain-v2 ./bin/dispatch.sh agy --prompt-file /path/to/prompt.md
+    ```
+  - 사용자에게 "Codex 쿼터 소진으로 인해 agy(Gemini 3.8 Flash)로 폴백하여 작업을 진행합니다"라는 사실을 명확히 보고한다.
+
+---
+
+## 22. 실험 중 SESSION_NAME 누락 또는 환경변수 ACC_RUNTIME 상속으로 인한 라이브 운영 세션 오염 사고
+
+- **메타데이터**:
+  - `root-cause`: `isolation-failure` / `live-session-pollution`
+  - `verified_with`: 2026-10-01 (운영 실측)
+- **증상**:
+  - 개발자가 새로운 기능 테스트나 디스패치 실험을 수행하는 도중, 현재 운영 중이던 실서비스 라이브 세션(`agentchain-v2`)의 런타임 디렉토리(`runtime/agentchain-v2-*`) 내에 더미 태스크(`tasks/agy-*`)나 이벤트가 생성되어 라이브 세션의 상태가 꼬이거나 오염된다.
+- **원인**:
+  - 상위 셸 환경에 기존 라이브 세션의 `ACC_RUNTIME`이나 `SESSION_NAME` 환경변수가 export되어 있는 상태에서 새 스크립트를 실행했거나,
+  - `dispatch.sh` 실행 시 `SESSION_NAME`을 명시하지 않아 현재 실행 중인 tmux 세션 환경을 의도치 않게 상속받았기 때문이다.
+- **대응 및 해결 방안**:
+  - 테스트 및 실험을 진행하기 전 반드시 `env | grep -E 'ACC_|SESSION_NAME'`을 실행하여 라이브 세션 환경변수가 잔류해 있는지 확인하고 `unset`한다.
+  - 모든 테스트는 독립된 임시 디렉토리(`mktemp -d`)와 임시 세션명을 주입한 완전 격리 환경(`env -i PATH="$PATH" HOME="$TEST_HOME" ...`)에서 실행한다.
+  - `tests/lib-isolated-env.sh`의 무오염 검증 하네스(라이브 런타임 시그니처 검증 및 고유 마커 검사)를 적극 활용한다.
+

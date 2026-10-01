@@ -1,13 +1,14 @@
 ---
 title: Usage & Operation Guide
 tags: [usage, bootstrap, config, watchdog, tmux-bridge, handoff, operation, usage-manual, dashboard]
-related: ["[[INDEX]]", "[[architecture]]", "[[known-issues]]"]
-summary: 설치부터 v2 Full-Push/Stage 1 상주/대시보드/v1 레거시 실행, config.env 설정, 관찰/개입 명령, 수동 핸드오프, 정리 절차.
+related: ["[[INDEX]]", "[[architecture]]", "[[known-issues]]", "[[session-resume]]"]
+summary: 설치부터 v2 Full-Push/Stage 1 상주/대시보드/v1 레거시 실행, config.env 설정, 관찰/개입 명령, 수동 핸드오프, 세션 재개 런북, 정리 절차.
 ---
 
 # Usage & Operation Guide
 
 `agent-command-chain-template`의 사전 요구사항, 환경 설정, v2/v1 실행법, 관찰 및 제어 명령어, Resident TUI 운용, 대시보드 사용법, 에이전트 간 수동 핸드오프, 그리고 세션 정리 절차를 설명한다.
+신규 세션에서 환경을 재현하고 작업을 이어받는 운영 지침은 [[session-resume]] 런북을 참조한다.
 
 ---
 
@@ -43,13 +44,28 @@ chmod +x bootstrap.sh watchdog.sh bootstrap-v2.sh watchdog-v2.sh bin/*.sh adapte
 | `AGY_WINDOW` | `agy` | 계층 2 agy (Gemini) 윈도우 이름 |
 | `CODEX_WINDOW` | `codex` | 계층 2-내부 Tier 2 Codex Terra 윈도우 이름 |
 | `SONNET_CMD` | `claude --model sonnet --remote-control` | Sonnet 기동 명령. 부트스트랩 시 `--add-dir <템플릿경로>`가 세션 범위로 자동 부가됨 |
-| `AGY_CMD` | `agy --new-project --mode plan` | agy 대화형 기동 명령 (Windows 전용 환경인 경우 `cmd.exe` 우회 주석 참고) |
+| `AGY_CMD` | `agy --new-project --mode plan` | agy 대화형 기동 명령 (v1 레거시 상주용) |
+| `AGY_RESIDENT_CMD` | `agy --dangerously-skip-permissions` | agy 상주 TUI 기동 명령 (Stage 1 상주 모드) |
 | `CODEX_CMD` | `codex --model gpt-5.6-terra -s danger-full-access` | Codex 대화형 TUI 기동 명령 (`codex exec` one-shot 아님) |
+| `CODEX_TIER` | `sol` | Codex 모델 티어 (`resolve-model.sh`를 통해 최신 list 모델 자동 해석) |
+| `CODEX_MODEL` | (미지정) | 명시적 Codex 모델 지정 시 `resolve-model.sh` 자동 해석 우회 |
 | `AUTO_CONFIRM_TRUST` | `true` | 새 디렉토리 첫 진입 시 디렉토리 신뢰("trust this folder?") 대화형 확인 자동 승인 여부 |
 | `LOG_DIR` | `./logs` | 로그 및 자동 생성되는 세션 브리핑(`session_brief.md`) 저장 디렉토리 |
-| `WATCHDOG_INTERVAL` | `30` | v1 워치독(`watchdog.sh`) 프로세스 생존 검사 주기 (초) |
+| `WATCHDOG_INTERVAL` | `60` | 워치독 프로세스 생존 검사 주기 (초) |
+| `START_WATCHDOG` | `true` | `bootstrap-v2.sh` 실행 시 `watchdog-v2.sh` 백그라운드 자동 기동 여부 |
+| `BRIDGE_MODE` | `push` | v2 Full-Push 이벤트 통지 브리지 모드 (push 고정) |
+| `WORKER_MODE` | `oneshot` | 기본 워커 실행 모드 (`oneshot` 또는 `resident`) |
+| `AGY_MODE` | `oneshot` | agy 워커 개별 모드 (미지정 시 `WORKER_MODE` 상속, Stage 1은 `resident` 지원) |
+| `CODEX_MODE` | `oneshot` | codex 워커 개별 모드 (Stage 1은 `oneshot` 고정) |
+| `HANDOFF_FILE` | (비워둠) | 세션 재개 시 자동 참조할 프로젝트 인계 파일 경로 (선택 사항) |
 | `DEFAULT_TASK_TIMEOUT` | `1800` | v2 작업 최대 허용 시간 (초, 30분) |
 | `NO_OUTPUT_WARN_SECONDS` | `900` | v2 워커 출력 무변경 스톨 경고 기준 시간 (초, 15분) |
+| `EVENT_DELIVERY_GRACE` | `120` | pending 이벤트 전달 지연 유예 시간 (초, 2분) |
+| `EVENT_CLAIM_TIMEOUT` | `30` | 이벤트 선점(claiming) 타임아웃 (초, 30초) |
+| `EVENT_ACK_TIMEOUT` | `600` | 이벤트 확인 응답(ack) 타임아웃 (초, 10분) |
+| `EVENT_BATCH_MAX` | `8` | 1회 알림당 최대 이벤트 묶음 수 |
+| `EVENT_TAIL_BYTES` | `1600` | 이벤트 요약 시 로그 꼬리 추출 바이트 수 |
+| `WATCHDOG_AUTO_KILL` | `false` | 마감 초과 시 강제 kill 여부 (기본 false: 모델 판단 위임) |
 
 ---
 
