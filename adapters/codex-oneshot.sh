@@ -12,8 +12,17 @@ fi
 
 project_dir="${PROJECT_DIR:-$PWD}"
 
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -z "${CODEX_MODEL:-}" ]]; then
+  CODEX_MODEL="$("$HERE/bin/resolve-model.sh" "${CODEX_TIER:-sol}")" || {
+    echo "Error: cannot resolve codex model for tier '${CODEX_TIER:-sol}'. Set CODEX_MODEL explicitly." >&2
+    exit 65
+  }
+fi
+echo "[codex-oneshot] model=$CODEX_MODEL tier=${CODEX_TIER:-sol}" >&2
+
 exec codex exec \
-  --model "${CODEX_MODEL:-gpt-5.6-terra}" \
+  --model "$CODEX_MODEL" \
   --skip-git-repo-check \
   -s danger-full-access \
   -C "$project_dir" \
