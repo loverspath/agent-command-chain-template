@@ -8,6 +8,7 @@
 > **실행 경로 안내 (v2 기본 권장 / v1 폴백)**
 > - **기본 권장 경로**: **v2 Full-Push 이벤트 통지 브리지** (`bootstrap-v2.sh`, `watchdog-v2.sh`, `bin/*`, `adapters/*`). FIFO 기반 즉각 깨우기(`asyncRewake`)와 4대 안전망 워치독을 통해 지연 없는 이벤트 통지와 신뢰성을 보장합니다. 상주 관찰이 필요한 경우 Stage 1 resident TUI 모드(`AGY_MODE=resident`)를 지원합니다.
 > - **폴백/레거시 경로**: **v1 기본 브리지** (`bootstrap.sh`, `watchdog.sh`). 순수 tmux 화면 캡처(pull) 방식으로 동작하며, v2 환경 구성이 어렵거나 최소 세션 테스트 시의 폴백으로 완전 보존됩니다. (v1 파일은 절대 삭제되지 않음)
+> - **세션 재개 런북**: 신규 Claude 세션에서 환경을 재현하거나 중단된 작업을 이어받을 때는 [`.llmwiki/session-resume.md`](.llmwiki/session-resume.md)를 참조하세요.
 
 ## 1. 역할 구조 (4계층)
 

@@ -1,13 +1,14 @@
 ---
 title: Architecture
 tags: [architecture, roles, tmux-bridge, 4-tier-command, full-push, fifo, outbox, watchdog, resident-tui, isolation, dashboard]
-related: ["[[INDEX]]", "[[usage]]", "[[known-issues]]"]
+related: ["[[INDEX]]", "[[usage]]", "[[known-issues]]", "[[session-resume]]"]
 summary: Sonnet/agy/Codex Terra/Sol-Opus 4계층 명령계통과 v2 Full-Push(FIFO+Outbox) 브리지, Stage 1 Resident TUI, 읽기 전용 대시보드, v1 tmux 브리지 및 폴백 설계.
 ---
 
 # Architecture
 
 `agent-command-chain-template`의 4계층 역할 구조, Full-Push v2 브리지 아키텍처, Stage 1 Resident TUI 모드, 읽기 전용 상태 대시보드, 그리고 v1 폴백 브리지 설계를 설명한다.
+신규 세션에서 환경을 재현하거나 중단된 작업을 이어받는 운영 절차는 [[session-resume]]를 참조한다.
 
 ---
 

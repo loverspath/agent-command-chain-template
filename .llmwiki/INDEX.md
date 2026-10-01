@@ -1,8 +1,8 @@
 ---
 title: agent-command-chain-template Wiki Index
 tags: [index, moc, tmux-bridge, multi-agent-orchestration]
-related: ["[[architecture]]", "[[usage]]", "[[known-issues]]"]
-summary: Sonnet/agy/Codex 4계층 명령계통 및 v2 Full-Push/Stage 1 상주/대시보드/v1 tmux 브리지 내부 위키 색인.
+related: ["[[architecture]]", "[[usage]]", "[[known-issues]]", "[[session-resume]]"]
+summary: Sonnet/agy/Codex 4계층 명령계통 및 v2 Full-Push/Stage 1 상주/대시보드/v1 tmux 브리지/세션 재개 런북 내부 위키 색인.
 ---
 
 # agent-command-chain-template
@@ -12,6 +12,7 @@ Claude Sonnet(감독/RC) · agy(Gemini 3.8 Flash, 라우터+워커) · Codex Ter
 어느 디렉토리에서든 스크립트를 호출하면 해당 작업 디렉토리를 대상으로 삼아 즉시 멀티 에이전트 협업 환경을 구축한다.
 
 세션을 처음 시작한다면: [[architecture]] → [[usage]] 순서로 읽으면 충분하다.
+신규 Claude CLI 세션에서 환경을 재현하거나 중단된 작업을 재개한다면: [[session-resume]] 런북을 따르라.
 작업 중 막히거나 경고가 발생하면 바로 [[known-issues]]를 확인하라 — 이미 실측하고 해결책/우회책을 정리해 두었다.
 
 ## Architecture
@@ -21,6 +22,10 @@ Claude Sonnet(감독/RC) · agy(Gemini 3.8 Flash, 라우터+워커) · Codex Ter
 ## Usage
 
 - [[usage]] — 사전 요구사항, 템플릿 설정(config.env), bootstrap-v2.sh/bootstrap.sh 실행법, 디스패치 및 관찰/개입 명령, Resident TUI 및 대시보드 운용, agy-Codex 수동 핸드오프, 세션 정리
+
+## Session Resume & Operations
+
+- [[session-resume]] — 신규 Claude 세션 환경 재현, 세션 분기 시나리오, 검증 체크리스트, stale lease 복구(`task-abandon.sh`), 프로젝트 핸드오프 절차, 감독관 행동 규범
 
 ## Known Issues
 
@@ -52,8 +57,12 @@ Claude Sonnet(감독/RC) · agy(Gemini 3.8 Flash, 라우터+워커) · Codex Ter
 - `#remote-control` — [[known-issues]]
 - `#resident-tui` — [[architecture]], [[usage]]
 - `#roles` — [[architecture]]
+- `#runbook` — [[session-resume]]
 - `#session-resolution` — [[architecture]], [[known-issues]]
+- `#session-resume` — [[session-resume]]
 - `#sonnet-overreach` — [[known-issues]]
+- `#stale-lease` — [[session-resume]], [[known-issues]]
+- `#supervisor-norms` — [[session-resume]]
 - `#unrequested-scope` — [[known-issues]]
 - `#self-reflection-not-automatic` — [[known-issues]]
 - `#test-harness-isolation` — [[architecture]], [[known-issues]]
