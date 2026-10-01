@@ -75,6 +75,8 @@ run_suite "bootstrap-resident-test.sh"
 run_suite "harness-self-test.sh"
 run_suite "codex-fail-closed-test.sh"
 run_suite "dashboard-test.sh"
+run_suite "test_resolve_model.sh"
+run_suite "test_task_abandon.sh"
 
 end_time=$(date +%s)
 elapsed=$((end_time - start_time))

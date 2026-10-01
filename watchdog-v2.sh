@@ -519,7 +519,7 @@ check_running_tasks() {
           local warn_detail="$task_dir/output.log"
           [[ -f "$warn_detail" ]] || warn_detail="$task_dir/prompt.md"
           if "$HERE/bin/event-emit.sh" watchdog stalled "$task_id" \
-            "Task exceeded deadline ($DEFAULT_TASK_TIMEOUT s) but remains running" "$warn_detail" "${task_id}-deadline-warn"; then
+            "Task exceeded deadline ($DEFAULT_TASK_TIMEOUT s) but remains running. Recovery: bin/task-abandon.sh $task_id then re-dispatch" "$warn_detail" "${task_id}-deadline-warn"; then
             touch "$task_dir/deadline.notified"
           fi
         fi

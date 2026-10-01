@@ -37,6 +37,7 @@ _ENV_AGY_MODE="${AGY_MODE:-}"
 _ENV_CODEX_MODE="${CODEX_MODE:-}"
 _ENV_BRIDGE_MODE="${BRIDGE_MODE:-}"
 _ENV_AGY_RESIDENT_CMD="${AGY_RESIDENT_CMD:-}"
+_ENV_HANDOFF_FILE="${HANDOFF_FILE:-}"
 
 cd "$HERE"
 
@@ -66,6 +67,8 @@ fi
 [[ -n "$_ENV_CODEX_MODE" ]] && CODEX_MODE="$_ENV_CODEX_MODE"
 [[ -n "$_ENV_BRIDGE_MODE" ]] && BRIDGE_MODE="$_ENV_BRIDGE_MODE"
 [[ -n "$_ENV_AGY_RESIDENT_CMD" ]] && AGY_RESIDENT_CMD="$_ENV_AGY_RESIDENT_CMD"
+[[ -n "$_ENV_HANDOFF_FILE" ]] && HANDOFF_FILE="$_ENV_HANDOFF_FILE"
+HANDOFF_FILE="${HANDOFF_FILE:-}"
 
 # 지원 모드 검증 (v2는 push 기반, worker는 oneshot(기본) 또는 resident)
 WORKER_MODE="${WORKER_MODE:-oneshot}"
@@ -199,6 +202,15 @@ SESSION_NAME=$SESSION_NAME $HERE/bin/dispatch.sh codex --prompt-file /path/to/pr
 \`\`\`
 - 이 알림을 받으면 내용을 검토한 뒤 안내된 ack 명령을 실행하여 이벤트를 아카이빙하라.
 EOF
+
+if [[ -n "${HANDOFF_FILE:-}" ]]; then
+  cat >> "$BRIEF_FILE" <<EOF
+
+## 작업 재개 지침 (Handoff)
+- 지정된 인계 파일: \`$HANDOFF_FILE\`
+- 작업을 재개하기 전 반드시 위 인계 파일을 먼저 읽고 현재 상태를 사용자에게 간략히 보고하라 (사용자의 명시적 작업 지시/승인이 있을 때까지 dispatch 등 독자 작업을 수행하지 마라).
+EOF
+fi
 
 SONNET_LAUNCH="export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 ACC_RUNTIME=\"$ACC_RUNTIME\" ACC_TEMPLATE_ROOT=\"$HERE\"; $SONNET_CMD --settings \"$BRIDGE_SETTINGS\" --add-dir \"$HERE\" --append-system-prompt \"\$(cat '$BRIEF_FILE')\""
 
