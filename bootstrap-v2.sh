@@ -212,7 +212,12 @@ if [[ -n "${HANDOFF_FILE:-}" ]]; then
 EOF
 fi
 
-SONNET_LAUNCH="export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 ACC_RUNTIME=\"$ACC_RUNTIME\" ACC_TEMPLATE_ROOT=\"$HERE\"; $SONNET_CMD --settings \"$BRIDGE_SETTINGS\" --add-dir \"$HERE\" --append-system-prompt \"\$(cat '$BRIEF_FILE')\""
+# logs/session_brief.md 는 모든 bootstrap(테스트 포함)이 덮어쓰는 공용 파일이므로,
+# 기동에는 런타임 전용 사본을 쓴다 (테스트 bootstrap 이 라이브 브리핑을 오염시키던 문제).
+cp "$BRIEF_FILE" "$ACC_RUNTIME/session_brief.md"
+BRIEF_FILE="$ACC_RUNTIME/session_brief.md"
+
+SONNET_LAUNCH="export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 ACC_RUNTIME=\"$ACC_RUNTIME\" ACC_TEMPLATE_ROOT=\"$HERE\" SESSION_NAME=\"$SESSION_NAME\"; $SONNET_CMD --settings \"$BRIDGE_SETTINGS\" --add-dir \"$HERE\" --append-system-prompt \"\$(cat '$BRIEF_FILE')\""
 
 has_window() {
   local win="$1"

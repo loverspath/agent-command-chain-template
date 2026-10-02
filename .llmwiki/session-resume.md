@@ -41,7 +41,7 @@ Antigravity CLI가 작업 완료 시 자동으로 Full-Push 브리지에 통지�
 ```bash
 cat ~/.gemini/config/hooks.json
 ```
-다음과 같은 `"agent-command-chain-bridge"` 블록이 등록되어 있어야 한다:
+아래와 같이 **`command` 경로가 `bin/agy-stop-hook.sh` 인 Stop 훅**이 등록되어 있어야 한다. 최상위 키 이름은 동작과 무관하다(이 머신의 실제 키는 `acc-resident-bridge`). 점검은 키 이름이 아니라 command 경로로 한다 (`bin/session-init.sh --check` 가 자동 판정):
 ```json
 {
   "agent-command-chain-bridge": {
@@ -150,6 +150,15 @@ cd /path/to/target/project
 ```
 스크립트가 `sonnet`, `agy`, `codex` 윈도우를 생성하고, 런타임 환경(`runtime/`), FIFO 파이프, `watchdog-v2.sh`를 자동으로 구성한다.
 
+### 권장: `bin/session-init.sh` 로 점검/교체
+```bash
+./bin/session-init.sh                 # 읽기 전용 점검 + 한국어 보고 (기본)
+./bin/session-init.sh --apply         # 브리지 감독관이 없을 때 새로 기동 + 검증
+./bin/session-init.sh --apply --retire-old-supervisor   # 옛 감독관 /exit → 새 감독관 기동 + 검증
+```
+- 같은 런타임에 브리지 감독관은 **항상 1명**이어야 한다. `sonnet-event-wait.sh` 는 `listener.lock` 을 `flock -n` 으로 잡으므로, 옛 감독관의 대기자가 살아 있으면 새 감독관의 대기자는 즉시 조용히 종료되어 **알림을 영영 못 받는다**.
+- 아래 (c)의 수동 절차는 비상용이다. 수동으로 띄울 때도 옛 감독관을 먼저 종료하라.
+
 ### 시나리오 (c): 일반 Claude CLI 세션 내부에서 시작된 경우 (브리지 플래그 누락)
 tmux 창 밖의 일반 셸 터미널에서 `claude`를 실행했거나, 브리지 플래그 없이 시작된 Claude 세션인 경우이다.
 
@@ -166,12 +175,13 @@ tmux 창 밖의 일반 셸 터미널에서 `claude`를 실행했거나, 브리�
      현재 세션을 종료하고 올바른 브리지 플래그를 부가하여 Claude를 기동한다:
      ```bash
      TEMPLATE_DIR="/home/rerun/agent-command-chain-template"
-     RUNTIME_DIR="$(ls -td $TEMPLATE_DIR/runtime/agentchain-v2-* | head -n 1)"
+     RUNTIME_DIR="$(tmux show-environment -t agentchain-v2 ACC_RUNTIME | sed -n 's/^ACC_RUNTIME=//p')"   # ls -td 는 테스트 런타임을 집을 수 있음
      BRIEF_FILE="$TEMPLATE_DIR/logs/session_brief.md"
 
      export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1
      export ACC_RUNTIME="$RUNTIME_DIR"
      export ACC_TEMPLATE_ROOT="$TEMPLATE_DIR"
+     export SESSION_NAME=agentchain-v2
 
      claude --model sonnet --remote-control \
        --settings "$RUNTIME_DIR/claude-bridge.settings.json" \

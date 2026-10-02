@@ -126,6 +126,12 @@ check_session_and_sonnet() {
     return
   fi
 
+  # session-init.sh 가 감독관 교체 중이면(표식 5분 이내) Sonnet 자동 재기동을 건너뛴다
+  local rot="$ACC_RUNTIME/supervisor.rotating"
+  if [[ -f "$rot" ]] && (( $(date +%s) - $(stat -c %Y "$rot" 2>/dev/null || echo 0) < 300 )); then
+    return
+  fi
+
   local cur
   cur="$(tmux display-message -p -t "${SESSION_NAME}:${SONNET_WINDOW}" '#{pane_current_command}' 2>/dev/null || echo "MISSING")"
   case "$cur" in
@@ -134,14 +140,14 @@ check_session_and_sonnet() {
       tmux new-window -t "$SESSION_NAME" -n "$SONNET_WINDOW" -c "$PROJECT_DIR"
       local bridge_settings="$ACC_RUNTIME/claude-bridge.settings.json"
       local brief_file="$LOG_DIR/session_brief.md"
-      local sonnet_launch="export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 ACC_RUNTIME=\"$ACC_RUNTIME\"; $SONNET_CMD --settings \"$bridge_settings\" --add-dir \"$HERE\" --append-system-prompt \"\$(cat '$brief_file' 2>/dev/null || echo '')\""
+      local sonnet_launch="export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 ACC_RUNTIME=\"$ACC_RUNTIME\" ACC_TEMPLATE_ROOT=\"$HERE\" SESSION_NAME=\"$SESSION_NAME\"; $SONNET_CMD --settings \"$bridge_settings\" --add-dir \"$HERE\" --append-system-prompt \"\$(cat '$brief_file' 2>/dev/null || echo '')\""
       tmux send-keys -t "${SESSION_NAME}:${SONNET_WINDOW}" "$sonnet_launch" C-m
       ;;
     bash|zsh|sh|-bash|-zsh|-sh)
       log "Sonnet 프로세스 종료 감지(현재: $cur) — 재기동"
       local bridge_settings="$ACC_RUNTIME/claude-bridge.settings.json"
       local brief_file="$LOG_DIR/session_brief.md"
-      local sonnet_launch="export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 ACC_RUNTIME=\"$ACC_RUNTIME\"; $SONNET_CMD --settings \"$bridge_settings\" --add-dir \"$HERE\" --append-system-prompt \"\$(cat '$brief_file' 2>/dev/null || echo '')\""
+      local sonnet_launch="export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 ACC_RUNTIME=\"$ACC_RUNTIME\" ACC_TEMPLATE_ROOT=\"$HERE\" SESSION_NAME=\"$SESSION_NAME\"; $SONNET_CMD --settings \"$bridge_settings\" --add-dir \"$HERE\" --append-system-prompt \"\$(cat '$brief_file' 2>/dev/null || echo '')\""
       tmux send-keys -t "${SESSION_NAME}:${SONNET_WINDOW}" "$sonnet_launch" C-m
       ;;
     *)
