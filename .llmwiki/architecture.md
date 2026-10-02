@@ -75,7 +75,11 @@ v2는 메시지 유실 없는 신뢰성을 달성하기 위해 **파일 기반 D
   - `runtime/events/archive/`: 처리가 완료(`event-ack.sh`)되어 보관된 이벤트
   - `runtime/tasks/<task_id>/`: 작업 명세(`spec.json`), 상태(`state.json`), 실행 로그(`output.log`)
   - `runtime/workers/`: 워커별 상태 및 터미널 락
+  - `runtime/workers/agy.transcript`: 상주 워커 활성 transcript 경로 (Stall 감지 범위 한정)
   - `runtime/event.fifo`: Claude Code `asyncRewake` 전용 비동기 시그널 FIFO
+  - `runtime/watchdog.log`: 체인별 워치독 전용 로그 (세션명 접두)
+  - `runtime/session_brief.md` / `supervisor_brief.md`: 체인별 감독관 브리핑 정본
+  - `runtime/retired`: 체인 은퇴 표식 파일 (워치독 클린 종료 유도)
 - **원자적 커밋 (Atomic Commit)**: 모든 상태 변경과 이벤트 스풀링은 `.tmp` 임시 파일을 먼저 작성한 후 원자적 `mv`를 통해 수행되므로, 읽는 측에서 부분 기록(torn write)을 읽는 일이 원천 차단됩니다.
 - **데드락 방지 FIFO 펄스**: `bin/event-emit.sh`는 이벤트를 디스크에 안전하게 쓴 후 FIFO에 1바이트 펄스를 보낼 때 `timeout 0.2` 비동기 쓰기를 사용하여 리스너 부재로 인한 송신자 영구 블로킹을 방지합니다.
 
@@ -104,7 +108,7 @@ v2는 메시지 유실 없는 신뢰성을 달성하기 위해 **파일 기반 D
 3. **`flock --close` 자가 래퍼**:
    - 셸 스크립트에서 fork된 자식 프로세스가 부모의 FD를 상속받아 락을 의도치 않게 계속 쥐고 있는 버그를 방지하기 위해, `exec flock -n -E 0 --close ...` 자가 래퍼 패턴을 적용하여 자식 프로세스 포크 시 락 FD가 상속되지 않도록 원천 차단했습니다.
 
-### 2.5 watchdog-v2.sh의 4대 안전망
+### 2.5 watchdog-v2.sh의 4대 안전망 및 런타임 범위화 규약
 
 `watchdog-v2.sh`는 60초 주기로 백그라운드에서 동작하며, 분산 에이전트 시스템에서 발생 가능한 4대 비정상 상태를 전담 감시하고 복구합니다:
 
@@ -118,15 +122,25 @@ tmux 세션 부재 시    running인데 PID 소멸  DEFAULT_TASK_TIMEOUT ACK 타
 bootstrap-v2 재실행   원자적 fail+이벤트   초과 경고/알림 발행  초과 이벤트 pending 복구
 ```
 
-1. **세션 / Sonnet 증발 감시**:
-   - tmux 세션 자체가 파괴되었거나 Sonnet 프로세스가 종료된 경우, `bootstrap-v2.sh`를 자동 호출하여 환경을 복구합니다.
+#### 다중 인스턴스 런타임 범위화 규약 (S2)
+
+1. **세션 / Sonnet 증발 감시 및 재기동 환경 격리**:
+   - tmux 세션 부재 시 `bootstrap-v2.sh`를 자동 호출하며, Sonnet 창 부재 또는 셸 프롬프트 감지 시 감독관을 자동 재기동합니다.
+   - **브리핑 파일 우선순위**: `$ACC_RUNTIME/session_brief.md` 우선 → 없으면 `$ACC_RUNTIME/supervisor_brief.md` → 둘 다 없을 때만 공용 `$LOG_DIR/session_brief.md`로 폴백(경고 로그 1회 출력).
+   - **환경변수 및 cwd 주입**: 재기동 커맨드에 `PROJECT_DIR`, `WORK_DIR`, `ACC_RUNTIME`, `ACC_TEMPLATE_ROOT`, `SESSION_NAME`을 명시 주입하며, 실행 디렉토리(cwd)는 `WORK_DIR`(설정되어 있으면), 없으면 `PROJECT_DIR`로 전환합니다.
 2. **PID 증발 비정상 작업 원자적 수거 (Reap)**:
    - 작업 상태가 `running`인데 기록된 워커 PID가 프로세스 테이블에 존재하지 않는 경우(crash, OOM 등), 상태 변수(`state_committed`)를 안전하게 초기화하고 작업을 `error`로 전이시키며 `task.error` 이벤트를 발행합니다. 작업이 확실히 커밋된 경우에만 워커의 `busy` 상태를 해제하여 데이터 일관성을 보장합니다.
-3. **Deadline 및 Stall 초과 감시**:
+3. **Deadline 및 Stall 초과 감시의 런타임 범위화**:
    - **Deadline**: 작업 실행 시간이 `DEFAULT_TASK_TIMEOUT`(기본 1800초/30분)을 초과하면 `task.deadline_exceeded` 이벤트를 발행하고 `deadline.notified` 플래그를 원자적으로 생성하여 중복 알림을 방지합니다.
-   - **Stall**: 워커 출력 로그(`output.log`)가 `NO_OUTPUT_WARN_SECONDS`(기본 900초/15분) 동안 1바이트도 갱신되지 않으면 무응답 스톨 경고를 기록합니다.
-4. **브리지 정체 해소 (ACK Timeout Recovery)**:
-   - `inflight` 상태로 전환된 이벤트가 `EVENT_ACK_TIMEOUT`(기본 600초/10분) 동안 Sonnet에 의해 ACK 처리되지 않으면, 상위 세션 일시 지연으로 판단하고 이벤트를 다시 `pending`으로 롤백 인계하여 영구 분실을 방지합니다.
+   - **Stall (상주 워커)**: `$ACC_RUNTIME/workers/agy.transcript`가 존재하면 해당 파일의 mtime만 검사하여 체인 간 간섭을 원천 차단합니다. 파일 부재 시 머신 전체 최신 transcript로 폴백하되 1회만 경고하며, stalled 이벤트의 detail 필드에는 타 체인의 transcript 경로가 노출되지 않도록 로컬 파일(`output.log`/`prompt.md`)을 유지합니다.
+4. **브리지 정체 해소 및 비상 Paste Buffer 격리**:
+   - `inflight` 상태로 전환된 이벤트가 `EVENT_ACK_TIMEOUT`(기본 600초/10분) 동안 Sonnet에 의해 ACK 처리되지 않으면 `pending`으로 롤백합니다.
+   - 브리지 리스너 장기 비활성 시 비상 폴백 발동: 기본 tmux 버퍼 대신 세션별 고유 이름 있는 버퍼 `acc-<SESSION_NAME>`을 사용(`set-buffer -b`, `paste-buffer -d -b`)하며 붙여넣기 직후 버퍼를 즉시 삭제(-d)하여 버퍼 경합과 클립보드 오염을 방지합니다.
+5. **은퇴 표식 (Retirement Marker)**:
+   - 각 순회 루프 맨 앞에서 `$ACC_RUNTIME/retired` 파일 존재 여부를 확인합니다.
+   - 파일이 존재하면 클린 로그 한 줄을 남기고 즉시 정상 종료(`exit 0`, `watchdog.pid` 삭제 정리)하며, 세션이 종료되어 있어도 재-bootstrap이나 윈도우 재생성을 일절 호출하지 않습니다.
+6. **체인별 독립 로그 (`$ACC_RUNTIME/watchdog.log`)**:
+   - 워치독 로그는 각 인스턴스의 `$ACC_RUNTIME/watchdog.log`에 기록되며, 모든 로그 라인에 `[<SESSION_NAME>]` 접두사가 포함됩니다 (`$ACC_RUNTIME` 유효하지 않을 때만 공용 `$LOG_DIR/watchdog.log` 폴백).
 
 ### 2.6 Sentinel 통신 프로토콜 및 2층 감사 체계
 

@@ -113,7 +113,7 @@ tmux attach -t agentchain-v2
 2. 각 CLI의 "이 폴더를 신뢰하는가?" 대화형 다이얼로그를 화면 텍스트 폴링으로 확인 후 자동 승인 (`AUTO_CONFIRM_TRUST=true`).
 3. 이번 실행의 실제 값(세션명, 창 이름, 프로젝트 경로)을 반영한 `logs/session_brief.md` 동적 생성.
 4. Sonnet UI의 준비 상태를 감지한 뒤, 브리핑 파일을 열람하라는 오리엔테이션 메시지를 Sonnet 채팅창에 자동 전송.
-5. (v2의 경우) `runtime/` 레이아웃 및 `event.fifo`를 초기화하고 `watchdog-v2.sh` 데몬을 백그라운드로 자동 기동.
+5. (v2의 경우) `runtime/` 레이아웃 및 `event.fifo`를 초기화하고 `watchdog-v2.sh` 데몬을 백그라운드로 자동 기동. 로그는 `$ACC_RUNTIME/watchdog.log`에 격리 기록된다 (상세 규약은 [[architecture#다중-인스턴스-런타임-범위화-규약-s2]] 참고).
 
 ---
 
@@ -268,7 +268,7 @@ tmux send-keys -t agentchain:codex "Specification 문서를 확인하고 테스�
 ```bash
 ~/agent-command-chain-template/watchdog.sh &
 ```
-- 세션 또는 창 프로세스가 종료되면 단순 재시작한다. 로그는 `logs/watchdog.log`에 기록된다.
+- 세션 또는 창 프로세스가 종료되면 단순 재시작한다. 로그는 `logs/watchdog.log`에 기록된다. (v2의 경우 워치독 로그 정본은 `$ACC_RUNTIME/watchdog.log`에 기록되며 세션명이 접두됨)
 
 ---
 

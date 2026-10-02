@@ -78,6 +78,7 @@ run_suite "dashboard-test.sh"
 run_suite "test_resolve_model.sh"
 run_suite "test_task_abandon.sh"
 run_suite "test-config-layering.sh"
+run_suite "test-watchdog-runtime.sh"
 
 end_time=$(date +%s)
 elapsed=$((end_time - start_time))

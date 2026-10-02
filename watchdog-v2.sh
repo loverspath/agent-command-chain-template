@@ -7,12 +7,15 @@ INVOKED_DIR="$PWD"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 _ENV_PROJECT_DIR="${PROJECT_DIR:-}"
+_ENV_WORK_DIR="${WORK_DIR:-}"
 _ENV_ACC_RUNTIME="${ACC_RUNTIME:-}"
 _ENV_SESSION_NAME="${SESSION_NAME:-}"
 _ENV_WATCHDOG_AUTO_KILL="${WATCHDOG_AUTO_KILL:-}"
 _ENV_WORKER_MODE="${WORKER_MODE:-}"
 _ENV_AGY_MODE="${AGY_MODE:-}"
 _ENV_CODEX_MODE="${CODEX_MODE:-}"
+_ENV_SONNET_CMD="${SONNET_CMD:-}"
+_ENV_LOG_DIR="${LOG_DIR:-}"
 
 cd "$HERE"
 
@@ -25,6 +28,7 @@ CONFIG_SESSION_NAME="${SESSION_NAME:-agentchain}"
 source "$HERE/lib/session.sh"
 
 [[ -n "$_ENV_PROJECT_DIR" ]] && PROJECT_DIR="$_ENV_PROJECT_DIR"
+[[ -n "$_ENV_WORK_DIR" ]] && WORK_DIR="$_ENV_WORK_DIR"
 [[ -n "$_ENV_ACC_RUNTIME" ]] && ACC_RUNTIME="$_ENV_ACC_RUNTIME"
 [[ -n "$_ENV_SESSION_NAME" ]] && SESSION_NAME="$_ENV_SESSION_NAME"
 [[ -n "$_ENV_WATCHDOG_AUTO_KILL" ]] && WATCHDOG_AUTO_KILL="$_ENV_WATCHDOG_AUTO_KILL"
@@ -32,6 +36,8 @@ WATCHDOG_AUTO_KILL="${WATCHDOG_AUTO_KILL:-false}"
 [[ -n "$_ENV_WORKER_MODE" ]] && WORKER_MODE="$_ENV_WORKER_MODE"
 [[ -n "$_ENV_AGY_MODE" ]] && AGY_MODE="$_ENV_AGY_MODE"
 [[ -n "$_ENV_CODEX_MODE" ]] && CODEX_MODE="$_ENV_CODEX_MODE"
+[[ -n "$_ENV_SONNET_CMD" ]] && SONNET_CMD="$_ENV_SONNET_CMD"
+[[ -n "$_ENV_LOG_DIR" ]] && LOG_DIR="$_ENV_LOG_DIR"
 
 WORKER_MODE="${WORKER_MODE:-oneshot}"
 AGY_MODE="${AGY_MODE:-$WORKER_MODE}"
@@ -56,11 +62,15 @@ if [[ ! -d "$PROJECT_DIR" ]]; then
   exit 1
 fi
 PROJECT_DIR="$(cd "$PROJECT_DIR" && pwd)"
+WORK_DIR="${WORK_DIR:-$PROJECT_DIR}"
+if [[ -d "$WORK_DIR" ]]; then
+  WORK_DIR="$(cd "$WORK_DIR" && pwd)"
+fi
+SUPERVISOR_CWD="$WORK_DIR"
 
 LOG_DIR="${LOG_DIR:-./logs}"
 [[ "$LOG_DIR" = /* ]] || LOG_DIR="$HERE/$LOG_DIR"
 mkdir -p "$LOG_DIR"
-LOG_FILE="$LOG_DIR/watchdog.log"
 
 ENV_SESSION_NAME="$_ENV_SESSION_NAME"
 ENV_ACC_RUNTIME="$_ENV_ACC_RUNTIME"
@@ -68,13 +78,30 @@ if [[ -z "${_ENV_ACC_RUNTIME:-}" || ! -d "$_ENV_ACC_RUNTIME" ]]; then
   echo "Error: watchdog-v2 requires explicit ACC_RUNTIME directory." >&2
   exit 1
 fi
+
+# 은퇴 표식($ACC_RUNTIME/retired) 사전 검사: 은퇴된 런타임이면 세션 검증/락/재기동 없이 즉시 클린 종료
+if [[ -f "$_ENV_ACC_RUNTIME/retired" ]]; then
+  ACC_RUNTIME="$_ENV_ACC_RUNTIME"
+  LOG_FILE="$ACC_RUNTIME/watchdog.log"
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] [${SESSION_NAME:-${_ENV_SESSION_NAME:-unknown}}] 은퇴 표식($ACC_RUNTIME/retired) 감지 — 워치독 정상 종료" | tee -a "$LOG_FILE"
+  rm -f "$ACC_RUNTIME/watchdog.pid"
+  exit 0
+fi
+
 resolve_session_and_runtime "watchdog-v2" "" false
 ACC_RUNTIME="$_ENV_ACC_RUNTIME"
 
 mkdir -p "$ACC_RUNTIME/events"/{pending,inflight,archive} "$ACC_RUNTIME/tasks" "$ACC_RUNTIME/workers"
 
+# watchdog.log 위치: $ACC_RUNTIME 우선, 유효하지 않을 때만 $LOG_DIR/watchdog.log 로 폴백
+if [[ -n "${ACC_RUNTIME:-}" && -d "$ACC_RUNTIME" ]]; then
+  LOG_FILE="$ACC_RUNTIME/watchdog.log"
+else
+  LOG_FILE="$LOG_DIR/watchdog.log"
+fi
+
 # 워치독 단일 인스턴스 락 (자식 프로세스 상속 방지를 위해 flock --close 래퍼 및 내부 전용 인자 사용)
-export PROJECT_DIR ACC_RUNTIME SESSION_NAME
+export PROJECT_DIR ACC_RUNTIME SESSION_NAME WORK_DIR
 if [[ "${1:-}" != "--lock-held" ]]; then
   target_self="$HERE/${BASH_SOURCE[0]##*/}"
   [[ -f "$target_self" ]] || target_self="$0"
@@ -107,17 +134,41 @@ case "$CODEX_MODE" in
     ;;
 esac
 
+_BRIEF_FALLBACK_WARNED=false
+_STALL_TRANSCRIPT_FALLBACK_WARNED=false
 
 log() {
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] [${SESSION_NAME:-unknown}] $*" | tee -a "$LOG_FILE"
 }
 
 log "워치독 v2 시작 (세션=$SESSION_NAME, 주기=${WATCHDOG_INTERVAL}s, 런타임=$ACC_RUNTIME)"
 
+check_retired() {
+  if [[ -f "$ACC_RUNTIME/retired" ]]; then
+    log "은퇴 표식($ACC_RUNTIME/retired) 감지 — 워치독 정상 종료"
+    rm -f "$ACC_RUNTIME/watchdog.pid"
+    exit 0
+  fi
+}
+
+resolve_briefing_file() {
+  if [[ -f "$ACC_RUNTIME/session_brief.md" ]]; then
+    echo "$ACC_RUNTIME/session_brief.md"
+  elif [[ -f "$ACC_RUNTIME/supervisor_brief.md" ]]; then
+    echo "$ACC_RUNTIME/supervisor_brief.md"
+  else
+    if [[ "$_BRIEF_FALLBACK_WARNED" != "true" ]]; then
+      log "경고: 런타임 브리핑 부재 ($ACC_RUNTIME/{session_brief,supervisor_brief}.md) — 공용 $LOG_DIR/session_brief.md 로 폴백" >&2
+      _BRIEF_FALLBACK_WARNED=true
+    fi
+    echo "$LOG_DIR/session_brief.md"
+  fi
+}
+
 check_session_and_sonnet() {
   if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
     log "세션 '$SESSION_NAME' 부재 — bootstrap-v2.sh 재실행"
-    PROJECT_DIR="$PROJECT_DIR" SESSION_NAME="$SESSION_NAME" ACC_RUNTIME="$ACC_RUNTIME" "$HERE/bootstrap-v2.sh" >> "$LOG_FILE" 2>&1 || true
+    PROJECT_DIR="$PROJECT_DIR" WORK_DIR="$WORK_DIR" SESSION_NAME="$SESSION_NAME" ACC_RUNTIME="$ACC_RUNTIME" "$HERE/bootstrap-v2.sh" >> "$LOG_FILE" 2>&1 || true
     return
   fi
 
@@ -132,17 +183,19 @@ check_session_and_sonnet() {
   case "$cur" in
     MISSING)
       log "Sonnet 윈도우 부재 — 재생성"
-      tmux new-window -t "$SESSION_NAME" -n "$SONNET_WINDOW" -c "$PROJECT_DIR"
+      tmux new-window -t "$SESSION_NAME" -n "$SONNET_WINDOW" -c "$SUPERVISOR_CWD"
       local bridge_settings="$ACC_RUNTIME/claude-bridge.settings.json"
-      local brief_file="$LOG_DIR/session_brief.md"
-      local sonnet_launch="export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 ACC_RUNTIME=\"$ACC_RUNTIME\" ACC_TEMPLATE_ROOT=\"$HERE\" SESSION_NAME=\"$SESSION_NAME\"; $SONNET_CMD --settings \"$bridge_settings\" --add-dir \"$HERE\" --append-system-prompt \"\$(cat '$brief_file' 2>/dev/null || echo '')\""
+      local brief_file
+      brief_file="$(resolve_briefing_file)"
+      local sonnet_launch="cd \"$SUPERVISOR_CWD\" && export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 PROJECT_DIR=\"$PROJECT_DIR\" WORK_DIR=\"$WORK_DIR\" ACC_RUNTIME=\"$ACC_RUNTIME\" ACC_TEMPLATE_ROOT=\"$HERE\" SESSION_NAME=\"$SESSION_NAME\"; $SONNET_CMD --settings \"$bridge_settings\" --add-dir \"$HERE\" --append-system-prompt \"\$(cat '$brief_file' 2>/dev/null || echo '')\""
       tmux send-keys -t "${SESSION_NAME}:${SONNET_WINDOW}" "$sonnet_launch" C-m
       ;;
     bash|zsh|sh|-bash|-zsh|-sh)
       log "Sonnet 프로세스 종료 감지(현재: $cur) — 재기동"
       local bridge_settings="$ACC_RUNTIME/claude-bridge.settings.json"
-      local brief_file="$LOG_DIR/session_brief.md"
-      local sonnet_launch="export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 ACC_RUNTIME=\"$ACC_RUNTIME\" ACC_TEMPLATE_ROOT=\"$HERE\" SESSION_NAME=\"$SESSION_NAME\"; $SONNET_CMD --settings \"$bridge_settings\" --add-dir \"$HERE\" --append-system-prompt \"\$(cat '$brief_file' 2>/dev/null || echo '')\""
+      local brief_file
+      brief_file="$(resolve_briefing_file)"
+      local sonnet_launch="cd \"$SUPERVISOR_CWD\" && export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 PROJECT_DIR=\"$PROJECT_DIR\" WORK_DIR=\"$WORK_DIR\" ACC_RUNTIME=\"$ACC_RUNTIME\" ACC_TEMPLATE_ROOT=\"$HERE\" SESSION_NAME=\"$SESSION_NAME\"; $SONNET_CMD --settings \"$bridge_settings\" --add-dir \"$HERE\" --append-system-prompt \"\$(cat '$brief_file' 2>/dev/null || echo '')\""
       tmux send-keys -t "${SESSION_NAME}:${SONNET_WINDOW}" "$sonnet_launch" C-m
       ;;
     *)
@@ -548,20 +601,42 @@ check_running_tasks() {
 
       if [[ "$this_mode" == "resident" ]]; then
         # 상주 모드: brain transcript 파일 mtime 확인
-        local newest_trans=""
-        newest_trans="$(find "${HOME:-/home/rerun}/.gemini/antigravity-cli/brain" -name "transcript_full.jsonl" -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1)"
-        if [[ -n "$newest_trans" ]]; then
-          local t_mtime="${newest_trans%%.*}"
+        local agy_trans_file="$ACC_RUNTIME/workers/agy.transcript"
+        local trans_path=""
+        if [[ -f "$agy_trans_file" ]]; then
+          trans_path="$(head -n 1 "$agy_trans_file" 2>/dev/null | tr -d '\r\n')"
+        fi
+
+        if [[ -n "$trans_path" && -f "$trans_path" ]]; then
+          local t_mtime
+          t_mtime="$(stat -c %Y "$trans_path" 2>/dev/null || echo 0)"
           if (( t_mtime > last_act )); then
             last_act="$t_mtime"
           fi
+          log_file="$trans_path"
+        else
+          if [[ "$_STALL_TRANSCRIPT_FALLBACK_WARNED" != "true" ]]; then
+            log "경고: workers/agy.transcript 부재 — 머신 전체 최신 transcript 로 폴백 감지"
+            _STALL_TRANSCRIPT_FALLBACK_WARNED=true
+          fi
+          local newest_trans=""
+          newest_trans="$(find "${HOME:-/home/rerun}/.gemini/antigravity-cli/brain" -name "transcript_full.jsonl" -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1)"
+          if [[ -n "$newest_trans" ]]; then
+            local t_mtime="${newest_trans%%.*}"
+            if (( t_mtime > last_act )); then
+              last_act="$t_mtime"
+            fi
+          fi
+          # 폴백 시 detail 필드에 다른 체인의 transcript 경로가 노출되지 않도록 output.log 또는 prompt.md 사용
+          log_file="$task_dir/output.log"
+          [[ -f "$log_file" ]] || log_file="$task_dir/prompt.md"
         fi
+
         local prompt_mtime
         prompt_mtime="$(stat -c %Y "$task_dir/prompt.md" 2>/dev/null || echo 0)"
         if (( prompt_mtime > last_act )); then
           last_act="$prompt_mtime"
         fi
-        log_file="${newest_trans#* }"
         [[ -f "$log_file" ]] || log_file="$task_dir/prompt.md"
       else
         if [[ -f "$log_file" ]]; then
@@ -716,8 +791,10 @@ check_bridge_health() {
           printf '%s\n' "$now" > "$marker"
           log "경고: 브리지 리스너 비활성 및 pending 이벤트 고립 (${age}s) — 비상 폴백 발동"
           local emergency_msg="[ACC_WATCHDOG_EMERGENCY] Push listener degraded. Pending events isolated for ${age}s. Check $pending_dir"
-          tmux set-buffer "$emergency_msg" 2>/dev/null || true
-          tmux paste-buffer -t "${SESSION_NAME}:${SONNET_WINDOW}" 2>/dev/null || true
+          local sanitized_sess="${SESSION_NAME//[^A-Za-z0-9_-]/_}"
+          local buf_name="acc-${sanitized_sess}"
+          tmux set-buffer -b "$buf_name" "$emergency_msg" 2>/dev/null || true
+          tmux paste-buffer -d -b "$buf_name" -t "${SESSION_NAME}:${SONNET_WINDOW}" 2>/dev/null || true
           tmux send-keys -t "${SESSION_NAME}:${SONNET_WINDOW}" C-m 2>/dev/null || true
 
           "$HERE/bin/event-emit.sh" bridge bridge_degraded "system" \
@@ -736,6 +813,7 @@ for arg in "$@"; do
 done
 
 if [[ "$oneshot" == "true" ]]; then
+  check_retired
   check_session_and_sonnet
   check_running_tasks
   check_inflight_ack_timeouts
@@ -744,6 +822,7 @@ if [[ "$oneshot" == "true" ]]; then
 fi
 
 while true; do
+  check_retired
   check_session_and_sonnet
   check_running_tasks
   check_inflight_ack_timeouts

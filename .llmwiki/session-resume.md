@@ -176,7 +176,14 @@ tmux 창 밖의 일반 셸 터미널에서 `claude`를 실행했거나, 브리�
      ```bash
      TEMPLATE_DIR="/home/rerun/agent-command-chain-template"
      RUNTIME_DIR="$(tmux show-environment -t agentchain-v2 ACC_RUNTIME | sed -n 's/^ACC_RUNTIME=//p')"   # ls -td 는 테스트 런타임을 집을 수 있음
-     BRIEF_FILE="$TEMPLATE_DIR/logs/session_brief.md"
+     # 런타임 브리핑 우선순위: session_brief.md -> supervisor_brief.md -> logs/session_brief.md
+     if [[ -f "$RUNTIME_DIR/session_brief.md" ]]; then
+       BRIEF_FILE="$RUNTIME_DIR/session_brief.md"
+     elif [[ -f "$RUNTIME_DIR/supervisor_brief.md" ]]; then
+       BRIEF_FILE="$RUNTIME_DIR/supervisor_brief.md"
+     else
+       BRIEF_FILE="$TEMPLATE_DIR/logs/session_brief.md"
+     fi
 
      export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1
      export ACC_RUNTIME="$RUNTIME_DIR"
@@ -206,10 +213,11 @@ tmux 창 밖의 일반 셸 터미널에서 `claude`를 실행했거나, 브리�
    # 프롬프트 기호(>)가 보이고 유휴 대기 상태여야 함
    ```
    *주의:* 이 명령은 세션 기동/재개 시 **최초 1회 상태 점검(sanity check)** 목적에 한하며, 작업 진행 중 주기적 폴링(polling) 용도로 사용하는 것은 전면 엄격 금지된다 (완료 통지는 Full-Push 이벤트 대기).
-3. **watchdog-v2 프로세스 생존 확인**:
+3. **watchdog-v2 프로세스 생존 및 로그 확인**:
    ```bash
    pgrep -fa "watchdog-v2.sh"
-   # 워치독 PID가 정상 출력되어야 함
+   # 워치독 PID가 정상 출력되어야 함. 워치독 로그는 런타임 전용 로그에서 확인:
+   tail -n 20 "$RUNTIME_DIR/watchdog.log"
    ```
 4. **이벤트 FIFO 파이프 존재 확인**:
    ```bash
