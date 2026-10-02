@@ -233,6 +233,15 @@ wait_for_pane_text() {
   return 1
 }
 
+# 다른 체인의 세션 보호: 기존 세션의 tmux env ACC_RUNTIME 이 이번 런타임과 다르면 보완/--restart 모두 거부
+if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+  _sess_rt="$(tmux show-environment -t "$SESSION_NAME" ACC_RUNTIME 2>/dev/null | sed -n 's/^ACC_RUNTIME=//p')"
+  if [[ -n "$_sess_rt" && "$_sess_rt" != "$ACC_RUNTIME" ]]; then
+    echo "Error: 세션 '$SESSION_NAME' 은 다른 런타임($_sess_rt) 소속입니다. 이번 런타임($ACC_RUNTIME)으로 덮어쓰거나 재시작하지 않습니다." >&2
+    exit 70
+  fi
+fi
+
 # 기존 세션 강제 재시작 요청 처리
 if [[ "$RESTART_SESSION" == "true" ]] && tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
   echo "기존 tmux 세션 '$SESSION_NAME' 종료 후 v2로 재생성 (--restart 플래그)..."

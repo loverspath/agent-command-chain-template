@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# bin/chain list|status [id]: 체인(런타임) 목록·상태 (읽기 전용)
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cmd="${1:-list}"; want="${2:-}"
+alive() { [[ -n "${1:-}" ]] && kill -0 "$1" 2>/dev/null && echo "alive($1)" || echo "-"; }
+show() {
+  local rt="$1" id sess pid_w pid_l pend busy ret
+  id="$(head -n1 "$rt/instance" 2>/dev/null | tr -d '\r\n')"; [[ -n "$id" ]] || id="$(basename "$rt")"
+  sess="$(head -n1 "$rt/session_name" 2>/dev/null | tr -d '\r\n')"; [[ -n "$sess" ]] || sess="$id"
+  [[ -z "$want" || "$want" == "$id" || "$want" == "$sess" ]] || return 0
+  local up="down"; tmux has-session -t "$sess" 2>/dev/null && up="up"
+  local envrt; envrt="$(tmux show-environment -t "$sess" ACC_RUNTIME 2>/dev/null | sed -n 's/^ACC_RUNTIME=//p')"
+  local envok="n/a"; [[ "$up" == up ]] && { [[ "$envrt" == "$rt" ]] && envok="match" || envok="MISMATCH"; }
+  pend="$(ls "$rt/events/pending" 2>/dev/null | wc -l)"
+  busy="$(ls "$rt/workers"/*.busy 2>/dev/null | wc -l)"
+  ret="no"; [[ -f "$rt/retired" ]] && ret="yes"
+  printf '%-22s session=%-4s tmux-env=%-8s watchdog=%-14s listener=%-14s pending=%s busy=%s retired=%s\n  runtime=%s\n' \
+    "$id" "$up" "$envok" "$(alive "$(cat "$rt/watchdog.pid" 2>/dev/null)")" "$(alive "$(cat "$rt/listener.pid" 2>/dev/null)")" "$pend" "$busy" "$ret" "$rt"
+}
+case "$cmd" in
+  list|status) for rt in "$HERE"/runtime/*/; do [[ -d "$rt" ]] && show "${rt%/}"; done ;;
+  retire)
+    [[ -n "$want" ]] || { echo "Usage: bin/chain retire <id>" >&2; exit 64; }
+    for rt in "$HERE"/runtime/*/; do
+      id="$(head -n1 "$rt/instance" 2>/dev/null | tr -d '\r\n')"
+      [[ "$id" == "$want" ]] && { touch "${rt%/}/retired"; echo "retired 표식 기록: ${rt%/} (워치독이 종료됨. tmux 세션은 직접 정리)"; exit 0; }
+    done
+    echo "Error: 인스턴스 '$want' 없음" >&2; exit 70 ;;
+  *) echo "Usage: bin/chain list|status [id] | retire <id>" >&2; exit 64 ;;
+esac

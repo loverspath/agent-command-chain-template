@@ -167,6 +167,16 @@ resolve_session_and_runtime() {
     final_runtime="$def_runtime"
   fi
 
+  # 상속된 ACC_RUNTIME 이 다른 세션의 런타임이면 조용히 해시 재계산하지 않고 거부 (다중 체인 오염 차단)
+  if [[ "$resolved_source" != "runtime-marker" && -n "${ENV_ACC_RUNTIME:-}" && -f "${ENV_ACC_RUNTIME}/session_name" ]]; then
+    local inh_sess
+    inh_sess="$(head -n 1 "${ENV_ACC_RUNTIME}/session_name" 2>/dev/null | tr -d '\r\n')"
+    if [[ -n "$inh_sess" && "$inh_sess" != "$resolved_session" ]]; then
+      echo "Error: ACC_RUNTIME(${ENV_ACC_RUNTIME})은 세션 '$inh_sess' 소속인데 해석된 세션은 '$resolved_session' 입니다. 다른 체인의 환경 상속 의심 — 거부." >&2
+      exit 70
+    fi
+  fi
+
   # 작업 1.3: 해석된 세션에 v2 마커가 없고 다른 세션에 있으면 조용히 진행하지 않고 거부 및 후보 세션명 안내
   if ! session_has_v2_marker "$resolved_session" "$proj_dir" "$base_here"; then
     local candidates=()
