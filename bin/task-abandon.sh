@@ -38,11 +38,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_SESSION_NAME="${SESSION_NAME:-}"
 ENV_ACC_RUNTIME="${ACC_RUNTIME:-}"
 
-_CFG_ENV="${ACC_CONFIG_ENV:-$HERE/config.env}"
-if [[ -f "$_CFG_ENV" ]]; then
-  # shellcheck disable=SC1091
-  source "$_CFG_ENV"
-fi
+# shellcheck disable=SC1091
+source "$HERE/lib/config.sh"
+acc_load_config "$HERE" || exit $?
 CONFIG_SESSION_NAME="${SESSION_NAME:-agentchain}"
 
 if [[ -z "$ENV_ACC_RUNTIME" ]]; then

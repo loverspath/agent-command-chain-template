@@ -14,11 +14,9 @@ fi
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-_CFG_ENV="${ACC_CONFIG_ENV:-$HERE/config.env}"
-if [[ -f "$_CFG_ENV" ]]; then
-  # shellcheck disable=SC1091
-  source "$_CFG_ENV"
-fi
+# shellcheck disable=SC1091
+source "$HERE/lib/config.sh"
+acc_load_config "$HERE" || exit $?
 
 SESSION_NAME="${SESSION_NAME:-agentchain}"
 session_safe="$(printf '%s' "$SESSION_NAME" | tr -cd '[:alnum:]_-')"

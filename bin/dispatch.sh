@@ -24,11 +24,9 @@ ENV_WORKER_MODE="${WORKER_MODE:-}"
 ENV_AGY_MODE="${AGY_MODE:-}"
 ENV_CODEX_MODE="${CODEX_MODE:-}"
 
-_CFG_ENV="${ACC_CONFIG_ENV:-$HERE/config.env}"
-if [[ -f "$_CFG_ENV" ]]; then
-  # shellcheck disable=SC1091
-  source "$_CFG_ENV"
-fi
+# shellcheck disable=SC1091
+source "$HERE/lib/config.sh"
+acc_load_config "$HERE" || exit $?
 CONFIG_SESSION_NAME="${SESSION_NAME:-agentchain}"
 
 [[ -n "$ENV_WORKER_MODE" ]] && WORKER_MODE="$ENV_WORKER_MODE"

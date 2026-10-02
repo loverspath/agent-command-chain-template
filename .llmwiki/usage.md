@@ -34,7 +34,26 @@ chmod +x bootstrap.sh watchdog.sh bootstrap-v2.sh watchdog-v2.sh bin/*.sh adapte
 
 ---
 
-## 2. config.env 주요 설정 항목
+## 2. 설정 체계 및 계층화 (2-Tier Configuration)
+
+템플릿은 단일 체크아웃에서 복수의 에이전트 체인을 안전하게 운용할 수 있도록 2계층 설정 구조(`lib/config.sh::acc_load_config`)를 제공한다.
+
+### 2.1 계층화 구조 및 우선순위
+1. **Tier 1 (공통 기본값)**: `config.env` (또는 환경변수 `ACC_CONFIG_ENV`)
+   - 모든 체인 인스턴스가 공유하는 공통 기본 설정.
+2. **Tier 2 (인스턴스별 오버라이드)**: `instances/<id>.env` (git 무시)
+   - `ACC_INSTANCE` 환경변수가 설정되어 있거나 런타임 표식 파일(`$ACC_RUNTIME/instance`)이 존재할 때 자동 로드.
+   - Tier 1의 동일 키를 오버라이드하며, 인스턴스 전용 설정(`SESSION_NAME`, `PROJECT_DIR`, `WORK_DIR`, `HANDOFF_FILE`, `DASHBOARD_PORT` 등)을 정의.
+3. **환경변수 최우선 원칙**:
+   - 호출 프로세스 셸에 명시된 환경변수(`SESSION_NAME=...`, `ACC_RUNTIME=...` 등)는 파일 설정(Tier 1 & Tier 2)보다 항상 우선.
+
+### 2.2 인스턴스 로딩 규칙 (`lib/config.sh`)
+- **인스턴스 미지정 시 (하위 호환)**: `ACC_INSTANCE`와 `$ACC_RUNTIME/instance`가 모두 없으면 기존과 100% 동일하게 `config.env`만 로드됨.
+- **인스턴스 ID 검증**: ID는 영숫자, 밑줄, 하이픈(`^[A-Za-z0-9_-]+$`)만 허용. 유효하지 않은 문자나 빈 표식 파일은 stderr 경고 후 `exit 70`(fail-closed).
+- **인스턴스 파일 부재 시 거부**: 인스턴스 ID가 결정되었으나 해당 `instances/<id>.env` 파일이 없으면 `config.env`로 조용히 폴백하지 않고 stderr 에러 출력 후 `exit 70`으로 즉시 거부 (침묵 실패 방지).
+- **성공 시 export**: 정상 로드 시 `ACC_INSTANCE`가 export되어 하위 프로세스에 전파됨.
+
+### 2.3 주요 설정 항목
 
 | 변수명 | 기본값 | 설명 |
 |---|---|---|

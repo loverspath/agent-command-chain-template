@@ -41,14 +41,10 @@ _ENV_HANDOFF_FILE="${HANDOFF_FILE:-}"
 
 cd "$HERE"
 
-_CFG_ENV="${ACC_CONFIG_ENV:-$HERE/config.env}"
-if [[ -f "$_CFG_ENV" ]]; then
-  # shellcheck disable=SC1091
-  source "$_CFG_ENV"
-elif [[ -f config.env ]]; then
-  # shellcheck disable=SC1091
-  source config.env
-else
+# shellcheck disable=SC1091
+source "$HERE/lib/config.sh"
+acc_load_config "$HERE" || exit $?
+if [[ ! -f "${ACC_CONFIG_ENV:-$HERE/config.env}" && -z "${ACC_INSTANCE:-}" ]]; then
   echo "config.env 가 없다. config.env.example 을 복사해서 값을 채워라." >&2
   exit 1
 fi

@@ -205,6 +205,10 @@ v2 Full-Push 아키텍처는 기계적 신뢰성(Durable Outbox)과 사람/감�
    - 트랜스크립트 파일 접근 시 엄격한 정규화 및 화이트리스트 검증을 수행하여 상위 디렉터리 탈출 시도를 원천 차단합니다.
    - 작업 단위 정밀 트랜스크립트 슬라이싱(exact, partial, inferred, none) 및 텍스트 절단 전 단일 지점 민감 정보 마스킹(`mask_sensitive`)을 적용합니다.
 
+### 2.11 2계층 설정 구조 (2-Tier Configuration Architecture)
+
+단일 체크아웃에서 복수 인스턴스를 안전하게 운용하기 위한 2계층 설정 계층화(`lib/config.sh::acc_load_config`), ID 유효성 검증, fail-closed 거부 규약 및 환경변수 최우선 원칙에 대한 상세 설명은 [[usage#2-설정-체계-및-계층화-2-tier-configuration]]을 참조한다.
+
 ---
 
 ## 3. tmux 브리지 (v1, 폴백/레거시)
