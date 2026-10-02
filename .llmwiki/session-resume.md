@@ -221,7 +221,7 @@ tmux 창 밖의 일반 셸 터미널에서 `claude`를 실행했거나, 브리�
    ```
 4. **이벤트 FIFO 파이프 존재 확인**:
    ```bash
-   test -p "$(ls -td runtime/agentchain-v2-*/event.fifo | head -n 1)" && echo "FIFO OK"
+   test -p "$RUNTIME_DIR/event.fifo" && echo "FIFO OK"   # 체인 목록·상태는 bin/chain status
    ```
 5. **웹 대시보드 상태 확인**:
    ```bash
@@ -246,10 +246,10 @@ tmux 창 밖의 일반 셸 터미널에서 `claude`를 실행했거나, 브리�
 ### 5.2 진단 및 확인
 ```bash
 # 1. 점유 중인 태스크 ID 확인
-cat runtime/agentchain-v2-*/workers/agy.busy
+cat "$RUNTIME_DIR/workers/agy.busy"
 
 # 2. 태스크 상태 확인
-cat runtime/agentchain-v2-*/tasks/<task_id>/state
+cat "$RUNTIME_DIR/tasks/<task_id>/state"
 ```
 
 ### 5.3 복구 명령 (`bin/task-abandon.sh`)

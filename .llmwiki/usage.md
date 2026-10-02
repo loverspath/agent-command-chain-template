@@ -219,6 +219,11 @@ SESSION_NAME=agentchain-v2 ./bin/event-ack.sh <batch_id>
 ~/agent-command-chain-template/dashboard/run.sh stop
 ```
 
+### 4.4a 체인 여러 개 운용 (`bin/chain`)
+- 인스턴스 ID = tmux 세션명. 새 체인: `instances/<세션명>.env`(`SESSION_NAME`, `PROJECT_DIR`, `WORK_DIR`, `HANDOFF_FILE`)를 만들고 `ACC_INSTANCE=<세션명> ./bootstrap-v2.sh`. 템플릿 체크아웃은 하나를 공유한다.
+- 목록·상태: `bin/chain list|status [id]` (세션 생존, tmux env 일치, 워치독/리스너 pid, pending/busy, retired). 은퇴: `bin/chain retire <id>`는 `$ACC_RUNTIME/retired` 표식만 쓰며 워치독이 종료된다. tmux 세션 종료는 직접 한다.
+- 안전장치: 상속된 `ACC_RUNTIME`이 다른 세션 소속이면 해석이 exit 70으로 거부하고, `bootstrap-v2.sh`는 다른 런타임 소속의 기존 세션을 보완하거나 `--restart` 하지 않는다(exit 70). 워치독의 런타임 범위 규칙은 architecture.md §2.5.
+
 ### 4.5 v1 레거시 관찰 및 수동 주입 (순수 pull 폴백)
 컨트롤러(사람 또는 Sonnet의 Bash 툴)는 표준 tmux 명령을 통해 각 창의 상태를 파악하고 지시를 내린다.
 
