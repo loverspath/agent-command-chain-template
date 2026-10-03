@@ -75,8 +75,31 @@ for orphan_dir in "$inflight"/*; do
   fi
 done
 
+# 유휴 모드: 진행 중(status=running) 작업이 없으면 정보성 이벤트(started/canceled)는, bridge_degraded는 항상
+# 감독관을 깨우지 않고 archive/auto-* 로 조용히 치운다. done/error/stalled/process_exit 는 항상 전달한다.
+drain_noise() {
+  local idle=true evt knd dest=""
+  grep -qs '^status=running' "$runtime"/tasks/*/state && idle=false
+  for evt in "$pending"/*.evt; do
+    [[ -f "$evt" ]] || continue
+    knd="$(grep '^kind=' "$evt" 2>/dev/null | cut -d= -f2-)"
+    case "$knd" in
+      bridge_degraded) ;;
+      started|canceled) [[ "$idle" == "true" ]] || continue ;;
+      *) continue ;;
+    esac
+    if [[ -z "$dest" ]]; then
+      dest="$archive/auto-$(date +%s%N)"
+      mkdir -p "$dest"
+    fi
+    mv "$evt" "$dest/" 2>/dev/null || true
+  done
+}
+
 # pending에 이벤트가 들어올 때까지 FIFO 읽기 대기 (FIFO는 힌트일 뿐, read -t 2로 주기적 재확인하여 lost pulse 영구 대기 방어)
-while ! find "$pending" -maxdepth 1 -name '*.evt' -print -quit 2>/dev/null | grep -q .; do
+while true; do
+  drain_noise
+  find "$pending" -maxdepth 1 -name '*.evt' -print -quit 2>/dev/null | grep -q . && break
   IFS= read -r -t 2 _ <&8 || true
 done
 

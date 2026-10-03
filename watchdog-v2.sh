@@ -756,8 +756,18 @@ check_bridge_health() {
   local pending_dir="$ACC_RUNTIME/events/pending"
 
   # bridge_degraded 이벤트 제외한 일반 작업 이벤트 중 오래된 것 탐색
-  local oldest_evt
-  oldest_evt="$(find "$pending_dir" -maxdepth 1 -name '*.evt' ! -name '*-bridge-*' -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | head -n 1)"
+  # 유휴 모드(진행 중 작업 없음)에서는 정보성 이벤트(started/canceled)를 고립 판정에서 제외 — 비상 폴백 소음 방지
+  local idle=true
+  grep -qs '^status=running' "$ACC_RUNTIME"/tasks/*/state && idle=false
+  local oldest_evt="" cand_line cand_file
+  while IFS= read -r cand_line; do
+    cand_file="${cand_line#* }"
+    if [[ "$idle" == "true" ]] && grep -qE '^kind=(started|canceled)$' "$cand_file" 2>/dev/null; then
+      continue
+    fi
+    oldest_evt="$cand_line"
+    break
+  done < <(find "$pending_dir" -maxdepth 1 -name '*.evt' ! -name '*-bridge-*' -type f -printf '%T@ %p\n' 2>/dev/null | sort -n)
   if [[ -n "$oldest_evt" ]]; then
     local evt_time evt_file
     evt_time="${oldest_evt%%.*}"
