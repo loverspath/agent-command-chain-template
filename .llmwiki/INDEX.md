@@ -29,7 +29,7 @@ Claude Sonnet(감독/RC) · agy(Gemini 3.8 Flash, 라우터+워커) · Codex Ter
 
 ## Known Issues
 
-- [[known-issues]] — RC 전제조건, 디렉토리 신뢰(Folder Trust) 자동 확인 한계, 세션 지속성 제품 버그, agy/codex 바이너리 이슈, tmux 중첩 attach, v1/v2 세션 오조준(interactive TUI) 및 4계층 자동 해석, 상주 대화형 TUI 비선점형 입력 큐잉(9/23 병목), 동시 타이핑 혼선, 테스트 하네스 격리 규약, Sonnet의 요청 외 범위 임의 확장(SSH 과설계) 사고, Post-mortem 규약 미자동화(10라운드 전량 누락) 사고
+- [[known-issues]] — RC 전제조건, 디렉토리 신뢰(Folder Trust) 자동 확인 한계, 세션 지속성 제품 버그, agy/codex 바이너리 이슈, tmux 중첩 attach, v1/v2 세션 오조준(interactive TUI) 및 4계층 자동 해석, 상주 대화형 TUI 비선점형 입력 큐잉(9/23 병목), 동시 타이핑 혼선, 테스트 하네스 격리 규약, Sonnet의 요청 외 범위 임의 확장(SSH 과설계) 사고, Post-mortem 규약 미자동화(10라운드 전량 누락) 사고, agy resident 완료 알림 누락 및 조기 완료 결함(센티널 판정 및 규약 D 도입)
 
 ## 태그 인덱스
 
@@ -56,6 +56,8 @@ Claude Sonnet(감독/RC) · agy(Gemini 3.8 Flash, 라우터+워커) · Codex Ter
 - `#prompt-drift` — [[known-issues]]
 - `#remote-control` — [[known-issues]]
 - `#resident-tui` — [[architecture]], [[usage]]
+- `#resident-sentinel` — [[architecture]], [[known-issues]], [[usage]]
+- `#protocol-d` — [[architecture]], [[known-issues]], [[usage]]
 - `#roles` — [[architecture]]
 - `#runbook` — [[session-resume]]
 - `#session-resolution` — [[architecture]], [[known-issues]]

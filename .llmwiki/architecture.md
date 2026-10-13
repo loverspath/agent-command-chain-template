@@ -92,7 +92,7 @@ v2는 메시지 유실 없는 신뢰성을 달성하기 위해 **파일 기반 D
 | **`bin/event-ack.sh`** | **이벤트 완료 처리기**. Sonnet이 확인한 이벤트를 `archive/` 디렉토리로 원자적으로 이동시키고 FIFO에 남은 잔여 펄스를 드레인하여 중복 기상을 방지합니다. |
 | **`bin/dispatch.sh`** | **작업 디스패처**. 4계층 세션명 자동 해석(환경변수 `SESSION_NAME` 권장, 런타임 마커, 현재 tmux 세션, config 기본값) 및 v2 마커 검증 후, 고유 작업 ID 발급 및 실행 프롬프트 사본(`$task_dir/prompt.md`) 생성 시 체인 컨텍스트 헤더(< 1KB) 자동 주입(`ACC_NO_BRIEF_HEADER=1`로 비활성화 가능, 헤더 포함 128KB 제한 검증). `oneshot` 모드에서는 `bin/run-task.sh` 명령을 주입하고, `resident` 모드에서는 1줄 도어벨 트리거(`Read and execute task prompt: ...`)를 주입합니다. `--dry-run` 안전 검증 플래그 지원. |
 | **`bin/run-task.sh`** | **워커 프로세스 러너 (oneshot 전용)**. 터미널 소유권 락(`terminal.lock`)을 획득하고 작업 상태를 `running`으로 전이한 뒤, 지정된 어댑터를 실행합니다. 실행 완료 시 성공/실패 여부에 따라 `task.done` 또는 `task.error` 이벤트를 원자적으로 발행합니다. |
-| **`bin/agy-stop-hook.sh`** | **agy Stop 훅 핸들러 (resident 전용)**. Antigravity CLI의 `Stop` 라이프사이클 훅으로부터 stdin JSON을 수신하여 `fullyIdle: true` 여부 및 서브에이전트 여부를 판별합니다. `terminal.lock` 멱등성을 보장하며 원자적 `done` 또는 `error` 이벤트를 Outbox에 발행하고 작업 상태와 `workers/agy.busy`를 안전하게 정리합니다. |
+| **`bin/agy-stop-hook.sh`** | **agy Stop 훅 핸들러 (resident 전용)**. Antigravity CLI의 `Stop` 라이프사이클 훅으로부터 stdin JSON을 수신하여 `fullyIdle: true` 여부 및 마지막 모델 응답의 완료 센티널(`[[DONE <id>]]` 또는 `[[BLOCKED <id>]]`)을 판별합니다. 지시서의 논리적 이름 ID를 허용하며, 서브에이전트 로그 및 지시서 인용을 엄격히 배제하고 이전 작업 잔여 센티널 오탐 방지 타임스탬프 가드를 적용합니다. 센티널 부재 시 running 유지(기한 초과 시 timeout 발행), `terminal.lock` 멱등성을 보장하며 원자적 `done` 또는 `error` 이벤트를 Outbox에 발행하고 작업 상태와 `workers/agy.busy`를 안전하게 정리합니다. |
 | **`adapters/agy-oneshot.sh`** | **agy 단발 실행 어댑터**. Antigravity CLI를 비대화형 단발 모드로 구동하여 명세된 프롬프트를 수행합니다. 메인 턴에서 `invoke_subagent` 도구를 통해 워커 서브에이전트를 기동·취합하고 종료합니다. |
 | **`adapters/codex-oneshot.sh`** | **Codex 단발 실행 어댑터**. `codex exec` 기반으로 단발성 설계/코딩 작업을 수행합니다. 비-Git 프로젝트용 `--skip-git-repo-check` 플래그를 포함합니다. |
 
@@ -175,11 +175,19 @@ v2 Full-Push 아키텍처는 기계적 신뢰성(Durable Outbox)과 사람/감�
 2. **도어벨과 페이로드 분리 (Doorbell vs Payload Separation)**:
    - 디스패처(`bin/dispatch.sh`)는 프롬프트 전문과 헤더를 `$ACC_RUNTIME/tasks/<task_id>/prompt.md` 파일에 기록하고, `workers/agy.busy`를 선점합니다.
    - tmux 창에는 오직 1줄 도어벨(`Read and execute task prompt: $task_dir/prompt.md`)만 주입하여 개행 폭주와 터미널 버퍼 오염을 원천 방지합니다.
-3. **무폴링 완료 통지 (Native Stop Hook + fullyIdle)**:
-   - agy가 작업을 수행하는 동안 서브에이전트 구동 턴에서는 `fullyIdle: false`이므로 훅이 대기합니다.
-   - 모든 서브에이전트가 완료되고 메인이 요약을 마치면 `fullyIdle: true`로 `bin/agy-stop-hook.sh`가 발동하여 `bin/event-emit.sh`를 통해 Outbox와 FIFO에 원자적 `done` 이벤트를 주입합니다.
+3. **무폴링 완료 통지 (Native Stop Hook + 완료 센티널 판정 + 규약 D)**:
+   - agy가 작업을 수행하는 동안 서브에이전트 구동 중에는 `fullyIdle: false`이므로 훅이 대기합니다.
+   - **완료 센티널 기반 판정**: `fullyIdle: true` 시점에 발동하는 `bin/agy-stop-hook.sh`는 본체 트랜스크립트의 **마지막 모델 응답**(`PLANNER_RESPONSE` 또는 `source == "MODEL"`)에서 `[[DONE <id>]]` 또는 `[[BLOCKED <id>]]` 센티널을 검증합니다:
+     - **식별자 비종속 유연 판정**: 지시서가 내부 발급 태스크 ID 대신 사람이 이해하기 쉬운 논리적 이름 ID(예: `[[DONE some-named-task]]`)를 사용하더라도 `^\s*\[\[(DONE|BLOCKED)\s+([a-zA-Z0-9_\-\.]+)\s*\]\](.*)$` 정규식을 만족하면 완료/차단으로 유연하게 인정합니다. 식별자가 실제 `task_id`와 다를 경우 `ACC_HOOK_DEBUG=1`에 `sentinel_id_mismatch_accepted` 태그를 로깅하며, 이벤트 summary에는 센티널 뒷부분 텍스트를 그대로 사용합니다. 훅이 완료 처리하는 대상은 여전히 `workers/agy.busy`의 현재 작업입니다.
+     - **이전 작업 센티널 오탐 방지 가드**: 식별자 비종속 완화로 인해 동일 세션 내 이전 작업의 잔여 모델 응답 센티널에 의해 오탐되는 현상을 방어하기 위해, 모델 응답의 `created_at` 타임스탬프가 현재 작업의 `started_epoch` 이후인지 검증(`created_at < started_epoch`인 응답은 무시/배제)합니다.
+     - **오탐 방지 설계**: 서브에이전트 트랜스크립트(`<subagent_reminder>`, `sender=`) 및 사용자 입력(`USER_INPUT`) 지시서 본문 인용문은 엄격히 배제하며, 단독 행 센티널만 인식합니다.
+     - **센티널 일치 시**: `event-emit.sh`를 통해 원자적 `done`(또는 `[[BLOCKED` 시 `error`) 이벤트를 주입하고, `state` 갱신 및 `workers/agy.busy`를 삭제합니다.
+     - **센티널 부재 시 (서브에이전트 위임 직후 등)**: 작업을 `running` 상태로 유지하고 busy 파일을 보존하여 턴 종료와 작업 완료의 불일치로 인한 조기 완료를 원천 차단합니다.
+     - **무한 대기 방지**: 센티널이 없더라도 작업 상태의 `deadline_epoch`를 확인하여 마감 시각이 초과된 경우 `timeout` 에러 이벤트를 발행하고 안전 종료합니다.
+     - **에러/중단 즉시 처리**: `terminationReason`이 에러/중단/취소이거나 `error` 메시지가 존재하는 경우 센티널 유무와 무관하게 즉시 `error` 이벤트를 발행합니다.
+   - **지시서 규약 D 자동 주입**: `bin/dispatch.sh`는 agy 작업 디스패치 시 지시서 끝에 [규약 D](서브에이전트 완료 전 턴 종료 금지, 최종 응답 마지막 줄 센티널 출력 강제)를 자동 주입하여 에이전트의 조기 턴 종료를 예방합니다.
    - `terminal.lock` 기반 멱등성 보장으로 중복 통지를 차단하며, `workers/agy.busy`가 없는 상태의 `/clear`나 수동 입력은 이벤트를 발행하지 않습니다.
-   - **Fail-Closed 4중 가드 원칙 (Hook Fail-Closed Rules)**:
+   - **Fail-Closed 가드 원칙 (Hook Fail-Closed Rules)**:
      1. `ACC_RUNTIME` 환경변수가 명시적으로 지정되어 있고 디렉토리이며, `workers/agy.resident` 마커 파일이 존재할 때만 진입 (런타임 추측/config.env 폴백 전면 제거).
      2. `workers/agy.resident` 내 기록된 `pane_id`와 hook 실행 환경의 `TMUX_PANE`이 일치할 때만 진입 (상주 창 이외 agy 프로세스의 Stop 훅 오반응 차단).
      3. 활성 작업 상태 파일(`state`) 내 `mode=resident` 및 `status=running`이 모두 만족될 때만 이벤트 발행 (oneshot 작업이나 이미 완료된 작업 오반응 차단).

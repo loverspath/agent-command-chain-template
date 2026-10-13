@@ -334,7 +334,9 @@ else
 fi
 
 # Simulate stop hook for Task 1
-hook1_payload="{\"fullyIdle\": true, \"conversationId\": \"res1\", \"testmark\": \"$TESTMARK\"}"
+res1_trans="$TEST_TMP/res1_transcript.jsonl"
+printf '{"source": "MODEL", "type": "PLANNER_RESPONSE", "content": "Done.\\n[[DONE %s]] result=success | learning=none"}\n' "$res_task1" > "$res1_trans"
+hook1_payload="{\"fullyIdle\": true, \"conversationId\": \"res1\", \"transcriptPath\": \"$res1_trans\", \"testmark\": \"$TESTMARK\"}"
 run_clean ACC_RUNTIME="$TEST_RUNTIME" TMUX_PANE="$agy_pane_id" -- "$HERE/bin/agy-stop-hook.sh" <<< "$hook1_payload" >/dev/null 2>&1 || true
 
 res1_evts=$(find "$TEST_RUNTIME/events" -name "${res_task1}*.evt" 2>/dev/null | wc -l)
@@ -352,7 +354,9 @@ res_out2=$(run_clean SESSION_NAME="$TEST_SESSION" ACC_RUNTIME="$TEST_RUNTIME" AG
 res_task2=$(echo "$res_out2" | grep -oE 'agy-[0-9]+' | head -n 1 || true)
 
 # Simulate stop hook for Task 2
-hook2_payload="{\"fullyIdle\": true, \"conversationId\": \"res2\", \"testmark\": \"$TESTMARK\"}"
+res2_trans="$TEST_TMP/res2_transcript.jsonl"
+printf '{"source": "MODEL", "type": "PLANNER_RESPONSE", "content": "Done.\\n[[DONE %s]] result=success | learning=none"}\n' "$res_task2" > "$res2_trans"
+hook2_payload="{\"fullyIdle\": true, \"conversationId\": \"res2\", \"transcriptPath\": \"$res2_trans\", \"testmark\": \"$TESTMARK\"}"
 run_clean ACC_RUNTIME="$TEST_RUNTIME" TMUX_PANE="$agy_pane_id" -- "$HERE/bin/agy-stop-hook.sh" <<< "$hook2_payload" >/dev/null 2>&1 || true
 
 res2_evts=$(find "$TEST_RUNTIME/events" -name "${res_task2}*.evt" 2>/dev/null | wc -l)

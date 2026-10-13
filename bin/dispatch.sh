@@ -295,6 +295,17 @@ else
   fi
 fi
 
+# 규약 D 주입 (agy 작업이고 brief header가 활성화된 경우, 중복 주입 방지)
+if [[ "$worker" == "agy" && "${ACC_NO_BRIEF_HEADER:-0}" != "1" ]]; then
+  if ! grep -qE '\[\[DONE (<task_id>|'"$task_id"')\]\]|\[PROTOCOL D\]|규약 D' "$task_dir/prompt.md" 2>/dev/null; then
+    cat >> "$task_dir/prompt.md" <<EOF
+
+[PROTOCOL D]
+서브에이전트를 쓰더라도 본체는 모든 서브에이전트가 끝나 결과를 받을 때까지 턴을 종료하지 말고, 최종 보고 후 마지막 줄에 [[DONE $task_id]] result=… | learning=…(막히면 [[BLOCKED $task_id]] reason=…)를 출력한 뒤에만 종료하라. 센티널은 최종 응답에만 쓰고 중간 응답·서브에이전트 지시에는 쓰지 마라.
+EOF
+  fi
+fi
+
 # ARG_MAX 및 CLI 입력 방어를 위한 프롬프트 크기 사전 검증 (헤더 포함 128KB 제한)
 prompt_size="$(wc -c < "$task_dir/prompt.md")"
 if (( prompt_size > 131072 )); then

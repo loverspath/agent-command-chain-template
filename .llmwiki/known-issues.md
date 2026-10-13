@@ -385,3 +385,36 @@ summary: 실측으로 확인된 RC 전제조건, Folder Trust 우회 한계, 세
   - 모든 테스트는 독립된 임시 디렉토리(`mktemp -d`)와 임시 세션명을 주입한 완전 격리 환경(`env -i PATH="$PATH" HOME="$TEST_HOME" ...`)에서 실행한다.
   - `tests/lib-isolated-env.sh`의 무오염 검증 하네스(라이브 런타임 시그니처 검증 및 고유 마커 검사)를 적극 활용한다.
 
+---
+
+## 23. agy resident 완료 알림 누락 및 턴 조기 종료 결함 (센티널 기반 완료 판정 부재)
+
+- **메타데이터**:
+  - `root-cause`: `cli-hook-lifecycle` / `premature-stop-detection`
+  - `verified_with`: 2026-10-12 / 2026-10-13 (운영 실측)
+- **증상 (정량적)**:
+  - `AGY_MODE=resident` 환경에서 agy 본체가 서브에이전트를 위임하거나 중간 일시정지 후 첫 턴을 마칠 때(약 20초 시점), `bin/agy-stop-hook.sh`가 `fullyIdle: true`만을 감지하여 작업을 조기 `done` 처리해버림.
+  - 이로 인해 실제 서브에이전트가 완료된 후 본체가 결과를 취합하는 최종 완료 시점에는 완료 알림 이벤트가 전혀 발행되지 않거나, 체인이 아직 작업이 끝나지 않았는데 완료로 오인하여 후속 작업을 진행하는 심각한 결함 발생.
+- **근본 원인**:
+  1. 기존 `bin/agy-stop-hook.sh`는 Antigravity CLI의 `Stop` 훅 페이로드에서 `fullyIdle: true` 여부만 판정하고, 실제 모델이 작업을 완료했는지를 검증하는 센티널 검사가 전혀 없었음.
+  2. 메인 에이전트가 서브에이전트를 호출한 직후 턴을 마치거나 대기 상태에 들어가면 CLI가 Stop 훅을 트리거하여 조기 완료로 처리됨.
+- **수정 내역**:
+  1. `bin/agy-stop-hook.sh` 전면 개편:
+     - 본체 transcript의 마지막 모델 응답(`PLANNER_RESPONSE` 또는 `source == "MODEL"`)에서만 `[[DONE <task_id>]]` 또는 `[[BLOCKED <task_id>]]` 센티널 탐색.
+     - 사용자 입력(`USER_INPUT`) 및 서브에이전트 로그(`<subagent_reminder>`, `sender=`)는 엄격히 배제하여 지시서 본문 인용이나 서브에이전트 로그에 의한 오탐 원천 차단.
+     - 센티널 일치 시에만 `done`/`error` 이벤트 발행 및 state/busy 정리.
+     - 센티널 부재 시 작업을 `running` 상태로 유지하고 `{"decision":"allow"}` 반환.
+     - 무한 대기 방지: state의 `deadline_epoch` 초과 시 `timeout` error 이벤트 발행 및 종료.
+     - `terminationReason`/`error` 에러/중단 상황은 센티널 유무와 무관하게 즉시 error 발행 유지.
+  2. `bin/dispatch.sh` 보강 (규약 D 자동 주입):
+     - agy 대상 디스패치 시 지시서 끝에 규약 D 자동 주입 (중복 방지):
+       "서브에이전트를 쓰더라도 본체는 모든 서브에이전트가 끝나 결과를 받을 때까지 턴을 종료하지 말고, 최종 보고 후 마지막 줄에 [[DONE <task_id>]] result=… | learning=…(막히면 [[BLOCKED <task_id>]] reason=…)를 출력한 뒤에만 종료하라. 센티널은 최종 응답에만 쓰고 중간 응답·서브에이전트 지시에는 쓰지 마라."
+- **재발 방지책**:
+  - `tests/stop-hook-test.sh`에 8대 시나리오(미완료 대기, 완료 1회, 멱등성, 프롬프트 인용 오탐 방지, 블록 감지, 에러 즉시 감지, 타임아웃, 마커/서브에이전트 배제) 전수 단위 테스트 구축.
+  - dispatch 자동 꼬리말 주입을 통한 프롬프트 규약 누락 구조적 방지.
+- **이슈 23 후속 보강 (센티널 판정 완화 및 타임스탬프 가드)**:
+  - **1차 수정의 한계**: 훅이 `[[DONE <task_id>]]`의 식별자가 내부 발급 태스크 ID(예: `agy-1791...`)와 100% 일치할 것만을 강제하여, 지시서나 모델이 사람이 읽기 쉬운 논리적 이름 ID(예: `some-named-task`, `hookfix2-20261012`)를 출력한 경우 완료 인식이 거부되고 타임아웃까지 불필요하게 대기하는 문제 발생.
+  - **식별자 비종속 완화**: 마지막 모델 응답의 단독 줄이 `^\s*\[\[(DONE|BLOCKED)\s+([a-zA-Z0-9_\-\.]+)\s*\]\](.*)$` 형식이면 식별자 일치 여부와 무관하게 완료/차단을 인정함. 식별자가 실제 `task_id`와 다를 경우 `ACC_HOOK_DEBUG=1`에 `sentinel_id_mismatch_accepted (found: <id>, current: <task_id>)` 태그를 로깅하고, 이벤트 summary에는 센티널 뒷부분 텍스트를 그대로 사용함. 훅이 닫는 대상은 여전히 `workers/agy.busy`의 현재 작업 하나임.
+  - **이전 작업 센티널 오탐 방지 가드**: ID 일치 조건을 완화함에 따라 동일 세션 내 이전 작업의 마지막 모델 응답 센티널이 남아있을 때 조기 완료로 오탐할 위험을 방어하기 위해, 모델 응답의 `created_at` 타임스탬프가 현재 작업의 `started_epoch` 이후인지 검증(`created_epoch < started_epoch`인 응답은 무시/배제).
+  - **단위 테스트 확장**: `tests/stop-hook-test.sh`에 이름 ID 센티널 완료(Case 17), 이름 ID BLOCKED(Case 18), 이전 작업 오래된 센티널 배제(Case 19)를 추가하여 총 19개 케이스 전원 통과 검증.
+

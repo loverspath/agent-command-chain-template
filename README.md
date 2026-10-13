@@ -55,7 +55,7 @@ v2는 tmux의 pull 모델(화면 스크래핑/폴링)의 지연과 불안정성�
   4. *브리지 정체 해소*: ACK 타임아웃 초과 이벤트를 pending으로 재인계하여 전달 보장.
 - **커널 자동 해제형 소유권**: 프로세스 비정상 종료(SIGKILL) 시에도 stale lock이 남지 않도록 커널 `flock`을 기반으로 터미널 소유권과 워치독 단일 인스턴스를 보호합니다.
 - **Resident TUI 모드 (Stage 1 agy 상주 지원)**:
-  `AGY_MODE=resident` 지정 시 agy가 tmux 창에 상시 대화형 TUI로 유지되며, 디스패처는 파일(`$task_dir/prompt.md`)과 1줄 도어벨 트리거로 안전하게 지시를 전달합니다. 완료 통지는 Antigravity CLI의 `Stop` 라이프사이클 훅(`bin/agy-stop-hook.sh`)을 통해 `fullyIdle: true` 시점에 발행됩니다.
+  `AGY_MODE=resident` 지정 시 agy가 tmux 창에 상시 대화형 TUI로 유지되며, 디스패처는 파일(`$task_dir/prompt.md`)과 1줄 도어벨 트리거로 안전하게 지시를 전달합니다. 완료 통지는 Antigravity CLI의 `Stop` 라이프사이클 훅(`bin/agy-stop-hook.sh`)을 통해 `fullyIdle: true` 및 마지막 모델 응답의 완료 센티널(`[[DONE <id>]]` / `[[BLOCKED <id>]]`) 검증을 거쳐 원자적으로 발행되며(지시서가 논리적 이름 ID를 사용해도 유연하게 허용, 이전 작업 잔여 센티널 오탐 방지 타임스탬프 가드 적용), 디스패치 시 지시서 규약 D가 자동 주입됩니다.
 - **세션 타겟팅 및 4계층 자동 해석**:
   `bin/dispatch.sh` 및 관련 도구들은 세션 오조준 방지를 위해 `SESSION_NAME` 4계층 자동 해석(환경변수 > 런타임 마커 > 현재 tmux 세션 > config.env) 및 v2 마커 가드(오조준 시 `exit 70`)를 내장하고 있습니다. 명시적인 `SESSION_NAME=agentchain-v2` 사용을 강력 권장합니다.
 

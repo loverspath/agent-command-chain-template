@@ -29,7 +29,7 @@
 > **[감사 책임 및 2층 검증 구조]**
 > - 디스패치 시 필수 참조 문서 목록(`knowledge_refs`)을 프롬프트에 주입하고, 워커 완료 보고에 실제 읽은 경로(`refs_loaded`)가 누락 없이 기록되었는지 대조 감사해라.
 > - 감사는 워커의 자기보고(`refs_loaded`, `learning_capsule`)에만 의존하지 않고, 작업 로그(`$ACC_RUNTIME/tasks/<task_id>/output.log`) 및 트랜스크립트의 실제 도구 호출(`Read|view_file` 등)과 교차 대조하는 2층 구조로 수행해라.
-> - **완료 판정의 진실 공급원(SSOT)**: 워커 출력 텍스트의 `[[DONE]]` sentinel은 사람이 읽는 보고 형식일 뿐이며, 작업 완료 및 성공/실패 판정의 단일 진실 공급원은 v2 outbox 이벤트(`run-task.sh`가 발행하는 `kind=done|error`)이다.
+> - **완료 판정의 진실 공급원(SSOT)**: 워커 출력 텍스트의 `[[DONE]]` sentinel은 보고 형식이자 resident 훅(`agy-stop-hook.sh`)의 완료 판정 트리거이며(지시서가 논리적 이름 ID를 명시해도 훅이 유연하게 허용함), 작업 완료 및 성공/실패 판정의 시스템적 단일 진실 공급원은 v2 outbox 이벤트(`run-task.sh` 또는 `agy-stop-hook.sh`가 발행하는 `kind=done|error`)이다.
 >
 > agy가 스스로 codex를 부르진 않으니(§2 브리지 설계 참고), 네가 agy 출력을 보고
 > "이건 Terra급이다" 싶으면 직접 codex 창에 작업을 넘겨라. 가장 어려운 문제나 전체 플래닝이
@@ -67,7 +67,7 @@ agy 창에서 최초로 줄 지시 (eraweb-fork `CLI_START_HERE.md`의 첫 프�
 > - **직접 작업 절대 금지**: 너 자신(메인 세션)이 직접 Read/Edit/Bash 등의 툴을 호출해 프로젝트 본문 탐색, 파일 수정, 빌드 등 실작업에 몰입하지 마라 (경량 읽기/수정 작업 예외 없음).
 > - **서브에이전트 위임**: 내장 도구인 `invoke_subagent`(Role="...", TypeName="self", Prompt="...")를 호출하여 워커 서브에이전트를 생성하고 작업을 위임해라. 너는 지시/취합/보고만 수행한다.
 > - **소환 불가/실패 시 즉각 에스컬레이션**: 서브에이전트 소환이 불가능하거나 실패하면 조용히 직접 처리하지 말고, 즉시 `[[BLOCKED <id>]] reason=subagent-unavailable|needs-terra` 형태로 상위(Sonnet)에 보고해라. 감독자가 Codex Terra로 재라우팅할 것이다.
-> - **규격화된 보고**: 디스패치에서 전달받은 `knowledge_refs`를 누락 없이 읽고 종료 보고의 `refs_loaded`에 기록해라. 완료 시 `learning_capsule`과 `[[DONE <id>]] result=... | learning=...` 형식으로 보고해라.
+> - **규격화된 보고**: 디스패치에서 전달받은 `knowledge_refs`를 누락 없이 읽고 종료 보고의 `refs_loaded`에 기록해라. 완료 시 `learning_capsule`과 `[[DONE <id>]] result=... | learning=...` 형식(막히면 `[[BLOCKED <id>]] reason=...`)으로 보고해라(지시서에 명시된 이름 ID나 내부 태스크 ID 모두 훅이 허용함). 센티널은 최종 응답 마지막 줄에만 쓰고 중간 응답·서브에이전트 지시에는 쓰지 마라 (규약 D).
 > - **[Tier 3 산출물 즉시 Research 등록]**: Sol, Opus, 헤드리스 Sol 등 Tier 3 심층 상담이나 조사 결과물이 도출/취합되면, 상위(Sonnet)나 사람의 추가 지시를 기다리지 않고 그 즉시(기본 동작으로) 서브에이전트에게 지시하여 루트 볼트의 `Research/` 폴더(`/mnt/c/Users/rerun/llm-wiki/Research/`)에 정규 위키 문서(`YYYY-MM-DD-<topic>.md`)로 등록하고 `Research/INDEX.md`를 갱신해라. 리포 내부 `logs/`에 방치해서는 안 된다.
 
 **실측 메모 및 운용 지침 (2026-09-24 프로브 실측 반영)**:

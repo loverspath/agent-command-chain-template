@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # bin/agy-stop-hook.sh: Antigravity CLI Stop 훅 핸들러
-# agy 상주 TUI의 완료(fullyIdle=true) 감지 및 event-emit.sh 연동
+# agy 상주 TUI의 완료(fullyIdle=true 및 sentinel 확인) 감지 및 event-emit.sh 연동
 # Fail-Closed 설계 원칙:
 #   1. ACC_RUNTIME이 명시적으로 설정되어 있고 유효한 디렉토리이며 workers/agy.resident 마커가 존재할 때만 진행
 #   2. workers/agy.resident의 pane id와 hook 환경의 TMUX_PANE이 일치할 때만 진행
 #   3. 활성 작업 상태가 mode=resident 및 status=running 일 때만 완료 이벤트 발행
-#   4. 그 외 모든 예외/부적합 상황에서는 유효한 JSON {"decision":"allow"}를 출력하고 무작업(no-op) 안전 종료
+#   4. 센티널 기반 완료 판정: 마지막 MODEL 응답에서 [[DONE <task_id>]] 또는 [[BLOCKED <task_id>]] 검증
+#   5. 센티널 부재 시 작업을 running 상태로 유지 (마감 시각 초과 시 timeout 발행)
+#   6. 그 외 모든 예외/부적합 상황에서는 유효한 JSON {"decision":"allow"}를 출력하고 무작업(no-op) 안전 종료
 set -uo pipefail
 umask 077
 
@@ -13,6 +15,7 @@ umask 077
 raw_payload="$(cat)"
 runtime="${ACC_RUNTIME:-}"
 res_pane_id=""
+mismatch_tag=""
 
 debug_log() {
   local decision="${1:-allow}"
@@ -66,7 +69,7 @@ fi
 # 4. 서브에이전트 트랜스크립트인지 검사 (메인 에이전트만 완료 이벤트 발행)
 # 서브에이전트 트랜스크립트는 첫머리(시스템 프롬프트, Step 0)에 <subagent_reminder> 또는 sender=를 포함함
 if [[ -n "$trans_path" && -f "$trans_path" ]]; then
-  if head -n 1 "$trans_path" 2>/dev/null | grep -qE '<subagent_reminder>|is a subagent|sender=' 2>/dev/null; then
+  if head -n 5 "$trans_path" 2>/dev/null | grep -qE '<subagent_reminder>|is a subagent|sender=' 2>/dev/null; then
     respond_and_exit "allow" "subagent_transcript"
   fi
 fi
@@ -90,6 +93,11 @@ res_session="$(sed -n -E 's/^(session|session_name)=//p' "$resident_marker" 2>/d
 cur_pane="${TMUX_PANE:-}"
 if [[ -z "$cur_pane" || -z "$res_pane_id" || "$cur_pane" != "$res_pane_id" ]]; then
   respond_and_exit "allow" "pane_mismatch"
+fi
+
+# transcript 경로를 상주 워커 파일에 기록 (watchdog 연동용)
+if [[ -n "$trans_path" && -f "$trans_path" && -d "$runtime/workers" ]]; then
+  printf '%s\n' "$trans_path" > "$runtime/workers/agy.transcript" 2>/dev/null || true
 fi
 
 busy_file="$runtime/workers/agy.busy"
@@ -135,19 +143,22 @@ if ! grep -q '^mode=resident' "$state_file" 2>/dev/null || ! grep -q '^status=ru
   respond_and_exit "allow" "status_changed_under_lock"
 fi
 
-# 9. 성공/에러 판정 및 이벤트 발행
+# 9. 에러/중단 여부 확인 (terminationReason 또는 error 필드)
+is_term_error=false
 final_kind="done"
 summary="Task completed"
 exit_code=0
 
 case "$term_reason" in
   error|interrupted|INTERRUPTED|cancel|cancelled|canceled|user_cancel*|timeout|max_steps_exceeded)
+    is_term_error=true
     final_kind="error"
     summary="Agy execution error or interrupted: ${err_msg:-$term_reason}"
     exit_code=1
     ;;
   *)
     if [[ -n "$err_msg" && "$err_msg" != "null" ]]; then
+      is_term_error=true
       final_kind="error"
       summary="Agy execution error: $err_msg"
       exit_code=1
@@ -155,6 +166,204 @@ case "$term_reason" in
     ;;
 esac
 
+# 10. 정상 종료 시: 트랜스크립트 센티널 검사
+if [[ "$is_term_error" == "false" ]]; then
+  # trans_path 폴백 탐색 (payload에 없거나 유효하지 않은 경우)
+  if [[ -z "$trans_path" || ! -f "$trans_path" ]]; then
+    if [[ -n "$conv_id" ]]; then
+      for cand in \
+        "$HOME/.gemini/antigravity-cli/brain/$conv_id/.system_generated/logs/transcript_full.jsonl" \
+        "$HOME/.gemini/antigravity-cli/brain/$conv_id/.system_generated/logs/transcript.jsonl" \
+        "${REAL_HOME:-$HOME}/.gemini/antigravity-cli/brain/$conv_id/.system_generated/logs/transcript_full.jsonl" \
+        "${REAL_HOME:-$HOME}/.gemini/antigravity-cli/brain/$conv_id/.system_generated/logs/transcript.jsonl"; do
+        if [[ -f "$cand" ]]; then
+          trans_path="$cand"
+          break
+        fi
+      done
+    fi
+    if [[ -z "$trans_path" || ! -f "$trans_path" ]] && [[ -f "$runtime/workers/agy.transcript" ]]; then
+      cand="$(head -n 1 "$runtime/workers/agy.transcript" 2>/dev/null | tr -d '\r\n')"
+      if [[ -f "$cand" ]]; then
+        trans_path="$cand"
+      fi
+    fi
+  fi
+
+  # started_epoch 추출 (state_file 우선, 없으면 busy_file 2번째 줄, 실패 시 0)
+  started_epoch="$(sed -n 's/^started_epoch=//p' "$state_file" 2>/dev/null | head -n 1 | tr -d '\r\n')"
+  if [[ -z "$started_epoch" || ! "$started_epoch" =~ ^[0-9]+$ ]]; then
+    started_epoch="$(sed -n '2p' "$busy_file" 2>/dev/null | tr -d '\r\n')"
+  fi
+  if [[ ! "$started_epoch" =~ ^[0-9]+$ ]]; then
+    started_epoch="0"
+  fi
+
+  # 센티널 파싱 (python3)
+  sentinel_type="NONE"
+  sentinel_rest=""
+  sentinel_found_id=""
+  if [[ -n "$trans_path" && -f "$trans_path" ]]; then
+    {
+      read -r sentinel_type || sentinel_type="NONE"
+      read -r sentinel_rest || sentinel_rest=""
+      read -r sentinel_found_id || sentinel_found_id=""
+    } < <(python3 -c '
+import sys, json, os, re
+from datetime import datetime, timezone
+
+def parse_created_at(ts_str):
+    if not ts_str or not isinstance(ts_str, str):
+        return None
+    ts = ts_str.strip()
+    try:
+        if ts.endswith("Z"):
+            ts = ts[:-1] + "+00:00"
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+trans_path = sys.argv[1]
+task_id = sys.argv[2]
+started_epoch = 0.0
+if len(sys.argv) > 3:
+    try:
+        started_epoch = float(sys.argv[3])
+    except Exception:
+        started_epoch = 0.0
+
+if not trans_path or not os.path.isfile(trans_path):
+    print("NONE\n")
+    sys.exit(0)
+
+full_path = trans_path
+if trans_path.endswith("transcript.jsonl"):
+    cand = trans_path[:-len("transcript.jsonl")] + "transcript_full.jsonl"
+    if os.path.isfile(cand):
+        full_path = cand
+
+last_model_text = None
+
+try:
+    with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+        # Check first 5 lines for subagent indicator
+        for _ in range(5):
+            line = f.readline()
+            if not line:
+                break
+            if any(k in line for k in ("<subagent_reminder>", "is a subagent", "sender=")):
+                print("SUBAGENT\n")
+                sys.exit(0)
+        f.seek(0)
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            stype = obj.get("type")
+            source = obj.get("source")
+            if stype in ("USER_INPUT", "SYSTEM_MESSAGE", "CHECKPOINT", "GENERIC"):
+                continue
+            if source == "MODEL" or stype == "PLANNER_RESPONSE":
+                c = obj.get("content")
+                if c and isinstance(c, str) and c.strip():
+                    created_at_raw = obj.get("created_at")
+                    created_epoch = parse_created_at(created_at_raw)
+                    # 타임스탬프 가드: started_epoch 이전 생성된 모델 응답은 이전 작업 잔여물이므로 배제
+                    if created_epoch is not None and started_epoch > 0 and created_epoch < started_epoch:
+                        continue
+                    last_model_text = c
+except Exception:
+    print("NONE\n")
+    sys.exit(0)
+
+if not last_model_text:
+    print("NONE\n")
+    sys.exit(0)
+
+pattern = re.compile(r"^\s*\[\[(DONE|BLOCKED)\s+([a-zA-Z0-9_\-\.]+)\s*\]\](.*)$")
+matched_type = None
+matched_rest = ""
+matched_id = ""
+
+for line in reversed(last_model_text.splitlines()):
+    m = pattern.match(line)
+    if m:
+        stype, tid, rest = m.group(1), m.group(2), m.group(3).strip()
+        matched_type = stype
+        matched_id = tid
+        matched_rest = rest
+        break
+
+if matched_type:
+    print(matched_type)
+    print(matched_rest)
+    print(matched_id)
+else:
+    print("NONE\n")
+' "$trans_path" "$task_id" "$started_epoch" 2>/dev/null || echo "NONE")
+  fi
+
+  mismatch_tag=""
+  if [[ "$sentinel_type" == "DONE" || "$sentinel_type" == "BLOCKED" ]]; then
+    if [[ -n "$sentinel_found_id" && "$sentinel_found_id" != "$task_id" ]]; then
+      mismatch_tag="sentinel_id_mismatch_accepted (found: $sentinel_found_id, current: $task_id)"
+      if [[ "${ACC_HOOK_DEBUG:-0}" == "1" && -n "$runtime" && -d "$runtime" ]]; then
+        printf '[%s] tag=%s\n' "$(date +%s)" "$mismatch_tag" >> "$runtime/hook-debug.log" 2>/dev/null || true
+      fi
+    fi
+  fi
+
+  case "$sentinel_type" in
+    SUBAGENT)
+      flock -u "$term_fd" 2>/dev/null || true
+      [[ -n "$term_fd" ]] && exec {term_fd}>&-
+      respond_and_exit "allow" "subagent_transcript"
+      ;;
+    DONE)
+      final_kind="done"
+      if [[ -n "$sentinel_rest" ]]; then
+        summary="Task completed: $sentinel_rest"
+      else
+        summary="Task completed"
+      fi
+      exit_code=0
+      ;;
+    BLOCKED)
+      final_kind="error"
+      if [[ -n "$sentinel_rest" ]]; then
+        summary="Task blocked: $sentinel_rest"
+      else
+        summary="Task blocked"
+      fi
+      exit_code=1
+      ;;
+    *)
+      # 센티널 부재: deadline 확인
+      now="$(date +%s)"
+      deadline_epoch="$(sed -n 's/^deadline_epoch=//p' "$state_file" 2>/dev/null | head -n 1 | tr -d '\r\n')"
+      if [[ -n "$deadline_epoch" && "$deadline_epoch" =~ ^[0-9]+$ ]] && (( now > deadline_epoch )); then
+        # 기한 초과: timeout 에러 발행 및 종료
+        final_kind="error"
+        summary="Task deadline exceeded (${now} > ${deadline_epoch}): timeout"
+        exit_code=124
+      else
+        # 기한 내 센티널 부재: 작업을 running 상태로 유지하고 정상 대기
+        flock -u "$term_fd" 2>/dev/null || true
+        [[ -n "$term_fd" ]] && exec {term_fd}>&-
+        respond_and_exit "allow" "sentinel_missing_keep_running"
+      fi
+      ;;
+  esac
+fi
+
+# 11. 완료 또는 에러 이벤트 발행
 detail_path="${trans_path:-$task_dir/output.log}"
 term_evt_id="${task_id}-terminal"
 
@@ -165,7 +374,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # event-emit.sh 호출 (Durable Outbox 및 FIFO 펄스)
 if eval "\"$HERE/bin/event-emit.sh\" agy \"$final_kind\" \"$task_id\" \"$summary\" \"$detail_path\" \"$term_evt_id\" ${term_fd}>&-"; then
-  # 10. 작업 상태 갱신
+  # 12. 작업 상태 갱신
   completed_epoch="$(date +%s)"
   tmp_state="$state_file.tmp.$$"
   {
@@ -176,7 +385,7 @@ if eval "\"$HERE/bin/event-emit.sh\" agy \"$final_kind\" \"$task_id\" \"$summary
   } > "$tmp_state"
   mv "$tmp_state" "$state_file"
 
-  # 11. busy 파일 및 락 해제
+  # 13. busy 파일 및 락 해제
   if [[ -f "$busy_file" ]] && grep -q "^$task_id$" "$busy_file" 2>/dev/null; then
     rm -f "$busy_file"
   fi
@@ -186,4 +395,8 @@ fi
 flock -u "$term_fd" 2>/dev/null || true
 [[ -n "$term_fd" ]] && exec {term_fd}>&-
 
-respond_and_exit "allow" "event_emitted"
+if [[ -n "$mismatch_tag" ]]; then
+  respond_and_exit "allow" "$mismatch_tag"
+else
+  respond_and_exit "allow" "event_emitted"
+fi

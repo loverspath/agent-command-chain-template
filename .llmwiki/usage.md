@@ -183,7 +183,16 @@ AGY_MODE=resident SESSION_NAME=agentchain-v2 ./bin/dispatch.sh agy --prompt-file
 AGY_MODE=resident SESSION_NAME=agentchain-v2 ./bin/dispatch.sh agy --dry-run
 ```
 
-#### 4. 유휴 시점 컨텍스트 소거 (/clear) 및 1줄 재무장
+#### 4. 상주 완료 판정 및 규약 D (Sentinel Protocol)
+상주 agy 환경에서는 Antigravity CLI의 Stop 라이프사이클 훅이 메인 에이전트의 중간 턴 종료(예: 서브에이전트 위임 직후 또는 일시 정지) 시점에도 호출될 수 있습니다. 조기 완료 오판정을 방지하기 위해 다음 원칙이 적용됩니다:
+- **완료 센티널 유연 판정 (이름 ID 허용)**: 본체 트랜스크립트의 마지막 모델 응답(`PLANNER_RESPONSE` 또는 `source == "MODEL"`) 단독 행에 `[[DONE <id>]]` 또는 `[[BLOCKED <id>]]`가 존재하면, 지시서가 논리적 이름 ID(예: `[[DONE some-named-task]]`)나 실제 발급된 태스크 ID 중 무엇을 사용했더라도 완료/차단 이벤트가 정상 발행됩니다 (식별자 불일치 시 `ACC_HOOK_DEBUG=1`에 태그 로깅, summary에는 센티널 뒷부분 텍스트 유지).
+- **이전 작업 센티널 오탐 방지 가드**: 동일 세션 내 이전 작업의 잔여 센티널에 의한 오탐을 방어하기 위해, 모델 응답의 `created_at` 타임스탬프가 현재 작업의 `started_epoch` 이후인 응답만 유효한 센티널 후보로 검증합니다(`created_at < started_epoch`인 응답은 무시/배제).
+- **센티널 부재 시 대기**: 센티널이 없으면 작업을 `running` 상태로 유지하며, 작업 마감 시각(`deadline_epoch`) 초과 시 `timeout` 에러 이벤트가 발행됩니다.
+- **규약 D 자동 주입**: `bin/dispatch.sh` 실행 시 agy 지시서 꼬리말에 규약 D가 자동 주입됩니다:
+  > "서브에이전트를 쓰더라도 본체는 모든 서브에이전트가 끝나 결과를 받을 때까지 턴을 종료하지 말고, 최종 보고 후 마지막 줄에 [[DONE <task_id>]] result=… | learning=…(막히면 [[BLOCKED <task_id>]] reason=…)를 출력한 뒤에만 종료하라. 센티널은 최종 응답에만 쓰고 중간 응답·서브에이전트 지시에는 쓰지 마라."
+- **에러 즉시 감지**: CLI 에러 또는 사용자 중단(`terminationReason`) 발생 시 센티널 유무와 무관하게 즉시 `error` 이벤트가 발행됩니다.
+
+#### 5. 유휴 시점 컨텍스트 소거 (/clear) 및 1줄 재무장
 워커가 유휴 상태(`workers/agy.busy` 부재)일 때 대화 맥락을 소거하고 역할을 재장착한다:
 ```bash
 # 1. /clear 전송 후 1초 대기
