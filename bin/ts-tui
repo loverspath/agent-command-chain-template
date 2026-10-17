@@ -1,0 +1,1679 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# ==============================================================================
+# ts-tui: Tokyo Night 테마의 세련된 TMUX & 에이전트 체인 관리 TUI
+# ==============================================================================
+# 디자인 및 레이아웃 참조 도구:
+#   - lazygit: 2단 분할 레이아웃, 하단 상시 키 가이드, 상황별 동적 한국어 설명
+#   - btop: 라운드 박스 테두리(╭─╮), Tokyo Night 컬러 팔레트, 상태 인디케이터(●)
+#   - k9s: 상단 리소스 요약 뱃지, 실시간 자동 리프레시, 상태별 컬러 태그
+#   - zellij: 하단 모드/상태 바, 유려한 윈도우/프로세스 정보 렌더링
+# ==============================================================================
+
+import os
+import sys
+import glob
+import time
+import curses
+import subprocess
+import unicodedata
+from datetime import datetime
+
+# 심볼릭 링크 안전 해석
+SCRIPT_PATH = os.path.realpath(__file__)
+BIN_DIR = os.path.dirname(SCRIPT_PATH)
+TEMPLATE_ROOT = os.path.abspath(os.path.join(BIN_DIR, ".."))
+
+
+# ------------------------------------------------------------------------------
+# 1. 모바일 및 두벌식(QWERTY) 한글 키 매핑 테이블 및 정규화 유틸리티
+# ------------------------------------------------------------------------------
+HANGUL_DUBEOLSIK_MAP = {
+    # 자음 (기본 호환 자모: U+3131 ~ U+314E)
+    'ㄱ': 'r', 'ㄲ': 'R', 'ㄳ': 'r',
+    'ㄴ': 's', 'ㄵ': 's', 'ㄶ': 's',
+    'ㄷ': 'e', 'ㄸ': 'E',
+    'ㄹ': 'f', 'ㄺ': 'f', 'ㄻ': 'f', 'ㄼ': 'f', 'ㄽ': 'f', 'ㄾ': 'f', 'ㄿ': 'f', 'ㅀ': 'f',
+    'ㅁ': 'a',
+    'ㅂ': 'q', 'ㅃ': 'Q', 'ㅄ': 'q',
+    'ㅅ': 't', 'ㅆ': 'T',
+    'ㅇ': 'd',
+    'ㅈ': 'w', 'ㅉ': 'W',
+    'ㅊ': 'c',
+    'ㅋ': 'z',
+    'ㅌ': 'x',
+    'ㅍ': 'v',
+    'ㅎ': 'g',
+    # 모음 (기본 호환 자모: U+314F ~ U+3163)
+    'ㅏ': 'k',
+    'ㅐ': 'o',
+    'ㅑ': 'i',
+    'ㅒ': 'O',
+    'ㅓ': 'j',
+    'ㅔ': 'p',
+    'ㅕ': 'u',
+    'ㅖ': 'P',
+    'ㅗ': 'h', 'ㅘ': 'h', 'ㅙ': 'h', 'ㅚ': 'h',
+    'ㅛ': 'y',
+    'ㅜ': 'n', 'ㅝ': 'n', 'ㅞ': 'n', 'ㅟ': 'n',
+    'ㅠ': 'b',
+    'ㅡ': 'm', 'ㅢ': 'm',
+    'ㅣ': 'l',
+
+    # 초성 자모 (U+1100 ~ U+1112)
+    '\u1100': 'r', '\u1101': 'R', '\u1102': 's', '\u1103': 'e', '\u1104': 'E',
+    '\u1105': 'f', '\u1106': 'a', '\u1107': 'q', '\u1108': 'Q', '\u1109': 't',
+    '\u110a': 'T', '\u110b': 'd', '\u110c': 'w', '\u110d': 'W', '\u110e': 'c',
+    '\u110f': 'z', '\u1110': 'x', '\u1111': 'v', '\u1112': 'g',
+
+    # 중성 모음 (U+1161 ~ U+1175)
+    '\u1161': 'k', '\u1162': 'o', '\u1163': 'i', '\u1164': 'O', '\u1165': 'j',
+    '\u1166': 'p', '\u1167': 'u', '\u1168': 'P', '\u1169': 'h', '\u116b': 'y',
+    '\u116e': 'n', '\u1172': 'b', '\u1173': 'm', '\u1175': 'l'
+}
+
+def normalize_key_input(raw_key):
+    """
+    curses 입력 키(int 또는 str)를 표준 영문/명령 심볼로 정규화.
+    모바일 한글 키보드(두벌식) 입력을 QWERTY 키 코드로 매핑.
+    """
+    if isinstance(raw_key, str):
+        # 1. 특수 문자열 키
+        if raw_key in ('\n', '\r'):
+            return "ENTER"
+        elif raw_key == '\t':
+            return "TAB"
+        elif raw_key == '\x1b':
+            return "ESC"
+
+        # 2. 한글 자모 직접 매핑
+        if raw_key in HANGUL_DUBEOLSIK_MAP:
+            return HANGUL_DUBEOLSIK_MAP[raw_key]
+
+        # 3. 완성형 한글 음절 (예: '가', '너', '구') 분해 후 첫 자모 변환
+        nfd = unicodedata.normalize('NFD', raw_key)
+        if nfd and nfd[0] in HANGUL_DUBEOLSIK_MAP:
+            return HANGUL_DUBEOLSIK_MAP[nfd[0]]
+
+        return raw_key
+
+    elif isinstance(raw_key, int):
+        # 특수 Curses 키 상수 매핑
+        if raw_key in (10, 13, curses.KEY_ENTER):
+            return "ENTER"
+        elif raw_key == 9:
+            return "TAB"
+        elif raw_key == 27:
+            return "ESC"
+        elif raw_key == curses.KEY_UP:
+            return "UP"
+        elif raw_key == curses.KEY_DOWN:
+            return "DOWN"
+        elif raw_key == curses.KEY_RESIZE:
+            return "RESIZE"
+        elif raw_key == curses.KEY_HOME:
+            return "HOME"
+        elif raw_key == curses.KEY_END:
+            return "END"
+        elif raw_key == curses.KEY_F5:
+            return "F5"
+        elif raw_key in (curses.KEY_DC, curses.KEY_BACKSPACE):
+            return "BACKSPACE"
+
+        try:
+            ch_str = chr(raw_key)
+            return normalize_key_input(ch_str)
+        except (ValueError, OverflowError):
+            return raw_key
+
+    return raw_key
+
+
+# ------------------------------------------------------------------------------
+# 2. 문자열 폭 계산 및 안전한 Curses 출력 유틸리티 (한글/전각 문자 완벽 대응)
+# ------------------------------------------------------------------------------
+class StrUtil:
+    @staticmethod
+    def char_width(c):
+        """동아시아 전각 문자 폭 계산 (한글/한자 등은 폭 2, 영문/기호는 1)"""
+        eaw = unicodedata.east_asian_width(c)
+        if eaw in ('F', 'W'):
+            return 2
+        return 1
+
+    @classmethod
+    def str_width(cls, s):
+        """문자열의 실제 터미널 표시 칼럼 폭 계산"""
+        if not s:
+            return 0
+        return sum(cls.char_width(c) for c in s)
+
+    @classmethod
+    def truncate(cls, s, max_width, suffix="…"):
+        """지정한 칼럼 폭을 초과하지 않도록 문자열을 안전하게 자름"""
+        if not s or max_width <= 0:
+            return ""
+        if cls.str_width(s) <= max_width:
+            return s
+        
+        suf_w = cls.str_width(suffix)
+        target = max_width - suf_w
+        if target <= 0:
+            target = max_width
+            suffix = ""
+
+        cur = 0
+        buf = []
+        for c in s:
+            cw = cls.char_width(c)
+            if cur + cw > target:
+                break
+            buf.append(c)
+            cur += cw
+        return "".join(buf) + suffix
+
+    @classmethod
+    def pad(cls, s, width, align="left"):
+        """전각 문자를 고려하여 정확한 칼럼 폭으로 공백 패딩"""
+        sw = cls.str_width(s)
+        if sw >= width:
+            return cls.truncate(s, width, suffix="")
+        diff = width - sw
+        if align == "right":
+            return (" " * diff) + s
+        elif align == "center":
+            left = diff // 2
+            right = diff - left
+            return (" " * left) + s + (" " * right)
+        return s + (" " * diff)
+
+    @classmethod
+    def safe_addstr(cls, win, y, x, text, attr=0, max_w=None):
+        """윈도우 경계를 벗어나거나 마지막 셀에서 오류가 발생하지 않도록 안전 출력"""
+        try:
+            h, w = win.getmaxyx()
+            if y < 0 or y >= h or x < 0 or x >= w:
+                return
+            avail = w - x
+            if max_w is not None:
+                avail = min(avail, max_w)
+            if avail <= 0:
+                return
+            
+            truncated = cls.truncate(text, avail, suffix="")
+            # 하단 맨 오른쪽 셀에서 curses.error 발생 방지
+            if y == h - 1 and x + cls.str_width(truncated) >= w:
+                truncated = cls.truncate(truncated, avail - 1, suffix="")
+            
+            if truncated:
+                win.addstr(y, x, truncated, attr)
+        except curses.error:
+            pass
+
+
+# ------------------------------------------------------------------------------
+# 2. Tokyo Night 테마 엔진 (curses 256색 및 기본 색상 완벽 대응)
+# ------------------------------------------------------------------------------
+class TokyoNightTheme:
+    """Tokyo Night 팔레트를 curses 색상 쌍으로 관리"""
+    def __init__(self):
+        self.has_colors = False
+        self.can_change = False
+        self.use_def_colors = False
+
+        # 페어 ID 정의
+        self.PAIR_NORMAL = 1
+        self.PAIR_HEADER = 2
+        self.PAIR_PURPLE = 3
+        self.PAIR_GREEN = 4
+        self.PAIR_YELLOW = 5
+        self.PAIR_RED = 6
+        self.PAIR_GRAY = 7
+        self.PAIR_MUTED = 8
+        self.PAIR_SEL = 9
+        self.PAIR_SEL_PURPLE = 10
+        self.PAIR_SEL_GREEN = 11
+        self.PAIR_SEL_YELLOW = 12
+        self.PAIR_CYAN = 13
+        self.PAIR_ORANGE = 14
+        self.PAIR_KEY_BADGE = 15
+        self.PAIR_BADGE_CHAIN = 16
+        self.PAIR_BADGE_TMUX = 17
+        self.PAIR_BADGE_DOWN = 18
+        self.PAIR_BOX_ACTIVE = 19
+        self.PAIR_BOX_INACTIVE = 20
+
+    def init_theme(self):
+        self.has_colors = curses.has_colors()
+        if not self.has_colors:
+            return
+
+        curses.start_color()
+        try:
+            curses.use_default_colors()
+            self.use_def_colors = True
+        except Exception:
+            self.use_def_colors = False
+
+        self.can_change = curses.can_change_color()
+        num_colors = curses.COLORS
+        bg = -1 if self.use_def_colors else curses.COLOR_BLACK
+
+        # 1) can_change_color 지원 시 Tokyo Night 정밀 RGB 정의
+        if self.can_change and num_colors >= 256:
+            palette = {
+                16: (102, 106, 149),  # #1a1b26 (Tokyo Night BG)
+                17: (753, 792, 961),  # #c0caf5 (FG Text)
+                18: (733, 604, 969),  # #bb9af7 (Purple / Highlight)
+                19: (478, 635, 969),  # #7aa2f7 (Blue / Header)
+                20: (620, 808, 416),  # #9ece6a (Green / Success / Active)
+                21: (878, 686, 408),  # #e0af68 (Yellow / Attention / Attached)
+                22: (969, 463, 557),  # #f7768e (Red / Error / Kill)
+                23: (337, 373, 537),  # #565f89 (Gray / Border)
+                24: (180, 200, 302),  # #283457 (Selection BG)
+                25: (490, 812, 1000), # #7dcfff (Cyan / Info)
+                26: (1000, 620, 392), # #ff9e64 (Orange / Notice)
+                27: (231, 259, 380),  # #3b4261 (Dark Gray)
+            }
+            try:
+                for cid, (r, g, b) in palette.items():
+                    curses.init_color(cid, r, g, b)
+                c_fg, c_purple, c_blue = 17, 18, 19
+                c_green, c_yellow, c_red = 20, 21, 22
+                c_gray, c_sel_bg, c_cyan = 23, 24, 25
+                c_orange, c_dark_gray = 26, 27
+            except Exception:
+                self._fallback_256(bg)
+                return
+        elif num_colors >= 256:
+            self._fallback_256(bg)
+            return
+        else:
+            self._fallback_16(bg)
+            return
+
+        # 컬러 페어 바인딩 (커스텀 RGB)
+        self._bind_pairs(bg, c_fg, c_purple, c_blue, c_green, c_yellow,
+                         c_red, c_gray, c_sel_bg, c_cyan, c_orange, c_dark_gray)
+
+    def _fallback_256(self, bg):
+        """256색 팔레트 근사값"""
+        c_fg = 189          # #d7d7ff
+        c_purple = 183      # #dfafff
+        c_blue = 111        # #87afff
+        c_green = 150       # #afd787
+        c_yellow = 221      # #ffd75f
+        c_red = 204         # #ff5f87
+        c_gray = 60         # #5f5f87
+        c_sel_bg = 237      # #3a3a3a
+        c_cyan = 117        # #87d7ff
+        c_orange = 215      # #ffaf5f
+        c_dark_gray = 238   # #444444
+        self._bind_pairs(bg, c_fg, c_purple, c_blue, c_green, c_yellow,
+                         c_red, c_gray, c_sel_bg, c_cyan, c_orange, c_dark_gray)
+
+    def _fallback_16(self, bg):
+        """8/16 기본 ANSI 색상 폴백"""
+        c_fg = curses.COLOR_WHITE
+        c_purple = curses.COLOR_MAGENTA
+        c_blue = curses.COLOR_CYAN
+        c_green = curses.COLOR_GREEN
+        c_yellow = curses.COLOR_YELLOW
+        c_red = curses.COLOR_RED
+        c_gray = curses.COLOR_WHITE
+        c_sel_bg = curses.COLOR_BLUE
+        c_cyan = curses.COLOR_CYAN
+        c_orange = curses.COLOR_YELLOW
+        c_dark_gray = curses.COLOR_BLACK
+        self._bind_pairs(bg, c_fg, c_purple, c_blue, c_green, c_yellow,
+                         c_red, c_gray, c_sel_bg, c_cyan, c_orange, c_dark_gray)
+
+    def _bind_pairs(self, bg, c_fg, c_purple, c_blue, c_green, c_yellow,
+                    c_red, c_gray, c_sel_bg, c_cyan, c_orange, c_dark_gray):
+        try:
+            curses.init_pair(self.PAIR_NORMAL, c_fg, bg)
+            curses.init_pair(self.PAIR_HEADER, c_blue, bg)
+            curses.init_pair(self.PAIR_PURPLE, c_purple, bg)
+            curses.init_pair(self.PAIR_GREEN, c_green, bg)
+            curses.init_pair(self.PAIR_YELLOW, c_yellow, bg)
+            curses.init_pair(self.PAIR_RED, c_red, bg)
+            curses.init_pair(self.PAIR_GRAY, c_gray, bg)
+            curses.init_pair(self.PAIR_MUTED, c_dark_gray, bg)
+            
+            # 선택 커서 페어
+            curses.init_pair(self.PAIR_SEL, c_fg, c_sel_bg)
+            curses.init_pair(self.PAIR_SEL_PURPLE, c_purple, c_sel_bg)
+            curses.init_pair(self.PAIR_SEL_GREEN, c_green, c_sel_bg)
+            curses.init_pair(self.PAIR_SEL_YELLOW, c_yellow, c_sel_bg)
+
+            # 강조 & 정보
+            curses.init_pair(self.PAIR_CYAN, c_cyan, bg)
+            curses.init_pair(self.PAIR_ORANGE, c_orange, bg)
+            
+            # 뱃지 및 박스
+            curses.init_pair(self.PAIR_KEY_BADGE, c_cyan, c_dark_gray)
+            curses.init_pair(self.PAIR_BADGE_CHAIN, c_fg, c_purple)
+            curses.init_pair(self.PAIR_BADGE_TMUX, c_fg, c_blue)
+            curses.init_pair(self.PAIR_BADGE_DOWN, c_fg, c_gray)
+            curses.init_pair(self.PAIR_BOX_ACTIVE, c_purple, bg)
+            curses.init_pair(self.PAIR_BOX_INACTIVE, c_gray, bg)
+        except Exception:
+            pass
+
+    def attr(self, name, bold=False, dim=False):
+        """페어 이름과 속성을 조합하여 반환"""
+        if not self.has_colors:
+            a = curses.A_NORMAL
+            if bold: a |= curses.A_BOLD
+            if dim: a |= curses.A_DIM
+            return a
+
+        pair_map = {
+            "normal": self.PAIR_NORMAL,
+            "header": self.PAIR_HEADER,
+            "purple": self.PAIR_PURPLE,
+            "green": self.PAIR_GREEN,
+            "yellow": self.PAIR_YELLOW,
+            "red": self.PAIR_RED,
+            "gray": self.PAIR_GRAY,
+            "muted": self.PAIR_MUTED,
+            "sel": self.PAIR_SEL,
+            "sel_purple": self.PAIR_SEL_PURPLE,
+            "sel_green": self.PAIR_SEL_GREEN,
+            "sel_yellow": self.PAIR_SEL_YELLOW,
+            "cyan": self.PAIR_CYAN,
+            "orange": self.PAIR_ORANGE,
+            "key_badge": self.PAIR_KEY_BADGE,
+            "badge_chain": self.PAIR_BADGE_CHAIN,
+            "badge_tmux": self.PAIR_BADGE_TMUX,
+            "badge_down": self.PAIR_BADGE_DOWN,
+            "box_active": self.PAIR_BOX_ACTIVE,
+            "box_inactive": self.PAIR_BOX_INACTIVE,
+        }
+        pid = pair_map.get(name, self.PAIR_NORMAL)
+        res = curses.color_pair(pid)
+        if bold:
+            res |= curses.A_BOLD
+        if dim:
+            res |= curses.A_DIM
+        return res
+
+
+# ------------------------------------------------------------------------------
+# 3. 데이터 모델 및 정보 수집기 (Tmux & Agent Chain Runtime)
+# ------------------------------------------------------------------------------
+class SessionInfo:
+    def __init__(self, name):
+        self.name = name
+        self.is_active = False           # tmux에 현재 살아있는지
+        self.is_chain = False            # 에이전트 체인인지
+        self.is_down_candidate = False   # 종료된 체인 복구 후보인지
+        self.windows_count = 0
+        self.attached = False
+        self.created_ts = 0
+        self.created_fmt = ""
+        self.windows = []                # list of dict(idx, name, active, cmd, path)
+        
+        # 체인 전용 정보
+        self.runtime_dir = None
+        self.instance_file = None
+        self.project_dir = None
+        self.work_dir = None
+        self.handoff_file = None
+        self.watchdog_pid = None
+        self.watchdog_alive = False
+        self.listener_pid = None
+        self.listener_alive = False
+        self.pending_events = 0
+        self.busy_workers = []
+        self.recent_tasks = []
+        self.supervisor_session_id = None
+
+
+class DataCollector:
+    @staticmethod
+    def is_pid_alive(pid_file):
+        """PID 파일의 프로세스 실제 생존 여부 확인"""
+        if not pid_file or not os.path.isfile(pid_file):
+            return None, False
+        try:
+            with open(pid_file, "r") as f:
+                content = f.read().strip()
+                if not content:
+                    return None, False
+                pid = int(content)
+            os.kill(pid, 0)
+            return pid, True
+        except (ValueError, OSError, ProcessLookupError, PermissionError):
+            return None, False
+
+    @classmethod
+    def get_all_sessions(cls):
+        """실행 중인 tmux 세션 및 디스크 상의 복구 가능한 체인 세션 목록 통합 수집"""
+        sessions_map = {}
+
+        # 1. tmux list-sessions 수집
+        t_res = subprocess.run(
+            ["tmux", "list-sessions", "-F", "#{session_name}|#{session_windows}|#{session_attached}|#{session_created}"],
+            capture_output=True, text=True
+        )
+        if t_res.returncode == 0:
+            for line in t_res.stdout.strip().splitlines():
+                if not line:
+                    continue
+                parts = line.split("|")
+                if len(parts) < 4:
+                    continue
+                s_name = parts[0]
+                s = SessionInfo(s_name)
+                s.is_active = True
+                s.windows_count = int(parts[1]) if parts[1].isdigit() else 0
+                s.attached = (int(parts[2]) > 0) if parts[2].isdigit() else False
+                s.created_ts = int(parts[3]) if parts[3].isdigit() else 0
+                if s.created_ts > 0:
+                    try:
+                        s.created_fmt = datetime.fromtimestamp(s.created_ts).strftime("%m/%d %H:%M")
+                    except Exception:
+                        s.created_fmt = "-"
+                
+                # 윈도우 상세 정보 수집
+                cls._collect_windows(s)
+                # 체인 런타임 여부 수집
+                cls._collect_chain_details(s)
+
+                sessions_map[s_name] = s
+
+        # 2. instances/ 및 runtime/ 탐색하여 Inactive (다운) 후보 수집
+        known_instances = set()
+        
+        # instances/*.env
+        for f in glob.glob(os.path.join(TEMPLATE_ROOT, "instances", "*.env")):
+            cand = os.path.basename(f)[:-4]
+            if cand:
+                known_instances.add(cand)
+
+        # runtime/*/session_name
+        for sn_file in glob.glob(os.path.join(TEMPLATE_ROOT, "runtime", "*", "session_name")):
+            try:
+                with open(sn_file, "r") as f:
+                    cand = f.readline().strip()
+                    if cand:
+                        known_instances.add(cand)
+            except Exception:
+                pass
+
+        for cand in sorted(known_instances):
+            if cand not in sessions_map:
+                s = SessionInfo(cand)
+                s.is_active = False
+                s.is_chain = True
+                s.is_down_candidate = True
+                cls._collect_chain_details(s)
+                sessions_map[cand] = s
+
+        # 정렬: 살아있는 세션 우선, 그 다음 복구 후보
+        active_list = [s for s in sessions_map.values() if s.is_active]
+        active_list.sort(key=lambda x: (0 if x.is_chain else 1, x.name))
+        
+        down_list = [s for s in sessions_map.values() if not s.is_active]
+        down_list.sort(key=lambda x: x.name)
+
+        return active_list + down_list
+
+    @classmethod
+    def _collect_windows(cls, s):
+        """특정 세션의 윈도우 및 프로세스 목록 파싱"""
+        w_res = subprocess.run(
+            ["tmux", "list-windows", "-t", s.name, "-F",
+             "#{window_index}|#{window_name}|#{window_active}|#{pane_current_command}|#{pane_current_path}|#{window_panes}"],
+            capture_output=True, text=True
+        )
+        if w_res.returncode == 0:
+            windows = []
+            for line in w_res.stdout.strip().splitlines():
+                if not line:
+                    continue
+                parts = line.split("|")
+                if len(parts) >= 6:
+                    windows.append({
+                        "idx": parts[0],
+                        "name": parts[1],
+                        "active": (parts[2] == "1"),
+                        "cmd": parts[3],
+                        "path": parts[4],
+                        "panes": parts[5]
+                    })
+            s.windows = windows
+
+    @classmethod
+    def _collect_chain_details(cls, s):
+        """체인 런타임, 인스턴스 파일, 워치독/리스너, 태스크 상태 조회"""
+        rt = None
+        # 1. tmux 환경변수 ACC_RUNTIME 확인
+        if s.is_active:
+            env_res = subprocess.run(
+                ["tmux", "show-environment", "-t", s.name, "ACC_RUNTIME"],
+                capture_output=True, text=True
+            )
+            for line in env_res.stdout.splitlines():
+                if line.startswith("ACC_RUNTIME="):
+                    val = line.split("=", 1)[1].strip()
+                    if os.path.isdir(val):
+                        rt = val
+                        break
+
+        # 2. instances/<name>.env 확인
+        inst_file = os.path.join(TEMPLATE_ROOT, "instances", f"{s.name}.env")
+        if os.path.isfile(inst_file):
+            s.instance_file = inst_file
+            s.is_chain = True
+            if not rt:
+                try:
+                    with open(inst_file, "r") as f:
+                        for l in f:
+                            if l.startswith("ACC_RUNTIME="):
+                                r_val = l.split("=", 1)[1].strip().strip('"\'')
+                                if os.path.isdir(r_val):
+                                    rt = r_val
+                            elif l.startswith("PROJECT_DIR="):
+                                s.project_dir = l.split("=", 1)[1].strip().strip('"\'')
+                            elif l.startswith("WORK_DIR="):
+                                s.work_dir = l.split("=", 1)[1].strip().strip('"\'')
+                            elif l.startswith("HANDOFF_FILE="):
+                                s.handoff_file = l.split("=", 1)[1].strip().strip('"\'')
+                except Exception:
+                    pass
+
+        # 3. runtime/*/session_name 탐색 (fallback)
+        if not rt:
+            for d in glob.glob(os.path.join(TEMPLATE_ROOT, "runtime", "*")):
+                sn_p = os.path.join(d, "session_name")
+                if os.path.isfile(sn_p):
+                    try:
+                        with open(sn_p, "r") as f:
+                            if f.readline().strip() == s.name:
+                                rt = d
+                                s.is_chain = True
+                                break
+                    except Exception:
+                        pass
+
+        if rt and os.path.isdir(rt):
+            s.runtime_dir = rt
+            s.is_chain = True
+            
+            # 워치독 & 리스너 PID 검사
+            w_pid, w_alive = cls.is_pid_alive(os.path.join(rt, "watchdog.pid"))
+            s.watchdog_pid = w_pid
+            s.watchdog_alive = w_alive
+
+            l_pid, l_alive = cls.is_pid_alive(os.path.join(rt, "listener.pid"))
+            s.listener_pid = l_pid
+            s.listener_alive = l_alive
+
+            # 대기 이벤트 개수
+            pending_dir = os.path.join(rt, "events", "pending")
+            if os.path.isdir(pending_dir):
+                s.pending_events = len(os.listdir(pending_dir))
+
+            # 워커 점유(busy) 상태
+            workers_dir = os.path.join(rt, "workers")
+            if os.path.isdir(workers_dir):
+                busy = []
+                for bf in glob.glob(os.path.join(workers_dir, "*.busy")):
+                    b_name = os.path.basename(bf)[:-5]
+                    try:
+                        with open(bf, "r") as f:
+                            tid = f.readline().strip()
+                        busy.append(f"{b_name} ({tid})")
+                    except Exception:
+                        busy.append(b_name)
+                s.busy_workers = busy
+
+            # 최근 작업(Tasks) 4개 조회
+            tasks_dir = os.path.join(rt, "tasks")
+            if os.path.isdir(tasks_dir):
+                try:
+                    entries = os.listdir(tasks_dir)
+                    sorted_tasks = sorted(
+                        entries,
+                        key=lambda x: os.path.getmtime(os.path.join(tasks_dir, x)),
+                        reverse=True
+                    )
+                    r_tasks = []
+                    for tid in sorted_tasks[:4]:
+                        t_path = os.path.join(tasks_dir, tid)
+                        if not os.path.isdir(t_path):
+                            continue
+                        state_file = os.path.join(t_path, "state")
+                        st = "unknown"
+                        worker = "unknown"
+                        exit_code = "-"
+                        if os.path.isfile(state_file):
+                            with open(state_file, "r") as f:
+                                for line in f:
+                                    if line.startswith("status="): st = line.split("=", 1)[1].strip()
+                                    elif line.startswith("worker="): worker = line.split("=", 1)[1].strip()
+                                    elif line.startswith("exit_code="): exit_code = line.split("=", 1)[1].strip()
+                        
+                        mtime_fmt = datetime.fromtimestamp(os.path.getmtime(t_path)).strftime("%H:%M:%S")
+                        r_tasks.append({
+                            "id": tid,
+                            "worker": worker,
+                            "status": st,
+                            "exit": exit_code,
+                            "time": mtime_fmt
+                        })
+                    s.recent_tasks = r_tasks
+                except Exception:
+                    pass
+
+
+# ------------------------------------------------------------------------------
+# 4. TUI 애플리케이션 (레이아웃, 렌더링, 이벤트 핸들링)
+# ------------------------------------------------------------------------------
+class TsTuiApp:
+    def __init__(self, stdscr):
+        self.stdscr = stdscr
+        self.theme = TokyoNightTheme()
+        self.sessions = []
+        self.selected_idx = 0
+        self.details_scroll = 0
+        self.compact_view = "list"  # "list" 또는 "detail" (컴팩트 모드 토글)
+        self.last_refresh = 0
+        self.refresh_interval = 2.0  # 2초 자동 새로고침
+        
+        # 토스트/상태 알림 메시지
+        self.toast_msg = ""
+        self.toast_time = 0
+        self.toast_attr = 0
+
+        # 모달 상태: None, "help", "kill_confirm", "recover_confirm"
+        self.modal_mode = None
+        self.modal_target = None
+        self.modal_input_buf = ""
+
+        # 초기 테마 및 curses 설정
+        curses.curs_set(0)
+        self.stdscr.timeout(500)  # 500ms 단위로 getch 리턴하여 타이머 및 이벤트 처리
+        self.theme.init_theme()
+        self.reload_data()
+
+    def set_toast(self, msg, attr_name="purple", duration=3.0):
+        self.toast_msg = msg
+        self.toast_attr = self.theme.attr(attr_name, bold=True)
+        self.toast_time = time.time() + duration
+
+    def reload_data(self):
+        """데이터 전체 재수집 및 선택 인덱스 보정"""
+        prev_name = self.sessions[self.selected_idx].name if self.sessions else None
+        self.sessions = DataCollector.get_all_sessions()
+        self.last_refresh = time.time()
+
+        if not self.sessions:
+            self.selected_idx = 0
+            return
+
+        # 이전 선택 세션 위치 보존
+        if prev_name:
+            found = False
+            for i, s in enumerate(self.sessions):
+                if s.name == prev_name:
+                    self.selected_idx = i
+                    found = True
+                    break
+            if not found:
+                self.selected_idx = min(self.selected_idx, len(self.sessions) - 1)
+        else:
+            self.selected_idx = min(self.selected_idx, len(self.sessions) - 1)
+
+    def draw_box(self, y, x, h, w, title="", is_active=False):
+        """라운드 모서리(btop 스타일)의 세련된 박스 테두리 그리기"""
+        if h < 2 or w < 2:
+            return
+        
+        border_attr = self.theme.attr("box_active" if is_active else "box_inactive", bold=is_active)
+        title_attr = self.theme.attr("purple" if is_active else "header", bold=True)
+
+        tl, tr, bl, br = "╭", "╮", "╰", "╯"
+        hl, vl = "─", "│"
+
+        # 상단 테두리 및 타이틀
+        top_line = tl + (hl * (w - 2)) + tr
+        StrUtil.safe_addstr(self.stdscr, y, x, top_line, border_attr)
+
+        if title:
+            t_str = f" {title} "
+            StrUtil.safe_addstr(self.stdscr, y, x + 2, t_str, title_attr)
+
+        # 좌우 세로 테두리
+        for row in range(y + 1, y + h - 1):
+            StrUtil.safe_addstr(self.stdscr, row, x, vl, border_attr)
+            StrUtil.safe_addstr(self.stdscr, row, x + w - 1, vl, border_attr)
+
+        # 하단 테두리
+        bot_line = bl + (hl * (w - 2)) + br
+        StrUtil.safe_addstr(self.stdscr, y + h - 1, x, bot_line, border_attr)
+
+    def get_session_summary(self, s, max_w):
+        """선택된 세션의 핵심 요약 (상태 점, UP/DOWN, 워치독 생존 여부, 워커 점유 상태)"""
+        if not s:
+            return "▶ 실행 중인 세션이 없습니다. [n] 키로 새 체인을 기동하세요."
+
+        parts = []
+        if s.is_active:
+            st = "UP" + ("(접속)" if s.attached else "")
+            parts.append(st)
+        else:
+            parts.append("DOWN")
+
+        if s.is_chain:
+            wd = "WD:OK" if s.watchdog_alive else "WD:STOP"
+            parts.append(wd)
+            if s.busy_workers:
+                parts.append(f"워커:{','.join(s.busy_workers)}")
+            else:
+                parts.append("워커:유휴")
+        elif s.is_down_candidate:
+            parts.append("복구대기")
+        else:
+            parts.append(f"TMUX({len(s.windows)}창)")
+
+        dot = "● " if s.is_active else "○ "
+        text = f"▶ {dot}{s.name}: " + " | ".join(parts)
+        return StrUtil.truncate(text, max_w)
+
+    def render(self):
+        """전체 UI 화면 렌더링 (반응형 2-패널 vs 컴팩트 1-패널 vs CLI 폴백)"""
+        self.stdscr.erase()
+        max_y, max_x = self.stdscr.getmaxyx()
+
+        # 1. 극소형 화면 (폭 < 40 또는 높이 < 10): 콘솔 텍스트 기반 번호 선택 CLI 폴백
+        if max_x < 40 or max_y < 10:
+            self.render_cli_fallback(max_y, max_x)
+            return
+
+        # 2. 컴팩트 1-패널 모드 (폭 40~69 또는 높이 10~14)
+        is_compact = (max_x < 70 or max_y < 15)
+
+        if is_compact:
+            self.render_compact(max_y, max_x)
+        else:
+            self.render_full_2panel(max_y, max_x)
+
+        # 활성화된 모달 다이얼로그 (있을 경우 최상위 렌더링)
+        if self.modal_mode:
+            self.draw_modal(max_y, max_x)
+
+        self.stdscr.refresh()
+
+    def render_cli_fallback(self, max_y, max_x):
+        """극소형 화면 (폭 < 40 또는 높이 < 10): 콘솔 텍스트 기반 번호 선택 CLI 모드"""
+        self.stdscr.erase()
+        
+        # 헤더
+        StrUtil.safe_addstr(self.stdscr, 0, 0, "[TMUX 세션 목록]", self.theme.attr("purple", bold=True), max_w=max_x)
+
+        cur_row = 1
+        max_rows = max(1, max_y - 3)
+        for i, s in enumerate(self.sessions):
+            if cur_row > max_rows:
+                break
+            st = "UP" if s.is_active else "DOWN"
+            att = "🔗" if s.attached else ""
+            line_str = f" {i + 1}. {s.name} ({st}{att})"
+            is_cur = (i == self.selected_idx)
+            attr = self.theme.attr("sel" if is_cur else "normal", bold=is_cur)
+            StrUtil.safe_addstr(self.stdscr, cur_row, 0, StrUtil.truncate(line_str, max_x), attr)
+            cur_row += 1
+
+        if cur_row < max_y - 1:
+            div = "─" * min(max_x, 38)
+            StrUtil.safe_addstr(self.stdscr, cur_row, 0, div, self.theme.attr("muted"))
+            cur_row += 1
+
+        if cur_row < max_y:
+            hint = f"번호(1-{min(len(self.sessions), 9)}) 접속 [q]종료"
+            StrUtil.safe_addstr(self.stdscr, cur_row, 0, StrUtil.truncate(hint, max_x), self.theme.attr("yellow", bold=True))
+
+        self.stdscr.refresh()
+
+    def render_compact(self, max_y, max_x):
+        """모바일 / 좁은 뷰포트용 컴팩트 1-패널 모드"""
+        # 1. 컴팩트 상단 헤더
+        header_h = self.draw_compact_header(max_y, max_x)
+
+        # 2. 하단 영역 높이 계산
+        bottom_h = 3 if max_y >= 14 else 2
+        body_y = header_h
+        body_h = max_y - header_h - bottom_h
+
+        # 3. 메인 바디 (목록 뷰 vs 상세 뷰)
+        if self.compact_view == "detail":
+            self.draw_right_panel(body_y, 0, body_h, max_x)
+        else:
+            self.draw_left_panel(body_y, 0, body_h, max_x)
+
+        # 4. 컴팩트 하단 안내 및 키 가이드 바
+        self.draw_compact_bottom(max_y - bottom_h, 0, bottom_h, max_x)
+
+    def render_full_2panel(self, max_y, max_x):
+        """데스크톱 / 대화면용 Tokyo Night 2-패널 모드"""
+        self.draw_header(max_y, max_x)
+
+        body_y = 3
+        body_h = max_y - 7
+        left_w = min(38, max(32, int(max_x * 0.36)))
+        right_w = max_x - left_w
+
+        self.draw_left_panel(body_y, 0, body_h, left_w)
+        self.draw_right_panel(body_y, left_w, body_h, right_w)
+
+        self.draw_bottom_panel(max_y - 4, 0, 4, max_x)
+
+    def draw_compact_header(self, max_y, max_x):
+        """컴팩트 모드 상단 헤더 (높이 14 이상: 3줄, 높이 10~13: 2줄)"""
+        active_cnt = sum(1 for s in self.sessions if s.is_active)
+        chain_cnt = sum(1 for s in self.sessions if s.is_chain and s.is_active)
+        att_cnt = sum(1 for s in self.sessions if s.attached)
+        down_cnt = sum(1 for s in self.sessions if s.is_down_candidate)
+
+        if max_y >= 14:
+            # 1행: 타이틀 및 시계
+            title = "✦ ts · TMUX & AGENT CHAIN"
+            StrUtil.safe_addstr(self.stdscr, 0, 1, title, self.theme.attr("purple", bold=True), max_w=max_x - 1)
+            
+            if max_x >= 58:
+                now_str = datetime.now().strftime("%H:%M:%S")
+                StrUtil.safe_addstr(self.stdscr, 0, max_x - len(now_str) - 2, now_str, self.theme.attr("muted"))
+
+            # 2행: 상태 뱃지
+            badge_x = 2
+            b1 = f"● 활성 {active_cnt}"
+            StrUtil.safe_addstr(self.stdscr, 1, badge_x, b1, self.theme.attr("green", bold=True))
+            badge_x += StrUtil.str_width(b1) + 2
+
+            b2 = f"⚡ 체인 {chain_cnt}"
+            StrUtil.safe_addstr(self.stdscr, 1, badge_x, b2, self.theme.attr("purple", bold=True))
+            badge_x += StrUtil.str_width(b2) + 2
+
+            b3 = f"🔗 접속 {att_cnt}"
+            StrUtil.safe_addstr(self.stdscr, 1, badge_x, b3, self.theme.attr("yellow", bold=True))
+            badge_x += StrUtil.str_width(b3) + 2
+
+            if down_cnt > 0 and badge_x < max_x - 12:
+                b4 = f"○ 복구 {down_cnt}"
+                StrUtil.safe_addstr(self.stdscr, 1, badge_x, b4, self.theme.attr("orange"))
+
+            # 3행: 구분선
+            div_line = "─" * (max_x - 2)
+            StrUtil.safe_addstr(self.stdscr, 2, 1, div_line, self.theme.attr("muted"))
+            return 3
+        else:
+            # 1행: 압축 타이틀 및 뱃지
+            t = f"✦ ts · TMUX [●{active_cnt} ⚡{chain_cnt}"
+            if down_cnt > 0:
+                t += f" ○{down_cnt}"
+            t += "]"
+            StrUtil.safe_addstr(self.stdscr, 0, 1, StrUtil.truncate(t, max_x - 2), self.theme.attr("purple", bold=True))
+            
+            # 2행: 구분선
+            div_line = "─" * (max_x - 2)
+            StrUtil.safe_addstr(self.stdscr, 1, 1, div_line, self.theme.attr("muted"))
+            return 2
+
+    def draw_compact_bottom(self, y, x, h, w):
+        """컴팩트 모드 하단 요약 및 1줄 키 가이드 바"""
+        cur_s = self.sessions[self.selected_idx] if self.sessions else None
+
+        if h >= 3:
+            sep = "─" * (w - 2)
+            StrUtil.safe_addstr(self.stdscr, y, 1, sep, self.theme.attr("muted"))
+            summary_y = y + 1
+            guide_y = y + 2
+        else:
+            summary_y = y
+            guide_y = y + 1
+
+        # 토스트 메시지 우선 표시
+        if self.toast_msg and time.time() < self.toast_time:
+            StrUtil.safe_addstr(self.stdscr, summary_y, 1, StrUtil.truncate(f"📢 {self.toast_msg}", w - 2), self.toast_attr)
+        elif self.compact_view == "detail":
+            detail_info = f"▶ [상세보기] {cur_s.name if cur_s else ''}  (j/k:스크롤, Tab/Esc:목록)"
+            StrUtil.safe_addstr(self.stdscr, summary_y, 1, StrUtil.truncate(detail_info, w - 2), self.theme.attr("yellow", bold=True))
+        else:
+            summary = self.get_session_summary(cur_s, w - 2)
+            StrUtil.safe_addstr(self.stdscr, summary_y, 1, summary, self.theme.attr("yellow", bold=True))
+
+        # 하단 1줄 키 가이드
+        if self.compact_view == "detail":
+            keys = [("Tab/i", "목록"), ("Enter", "접속"), ("r", "복구"), ("q", "종료")]
+        else:
+            if w >= 60:
+                keys = [("Enter", "접속"), ("Tab", "상세"), ("r", "복구"), ("n", "새체인"), ("d", "분리"), ("q", "종료")]
+            elif w >= 48:
+                keys = [("Enter", "접속"), ("Tab", "상세"), ("r", "복구"), ("n", "새체인"), ("q", "종료")]
+            else:
+                keys = [("Enter", "접속"), ("Tab", "상세"), ("r", "복구"), ("q", "종료")]
+
+        kx = 1
+        for key_txt, desc_txt in keys:
+            badge = f"[{key_txt}]"
+            StrUtil.safe_addstr(self.stdscr, guide_y, kx, badge, self.theme.attr("key_badge", bold=True))
+            kx += len(badge)
+            StrUtil.safe_addstr(self.stdscr, guide_y, kx, desc_txt, self.theme.attr("normal"))
+            kx += StrUtil.str_width(desc_txt) + 1
+            if kx >= w - 4:
+                break
+
+    def draw_header(self, max_y, max_x):
+        """btop / k9s 스타일 상단 헤더 뱃지 및 상태 바"""
+        title = "✦ ts · TMUX & AGENT COMMAND CHAIN TUI"
+        StrUtil.safe_addstr(self.stdscr, 0, 1, title, self.theme.attr("purple", bold=True))
+
+        # 시계
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        StrUtil.safe_addstr(self.stdscr, 0, max_x - len(now_str) - 2, now_str, self.theme.attr("muted"))
+
+        # 상태 요약 뱃지 (k9s 스타일)
+        active_cnt = sum(1 for s in self.sessions if s.is_active)
+        chain_cnt = sum(1 for s in self.sessions if s.is_chain and s.is_active)
+        att_cnt = sum(1 for s in self.sessions if s.attached)
+        down_cnt = sum(1 for s in self.sessions if s.is_down_candidate)
+
+        badge_x = 2
+        b1 = f"● 활성 {active_cnt}개"
+        StrUtil.safe_addstr(self.stdscr, 1, badge_x, b1, self.theme.attr("green", bold=True))
+        badge_x += StrUtil.str_width(b1) + 3
+
+        b2 = f"⚡ 체인 {chain_cnt}개"
+        StrUtil.safe_addstr(self.stdscr, 1, badge_x, b2, self.theme.attr("purple", bold=True))
+        badge_x += StrUtil.str_width(b2) + 3
+
+        b3 = f"🔗 접속 {att_cnt}개"
+        StrUtil.safe_addstr(self.stdscr, 1, badge_x, b3, self.theme.attr("yellow", bold=True))
+        badge_x += StrUtil.str_width(b3) + 3
+
+        if down_cnt > 0:
+            b4 = f"○ 복구대기 {down_cnt}개"
+            StrUtil.safe_addstr(self.stdscr, 1, badge_x, b4, self.theme.attr("orange"))
+            badge_x += StrUtil.str_width(b4) + 3
+
+        # 구분선
+        div_line = "─" * (max_x - 2)
+        StrUtil.safe_addstr(self.stdscr, 2, 1, div_line, self.theme.attr("muted"))
+
+    def draw_left_panel(self, y, x, h, w):
+        """lazygit 스타일 세션 목록 패널"""
+        title = f"세션 목록 [{self.selected_idx + 1}/{len(self.sessions)}]" if self.sessions else "세션 목록"
+        self.draw_box(y, x, h, w, title=title, is_active=(self.compact_view != "detail"))
+
+        if not self.sessions:
+            StrUtil.safe_addstr(self.stdscr, y + 2, x + 2, "실행 중인 세션이 없습니다.", self.theme.attr("muted"))
+            StrUtil.safe_addstr(self.stdscr, y + 4, x + 2, "[n] 키로 새 체인을 기동하세요.", self.theme.attr("yellow"))
+            return
+
+        inner_h = h - 2
+        inner_w = w - 2
+        start_row = y + 1
+
+        # 스크롤 윈도우 계산
+        scroll_start = 0
+        if self.selected_idx >= inner_h:
+            scroll_start = self.selected_idx - inner_h + 1
+
+        row_idx = 0
+        last_was_active = True
+
+        for i in range(scroll_start, len(self.sessions)):
+            if row_idx >= inner_h:
+                break
+            
+            s = self.sessions[i]
+            is_cur = (i == self.selected_idx)
+            draw_y = start_row + row_idx
+
+            # 액티브 세션과 다운 후보 사이 구분자
+            if last_was_active and s.is_down_candidate and row_idx < inner_h - 1:
+                sep = "── 복구 후보 (다운됨) ──"
+                StrUtil.safe_addstr(self.stdscr, draw_y, x + 2, StrUtil.truncate(sep, inner_w), self.theme.attr("muted"))
+                row_idx += 1
+                draw_y += 1
+                last_was_active = False
+                if row_idx >= inner_h:
+                    break
+
+            # 상태 표시 아이콘 (● 초록: 접속중, ● 노랑: 대기중, ○ 주황/회색: 다운)
+            if s.is_active:
+                if s.attached:
+                    dot_char = "●"
+                    dot_attr = self.theme.attr("sel_yellow" if is_cur else "yellow", bold=True)
+                else:
+                    dot_char = "●"
+                    dot_attr = self.theme.attr("sel_green" if is_cur else "green", bold=True)
+            else:
+                dot_char = "○"
+                dot_attr = self.theme.attr("sel_purple" if is_cur else "orange")
+
+            # 뱃지: [CHAIN], [TMUX], [DOWN]
+            if s.is_down_candidate:
+                badge = "[DOWN]"
+                badge_attr = self.theme.attr("sel_purple" if is_cur else "muted", dim=not is_cur)
+            elif s.is_chain:
+                badge = "[CHAIN]"
+                badge_attr = self.theme.attr("sel_purple" if is_cur else "purple", bold=True)
+            else:
+                badge = "[TMUX]"
+                badge_attr = self.theme.attr("sel" if is_cur else "header")
+
+            # 번호 (1..9 단축키)
+            num_tag = f"[{i + 1}]" if i < 9 else f" {i + 1} "
+
+            # 행 전체 하이라이트 배경 (lazygit 커서 스타일)
+            if is_cur:
+                bg_bar = " " * inner_w
+                StrUtil.safe_addstr(self.stdscr, draw_y, x + 1, bg_bar, self.theme.attr("sel"))
+                StrUtil.safe_addstr(self.stdscr, draw_y, x + 1, "▶", self.theme.attr("sel_purple", bold=True))
+
+            # 텍스트 컬럼 배치
+            col_x = x + 3
+            StrUtil.safe_addstr(self.stdscr, draw_y, col_x, num_tag, self.theme.attr("sel_purple" if is_cur else "muted", bold=is_cur))
+            col_x += 4
+
+            StrUtil.safe_addstr(self.stdscr, draw_y, col_x, dot_char, dot_attr)
+            col_x += 2
+
+            # 세션 이름
+            max_name_w = inner_w - (col_x - x) - len(badge) - 1
+            name_str = StrUtil.truncate(s.name, max(6, max_name_w))
+            name_attr = self.theme.attr("sel" if is_cur else "normal", bold=is_cur)
+            StrUtil.safe_addstr(self.stdscr, draw_y, col_x, name_str, name_attr)
+
+            # 우측 정렬 뱃지
+            badge_pos = x + inner_w - len(badge)
+            if badge_pos > col_x + StrUtil.str_width(name_str):
+                StrUtil.safe_addstr(self.stdscr, draw_y, badge_pos, badge, badge_attr)
+
+            row_idx += 1
+
+    def draw_right_panel(self, y, x, h, w):
+        """btop / k9s 스타일 세션 상세 정보 및 라이브 모니터링 패널"""
+        if not self.sessions or self.selected_idx >= len(self.sessions):
+            self.draw_box(y, x, h, w, title="세션 상세", is_active=False)
+            return
+
+        s = self.sessions[self.selected_idx]
+        chain_tag = " [에이전트 체인] " if s.is_chain else " [일반 TMUX 세션] "
+        title = StrUtil.truncate(f"세션 상세: {s.name}{chain_tag}", max(10, w - 4))
+        self.draw_box(y, x, h, w, title=title, is_active=(self.compact_view == "detail"))
+
+        inner_h = h - 2
+        inner_w = w - 4
+        cur_y = y + 1
+        cx = x + 2
+
+        # ----------------------------------------------------------------------
+        # 1) 헤더 및 기본 상태 요약 (반응형 칼럼 레이아웃)
+        # ----------------------------------------------------------------------
+        st_text = "● 실행 중 (UP)" if s.is_active else "○ 종료됨 (DOWN - 복구 가능)"
+        st_color = "green" if s.is_active else "orange"
+        att_text = "접속 중 (Attached)" if s.attached else "대기 중 (Detached)"
+        att_color = "yellow" if s.attached else "muted"
+
+        if inner_w >= 70:
+            StrUtil.safe_addstr(self.stdscr, cur_y, cx, "• 상태:", self.theme.attr("muted"))
+            StrUtil.safe_addstr(self.stdscr, cur_y, cx + 8, st_text, self.theme.attr(st_color, bold=True))
+
+            StrUtil.safe_addstr(self.stdscr, cur_y, cx + 28, "• 클라이언트:", self.theme.attr("muted"))
+            StrUtil.safe_addstr(self.stdscr, cur_y, cx + 42, att_text, self.theme.attr(att_color, bold=True))
+            cur_y += 1
+        else:
+            StrUtil.safe_addstr(self.stdscr, cur_y, cx, "• 상태       :", self.theme.attr("muted"))
+            StrUtil.safe_addstr(self.stdscr, cur_y, cx + 15, st_text, self.theme.attr(st_color, bold=True))
+            cur_y += 1
+            StrUtil.safe_addstr(self.stdscr, cur_y, cx, "• 클라이언트 :", self.theme.attr("muted"))
+            StrUtil.safe_addstr(self.stdscr, cur_y, cx + 15, att_text, self.theme.attr(att_color, bold=True))
+            cur_y += 1
+
+        if s.created_fmt:
+            StrUtil.safe_addstr(self.stdscr, cur_y, cx, "• 생성 시각  :", self.theme.attr("muted"))
+            StrUtil.safe_addstr(self.stdscr, cur_y, cx + 15, s.created_fmt, self.theme.attr("normal"))
+            cur_y += 1
+
+        # ----------------------------------------------------------------------
+        # 2) 에이전트 체인인 경우: 아키텍처 및 안전망 데몬 상태 (v2 Full-Push)
+        # ----------------------------------------------------------------------
+        if s.is_chain:
+            cur_y += 1
+            if cur_y < y + inner_h - 2:
+                StrUtil.safe_addstr(self.stdscr, cur_y, cx, "─ [ 체인 아키텍처 & 안전망 데몬 상태 ] ─", self.theme.attr("purple", bold=True))
+                cur_y += 1
+
+                # 런타임 경로
+                rt_disp = s.runtime_dir if s.runtime_dir else "(미지정 / 탐색 중)"
+                StrUtil.safe_addstr(self.stdscr, cur_y, cx, "• 런타임 경로 :", self.theme.attr("muted"))
+                StrUtil.safe_addstr(self.stdscr, cur_y, cx + 16, StrUtil.truncate(rt_disp, inner_w - 18), self.theme.attr("cyan"))
+                cur_y += 1
+
+                # 프로젝트 / 작업 경로
+                if s.project_dir and cur_y < y + inner_h - 2:
+                    StrUtil.safe_addstr(self.stdscr, cur_y, cx, "• 대상 프로젝트 :", self.theme.attr("muted"))
+                    StrUtil.safe_addstr(self.stdscr, cur_y, cx + 16, StrUtil.truncate(s.project_dir, inner_w - 18), self.theme.attr("normal"))
+                    cur_y += 1
+
+                if s.work_dir and cur_y < y + inner_h - 2:
+                    StrUtil.safe_addstr(self.stdscr, cur_y, cx, "• 작업 디렉토리 :", self.theme.attr("muted"))
+                    StrUtil.safe_addstr(self.stdscr, cur_y, cx + 16, StrUtil.truncate(s.work_dir, inner_w - 18), self.theme.attr("normal"))
+                    cur_y += 1
+
+                # 워치독 & 리스너 상태
+                wd_str = f"● ALIVE (PID {s.watchdog_pid})" if s.watchdog_alive else "○ STOPPED"
+                wd_col = "green" if s.watchdog_alive else "red"
+                ls_str = f"● ALIVE (PID {s.listener_pid})" if s.listener_alive else "○ STOPPED"
+                ls_col = "green" if s.listener_alive else "red"
+
+                if inner_w >= 70 and cur_y < y + inner_h - 2:
+                    StrUtil.safe_addstr(self.stdscr, cur_y, cx, "• 워치독 (v2) :", self.theme.attr("muted"))
+                    StrUtil.safe_addstr(self.stdscr, cur_y, cx + 16, wd_str, self.theme.attr(wd_col, bold=True))
+
+                    StrUtil.safe_addstr(self.stdscr, cur_y, cx + 36, "• 리스너(FIFO):", self.theme.attr("muted"))
+                    StrUtil.safe_addstr(self.stdscr, cur_y, cx + 51, ls_str, self.theme.attr(ls_col, bold=True))
+                    cur_y += 1
+                elif cur_y < y + inner_h - 3:
+                    StrUtil.safe_addstr(self.stdscr, cur_y, cx, "• 워치독 (v2)  :", self.theme.attr("muted"))
+                    StrUtil.safe_addstr(self.stdscr, cur_y, cx + 16, wd_str, self.theme.attr(wd_col, bold=True))
+                    cur_y += 1
+                    StrUtil.safe_addstr(self.stdscr, cur_y, cx, "• 리스너 (FIFO):", self.theme.attr("muted"))
+                    StrUtil.safe_addstr(self.stdscr, cur_y, cx + 16, ls_str, self.theme.attr(ls_col, bold=True))
+                    cur_y += 1
+
+                # 이벤트 대기열 및 워커 점유(busy)
+                busy_desc = ", ".join(s.busy_workers) if s.busy_workers else "없음 (유휴 대기)"
+                busy_col = "yellow" if s.busy_workers else "green"
+
+                if inner_w >= 70 and cur_y < y + inner_h - 2:
+                    StrUtil.safe_addstr(self.stdscr, cur_y, cx, "• 대기 이벤트 :", self.theme.attr("muted"))
+                    StrUtil.safe_addstr(self.stdscr, cur_y, cx + 16, f"{s.pending_events}건", self.theme.attr("normal"))
+
+                    StrUtil.safe_addstr(self.stdscr, cur_y, cx + 36, "• 워커 점유   :", self.theme.attr("muted"))
+                    StrUtil.safe_addstr(self.stdscr, cur_y, cx + 51, StrUtil.truncate(busy_desc, inner_w - 53), self.theme.attr(busy_col, bold=bool(s.busy_workers)))
+                    cur_y += 1
+                elif cur_y < y + inner_h - 3:
+                    StrUtil.safe_addstr(self.stdscr, cur_y, cx, "• 대기 이벤트  :", self.theme.attr("muted"))
+                    StrUtil.safe_addstr(self.stdscr, cur_y, cx + 16, f"{s.pending_events}건", self.theme.attr("normal"))
+                    cur_y += 1
+                    StrUtil.safe_addstr(self.stdscr, cur_y, cx, "• 워커 점유    :", self.theme.attr("muted"))
+                    StrUtil.safe_addstr(self.stdscr, cur_y, cx + 16, StrUtil.truncate(busy_desc, inner_w - 18), self.theme.attr(busy_col, bold=bool(s.busy_workers)))
+                    cur_y += 1
+
+        # ----------------------------------------------------------------------
+        # 3) 윈도우 및 프로세스 구성 (Windows & Panes)
+        # ----------------------------------------------------------------------
+        if s.is_active and s.windows and cur_y < y + inner_h - 2:
+            cur_y += 1
+            StrUtil.safe_addstr(self.stdscr, cur_y, cx, "─ [ TMUX 윈도우 및 프로세스 현황 ] ─", self.theme.attr("header", bold=True))
+            cur_y += 1
+
+            # 테이블 헤더
+            if inner_w >= 54:
+                hdr = f"  {'Idx':<4} {'윈도우명':<10} {'상태':<6} {'실행 명령':<14} {'작업 경로'}"
+            else:
+                hdr = f"  {'Idx':<4} {'윈도우명':<10} {'상태':<6} {'실행 명령'}"
+            StrUtil.safe_addstr(self.stdscr, cur_y, cx, StrUtil.truncate(hdr, inner_w), self.theme.attr("muted", bold=True))
+            cur_y += 1
+
+            for w_item in s.windows:
+                if cur_y >= y + inner_h - 1:
+                    break
+                w_act = "활성 *" if w_item["active"] else "대기"
+                w_col = "green" if w_item["active"] else "normal"
+                w_cmd = w_item["cmd"]
+                if "claude" in w_cmd:
+                    w_cmd = "claude (RC)"
+                elif "agy" in w_cmd:
+                    w_cmd = "agy (상주)"
+                
+                if inner_w >= 54:
+                    w_row = f"  {w_item['idx']:<4} {w_item['name']:<10} {w_act:<6} {w_cmd:<14} {w_item['path']}"
+                else:
+                    w_row = f"  {w_item['idx']:<4} {w_item['name']:<10} {w_act:<6} {w_cmd}"
+                StrUtil.safe_addstr(self.stdscr, cur_y, cx, StrUtil.truncate(w_row, inner_w), self.theme.attr(w_col))
+                cur_y += 1
+
+        # ----------------------------------------------------------------------
+        # 4) 최근 태스크 실행 이력 (Recent Tasks)
+        # ----------------------------------------------------------------------
+        if s.is_chain and s.recent_tasks and cur_y < y + inner_h - 2:
+            cur_y += 1
+            StrUtil.safe_addstr(self.stdscr, cur_y, cx, "─ [ 최근 작업(Task) 상태 & 이벤트 ] ─", self.theme.attr("purple", bold=True))
+            cur_y += 1
+
+            for t in s.recent_tasks:
+                if cur_y >= y + inner_h - 1:
+                    break
+                st_icon = "●"
+                st_color = "normal"
+                if t["status"] == "running":
+                    st_icon = "▶"
+                    st_color = "yellow"
+                elif t["status"] in ("done", "completed"):
+                    st_icon = "✓"
+                    st_color = "green"
+                elif t["status"] in ("error", "failed", "abandoned"):
+                    st_icon = "✗"
+                    st_color = "red"
+
+                t_line = f"  {st_icon} {t['id']} [{t['worker']}] status={t['status']} (exit:{t['exit']}) @ {t['time']}"
+                StrUtil.safe_addstr(self.stdscr, cur_y, cx, StrUtil.truncate(t_line, inner_w), self.theme.attr(st_color))
+                cur_y += 1
+
+        # ----------------------------------------------------------------------
+        # 5) 복구 안내 (종료된 후보인 경우)
+        # ----------------------------------------------------------------------
+        if s.is_down_candidate and cur_y < y + inner_h - 2:
+            cur_y += 1
+            notice1 = "ℹ 비정상 종료되거나 보관 중인 체인 인스턴스입니다."
+            notice2 = "  [Enter] 또는 [r] 키를 누르면 Sonnet 대화 맥락(--resume) 및 Remote Control을 복원합니다."
+            StrUtil.safe_addstr(self.stdscr, cur_y, cx, notice1, self.theme.attr("orange"))
+            cur_y += 1
+            StrUtil.safe_addstr(self.stdscr, cur_y, cx, notice2, self.theme.attr("yellow", bold=True))
+            cur_y += 1
+
+        # ----------------------------------------------------------------------
+        # 6) 명령어 설명 패널 (User Prompt 요구: 기본적으로 명령어 설명이 보이게)
+        # ----------------------------------------------------------------------
+        if cur_y < y + inner_h - 3:
+            cur_y += 1
+            StrUtil.safe_addstr(self.stdscr, cur_y, cx, "─ [ 대상 세션 추천 동작 ] ─", self.theme.attr("header", bold=True))
+            cur_y += 1
+            if s.is_active:
+                if s.is_chain:
+                    guide1 = "  [Enter] : 세션에 접속하여 Claude 및 워커 TUI 대화"
+                    guide2 = "  [d]     : 다른 클라이언트 접속 분리 (Detach)"
+                    guide3 = "  [r]     : 체인 복구 마법사 실행 (다른 세션 복구)"
+                else:
+                    guide1 = f"  [Enter] : 일반 TMUX '{s.name}' 세션 접속 (tmux attach)"
+                    guide2 = "  [k]     : 세션 안전 종료 (kill-session)"
+                    guide3 = "  [n]     : 신규 에이전트 체인 기동 (v2 Full-Push)"
+            else:
+                guide1 = f"  [Enter]/[r] : '{s.name}' 복구 실행 (Claude --resume + RC)"
+                guide2 = "  [n]         : 신규 에이전트 체인 전체 기동 마법사"
+                guide3 = "  [q]         : TUI 종료 (쉘로 복귀)"
+
+            for g in (guide1, guide2, guide3):
+                if cur_y >= y + inner_h:
+                    break
+                StrUtil.safe_addstr(self.stdscr, cur_y, cx, StrUtil.truncate(g, inner_w), self.theme.attr("normal"))
+                cur_y += 1
+
+    def draw_bottom_panel(self, y, x, h, w):
+        """lazygit / zellij 스타일 하단 상황별 안내 및 영구 키 바인딩 바"""
+        sep = "─" * (w - 2)
+        StrUtil.safe_addstr(self.stdscr, y, 1, sep, self.theme.attr("muted"))
+
+        cur_s = self.sessions[self.selected_idx] if self.sessions else None
+
+        # 1행: 현재 커서 세션에 따른 상황별 동작 한국어 설명
+        desc_line = ""
+        if not cur_s:
+            desc_line = "▶ 현재 세션이 없습니다. [n]을 눌러 신규 체인을 기동하세요."
+        elif cur_s.is_active:
+            if cur_s.is_chain:
+                desc_line = f"▶ [Enter] '{cur_s.name}' 체인 세션 접속  |  [Tab] 상세  |  [d] Detach  |  [r] 복구  |  [x] 세션 종료"
+            else:
+                desc_line = f"▶ [Enter] 일반 TMUX '{cur_s.name}' 세션 접속  |  [Tab] 상세  |  [d] Detach  |  [x] 세션 종료"
+        else:
+            desc_line = f"▶ [Enter] 또는 [r] '{cur_s.name}' 체인 복구 시작 (Claude 단독 + RC)  |  [n] 새 체인  |  [q] 나가기"
+
+        # 토스트 알림이 살아있으면 토스트를 우선 표시
+        if self.toast_msg and time.time() < self.toast_time:
+            StrUtil.safe_addstr(self.stdscr, y + 1, 2, f"📢 {self.toast_msg}", self.toast_attr)
+        else:
+            StrUtil.safe_addstr(self.stdscr, y + 1, 2, StrUtil.truncate(desc_line, w - 4), self.theme.attr("yellow", bold=True))
+
+        # 2행: 상시 고정 단축키 가이드 (lazygit 스타일)
+        keys = [
+            ("Enter", "접속"),
+            ("Tab", "상세"),
+            ("r", "체인복구"),
+            ("n", "새체인"),
+            ("d", "분리"),
+            ("x", "세션종료"),
+            ("R", "새로고침"),
+            ("?", "도움말"),
+            ("q", "종료")
+        ]
+
+        kx = 2
+        for key_txt, desc_txt in keys:
+            badge = f"[{key_txt}]"
+            StrUtil.safe_addstr(self.stdscr, y + 2, kx, badge, self.theme.attr("key_badge", bold=True))
+            kx += len(badge) + 1
+            StrUtil.safe_addstr(self.stdscr, y + 2, kx, desc_txt, self.theme.attr("normal"))
+            kx += StrUtil.str_width(desc_txt) + 2
+            if kx >= w - 10:
+                break
+
+    def draw_modal(self, max_y, max_x):
+        """팝업 모달 다이얼로그 (도움말, 종료 확인 등)"""
+        if self.modal_mode == "help":
+            self._draw_help_modal(max_y, max_x)
+        elif self.modal_mode == "kill_confirm":
+            self._draw_kill_modal(max_y, max_x)
+
+    def _draw_help_modal(self, max_y, max_x):
+        mh = min(20, max_y - 4)
+        mw = min(74, max_x - 6)
+        my = (max_y - mh) // 2
+        mx = (max_x - mw) // 2
+
+        for row in range(my, my + mh):
+            StrUtil.safe_addstr(self.stdscr, row, mx, " " * mw, self.theme.attr("normal"))
+
+        self.draw_box(my, mx, mh, mw, title="ts TUI 도움말 & 단축키 안내", is_active=True)
+
+        help_lines = [
+            ("탐색 및 이동", "↑ / k, ↓ / j (위/아래), Home / End, 1~9 (숫자 바로 선택)"),
+            ("상세/목록전환", "Tab / i : 세션 상세 화면과 목록 화면 전환"),
+            ("세션 접속", "Enter : 선택한 tmux 세션에 즉시 접속 (tmux attach/switch)"),
+            ("체인 복구", "r : 비정상 종료된 체인 복구 (Claude 단독 + RC 마법사)"),
+            ("신규 기동", "n : 신규 에이전트 체인 전체 기동 (v2 Full-Push 부트스트랩)"),
+            ("세션 분리", "d : 현재 선택된 세션에 붙은 클라이언트 분리 (Detach)"),
+            ("세션 종료", "x / K : 선택한 tmux 세션 안전 종료 (종료 확인 모달 표시)"),
+            ("새로고침", "R / F5 : 세션 및 체인 런타임 실시간 상태 즉시 갱신"),
+            ("종료", "q / Esc : TUI 매니저 종료 (실행 중인 tmux 세션 영향 없음)"),
+            ("", ""),
+            ("모바일 한글키", "두벌식 지원: ㄱ(복구), ㅜ(새체인), ㅇ(분리), ㅓ/ㅏ(이동), ㅑ(상세), ㅂ(종료)"),
+            ("", ""),
+            ("상태 표시 안내:", ""),
+            ("  ● 녹색/노랑", "살아있는 tmux 세션 (노랑: 대기중, 녹색: 접속중)"),
+            ("  ○ 주황", "디스크에 런타임/설정이 보존된 복구 가능 체인 후보"),
+            ("  [CHAIN]", "v2 Full-Push 브리지 및 워치독이 연동된 에이전트 체인"),
+        ]
+
+        cy = my + 2
+        for title, desc in help_lines:
+            if cy >= my + mh - 2:
+                break
+            if not title and not desc:
+                cy += 1
+                continue
+            if not desc:
+                StrUtil.safe_addstr(self.stdscr, cy, mx + 3, title, self.theme.attr("purple", bold=True))
+            else:
+                StrUtil.safe_addstr(self.stdscr, cy, mx + 3, f"{title:<12}", self.theme.attr("header", bold=True))
+                StrUtil.safe_addstr(self.stdscr, cy, mx + 16, StrUtil.truncate(desc, mw - 19), self.theme.attr("normal"))
+            cy += 1
+
+        close_hint = "[닫기: Esc / q / Enter]"
+        StrUtil.safe_addstr(self.stdscr, my + mh - 2, mx + mw - len(close_hint) - 3, close_hint, self.theme.attr("yellow", bold=True))
+
+    def _draw_kill_modal(self, max_y, max_x):
+        mh = 10
+        mw = min(66, max_x - 6)
+        my = (max_y - mh) // 2
+        mx = (max_x - mw) // 2
+
+        for row in range(my, my + mh):
+            StrUtil.safe_addstr(self.stdscr, row, mx, " " * mw, self.theme.attr("normal"))
+
+        s_name = self.modal_target.name if self.modal_target else "세션"
+        is_chain = self.modal_target.is_chain if self.modal_target else False
+
+        self.draw_box(my, mx, mh, mw, title="⚠️ 세션 종료 확인", is_active=True)
+
+        warn_title = f"정말 세션 '{s_name}'을(를) 종료(kill-session)하시겠습니까?"
+        StrUtil.safe_addstr(self.stdscr, my + 2, mx + 3, StrUtil.truncate(warn_title, mw - 6), self.theme.attr("red", bold=True))
+
+        if is_chain:
+            warn2 = "주의: 에이전트 체인입니다! 실행 중인 Claude 및 워커가 중단됩니다."
+            StrUtil.safe_addstr(self.stdscr, my + 4, mx + 3, StrUtil.truncate(warn2, mw - 6), self.theme.attr("yellow", bold=True))
+        else:
+            warn2 = "주의: 세션 내부에서 실행 중인 모든 프로세스가 강제 종료됩니다."
+            StrUtil.safe_addstr(self.stdscr, my + 4, mx + 3, StrUtil.truncate(warn2, mw - 6), self.theme.attr("muted"))
+
+        prompt = "종료하려면 'y' 키를 누르세요. (취소: 'n', Esc, Enter)"
+        StrUtil.safe_addstr(self.stdscr, my + 6, mx + 3, prompt, self.theme.attr("purple", bold=True))
+
+    # --------------------------------------------------------------------------
+    # 액션 핸들러
+    # --------------------------------------------------------------------------
+    def action_attach(self):
+        """선택한 세션에 접속 (내부 tmux는 switch-client, 외부는 curses 종료 후 exec)"""
+        if not self.sessions or self.selected_idx >= len(self.sessions):
+            return
+        
+        target = self.sessions[self.selected_idx]
+        if not target.is_active:
+            # 다운된 체인이면 복구 액션으로 유도
+            self.action_recover()
+            return
+
+        in_tmux = bool(os.environ.get("TMUX"))
+        if in_tmux:
+            subprocess.run(["tmux", "switch-client", "-t", target.name])
+            self.set_toast(f"세션 '{target.name}'으로 클라이언트를 전환했습니다.", "green")
+            self.reload_data()
+        else:
+            curses.endwin()
+            try:
+                os.execvp("tmux", ["tmux", "attach-session", "-t", target.name])
+            except Exception as e:
+                print(f"[오류] tmux 세션 접속 실패: {e}")
+                sys.exit(1)
+
+    def action_recover(self):
+        """체인 복구 마법사 호출 (curses 임시 중단 후 CLI 실행 후 복귀)"""
+        target = self.sessions[self.selected_idx] if self.sessions else None
+        target_name = target.name if (target and target.is_chain) else ""
+
+        if target and target.is_active:
+            self.set_toast(f"세션 '{target.name}'은(는) 이미 실행 중입니다!", "yellow")
+            return
+
+        curses.endwin()
+        try:
+            print("\033c", end="")  # 터미널 화면 클리어
+            cmd = [os.path.join(TEMPLATE_ROOT, "bin", "ts"), "recover"]
+            if target_name:
+                cmd.append(target_name)
+            subprocess.run(cmd)
+            print("\n엔터를 누르면 TUI 매니저로 복귀합니다...")
+            input()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.stdscr.refresh()
+            self.reload_data()
+            self.set_toast("복구 절차가 완료되었습니다.", "purple")
+
+    def action_new_chain(self):
+        """신규 체인 전체 기동 마법사 호출"""
+        curses.endwin()
+        try:
+            print("\033c", end="")
+            cmd = [os.path.join(TEMPLATE_ROOT, "bin", "ts"), "new"]
+            subprocess.run(cmd)
+            print("\n엔터를 누르면 TUI 매니저로 복귀합니다...")
+            input()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.stdscr.refresh()
+            self.reload_data()
+            self.set_toast("신규 체인 마법사가 종료되었습니다.", "purple")
+
+    def action_detach(self):
+        """현재 세션에서 클라이언트 Detach"""
+        if not self.sessions or self.selected_idx >= len(self.sessions):
+            return
+        target = self.sessions[self.selected_idx]
+        if not target.is_active:
+            self.set_toast("실행 중이지 않은 세션입니다.", "yellow")
+            return
+        
+        res = subprocess.run(["tmux", "detach-client", "-s", target.name], capture_output=True, text=True)
+        if res.returncode == 0:
+            self.set_toast(f"세션 '{target.name}'의 클라이언트를 분리(Detach)했습니다.", "green")
+        else:
+            self.set_toast(f"Detach 실패: {res.stderr.strip()}", "red")
+        self.reload_data()
+
+    def action_kill(self):
+        """세션 종료 모달 띄우기"""
+        if not self.sessions or self.selected_idx >= len(self.sessions):
+            return
+        target = self.sessions[self.selected_idx]
+        if not target.is_active:
+            self.set_toast("이미 종료된 세션입니다.", "yellow")
+            return
+        
+        self.modal_mode = "kill_confirm"
+        self.modal_target = target
+
+    def confirm_kill(self):
+        """세션 종료 실행"""
+        target = self.modal_target
+        self.modal_mode = None
+        self.modal_target = None
+
+        if not target or not target.is_active:
+            return
+
+        res = subprocess.run(["tmux", "kill-session", "-t", target.name], capture_output=True, text=True)
+        if res.returncode == 0:
+            self.set_toast(f"세션 '{target.name}'을(를) 정상 종료했습니다.", "red")
+        else:
+            self.set_toast(f"세션 종료 실패: {res.stderr.strip()}", "red")
+        self.reload_data()
+
+    # --------------------------------------------------------------------------
+    # 메인 루프
+    # --------------------------------------------------------------------------
+    def run(self):
+        while True:
+            # 자동 새로고침 검사
+            if time.time() - self.last_refresh > self.refresh_interval:
+                self.reload_data()
+
+            self.render()
+
+            try:
+                raw_ch = self.stdscr.get_wch()
+            except curses.error:
+                continue
+            except KeyboardInterrupt:
+                break
+
+            key = normalize_key_input(raw_ch)
+
+            # 창 크기 변경 (btop / k9s 스타일 실시간 재계산)
+            if key == "RESIZE":
+                curses.update_lines_cols()
+                self.stdscr.clear()
+                continue
+
+            # 모달 팝업 상태 입력 처리
+            if self.modal_mode == "help":
+                if key in ("ESC", "ENTER", 'q', 'Q', 'ㅂ', '?', 'h', 'H'):
+                    self.modal_mode = None
+                continue
+
+            if self.modal_mode == "kill_confirm":
+                if key in ('y', 'Y', 'ㅛ'):
+                    self.confirm_kill()
+                elif key in ("ESC", "ENTER", 'n', 'N', 'ㅜ', 'q', 'Q', 'ㅂ'):
+                    self.modal_mode = None
+                    self.modal_target = None
+                    self.set_toast("세션 종료가 취소되었습니다.", "muted")
+                continue
+
+            # 극소형 CLI 폴백 모드 입력 처리 (폭 < 40 또는 높이 < 10)
+            max_y, max_x = self.stdscr.getmaxyx()
+            if max_x < 40 or max_y < 10:
+                if key in ('q', 'Q', 'ㅂ', "ESC"):
+                    break
+                elif isinstance(key, str) and key.isdigit() and '1' <= key <= '9':
+                    idx = int(key) - 1
+                    if idx < len(self.sessions):
+                        self.selected_idx = idx
+                        self.action_attach()
+                elif key in ('r', 'R', 'ㄱ', 'ㄲ'):
+                    if key in ('r', 'ㄱ'):
+                        self.action_recover()
+                    else:
+                        self.reload_data()
+                elif key in ('n', 'N', 'ㅜ'):
+                    self.action_new_chain()
+                continue
+
+            # 일반 메인 내비게이션 & 액션 키 바인딩
+            if key in ('q', 'Q', 'ㅂ', "ESC"):  # 종료 또는 상세에서 목록으로
+                if self.compact_view == "detail":
+                    self.compact_view = "list"
+                else:
+                    break
+            elif key in ("TAB", 'i', 'I', 'ㅑ'):  # 목록 <-> 상세 토글
+                if self.compact_view == "list":
+                    self.compact_view = "detail"
+                    self.details_scroll = 0
+                else:
+                    self.compact_view = "list"
+            elif key in ("UP", 'k', 'K', 'ㅏ'):  # 이전 세션 또는 상세 스크롤 업
+                if self.compact_view == "detail":
+                    self.details_scroll = max(0, self.details_scroll - 1)
+                elif self.sessions:
+                    self.selected_idx = (self.selected_idx - 1) % len(self.sessions)
+                    self.details_scroll = 0
+            elif key in ("DOWN", 'j', 'J', 'ㅓ'):  # 다음 세션 또는 상세 스크롤 다운
+                if self.compact_view == "detail":
+                    self.details_scroll += 1
+                elif self.sessions:
+                    self.selected_idx = (self.selected_idx + 1) % len(self.sessions)
+                    self.details_scroll = 0
+            elif key in ("HOME", 'g'):  # 맨 위로
+                if self.compact_view == "detail":
+                    self.details_scroll = 0
+                else:
+                    self.selected_idx = 0
+                    self.details_scroll = 0
+            elif key in ("END", 'G'):  # 맨 아래로
+                if self.sessions and self.compact_view == "list":
+                    self.selected_idx = len(self.sessions) - 1
+                    self.details_scroll = 0
+            elif isinstance(key, str) and key.isdigit() and '1' <= key <= '9':  # 숫자 키 바로 선택
+                idx = int(key) - 1
+                if idx < len(self.sessions):
+                    self.selected_idx = idx
+                    self.details_scroll = 0
+            elif key == "ENTER":  # Enter (접속)
+                self.action_attach()
+            elif key in ('r', 'R', 'ㄱ', 'ㄲ'):  # 'R'은 새로고침, 'r'은 복구
+                if key in ('r', 'ㄱ'):
+                    self.action_recover()
+                else:
+                    self.reload_data()
+                    self.set_toast("상태를 새로고침했습니다.", "purple")
+            elif key == "F5":  # F5 새로고침
+                self.reload_data()
+                self.set_toast("상태를 새로고침했습니다.", "purple")
+            elif key in ('n', 'N', 'ㅜ'):  # 신규 체인
+                self.action_new_chain()
+            elif key in ('d', 'D', 'ㅇ'):  # Detach
+                self.action_detach()
+            elif key in ('x', 'X', 'ㅌ'):  # 세션 종료 확인
+                self.action_kill()
+            elif key in ('?', 'h', 'H', 'ㅎ'):  # 도움말 모달
+                self.modal_mode = "help"
+
+
+def main():
+    try:
+        curses.wrapper(lambda stdscr: TsTuiApp(stdscr).run())
+    except Exception as e:
+        print(f"\n[ts-tui 오류 발생] {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

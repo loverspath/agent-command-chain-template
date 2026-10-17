@@ -1,0 +1,647 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# ts: TMUX 세션 빠른 접속 및 에이전트 체인 복구/신규 기동 통합 CLI
+# ==============================================================================
+# 사용법:
+#   ts                     대화형 세션 매니저 및 체인 제어 메뉴
+#   ts <번호>              해당 번호의 tmux 세션에 즉시 접속 (예: ts 1)
+#   ts <세션명>            지정한 세션명으로 즉시 접속 (예: ts agentchain-v3)
+#   ts attach <세션|번호>  지정한 tmux 세션에 접속
+#   ts recover [세션]      기존 체인 세션 복구 (Claude 단독 + Remote Control)
+#   ts new [세션]          신규 체인 전체 기동 (Claude + Watchdog + agy + codex)
+#   ts list, ls            현재 세션 목록 및 체인 런타임 상태 출력
+#   ts help, -h            도움말 출력
+# ==============================================================================
+
+set -uo pipefail
+
+# 1. 템플릿 루트 디렉토리 결정 (심볼릭 링크 안전 해석)
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+BIN_DIR="$(dirname "$SCRIPT_PATH")"
+HERE="$(cd "$BIN_DIR/.." && pwd)"
+
+# 2. ANSI 컬러 정의
+if [[ -t 1 ]]; then
+  C_RESET='\033[0m'
+  C_BOLD='\033[1m'
+  C_DIM='\033[2m'
+  C_RED='\033[31m'
+  C_GREEN='\033[32m'
+  C_YELLOW='\033[33m'
+  C_BLUE='\033[34m'
+  C_MAGENTA='\033[35m'
+  C_CYAN='\033[36m'
+else
+  C_RESET=''
+  C_BOLD=''
+  C_DIM=''
+  C_RED=''
+  C_GREEN=''
+  C_YELLOW=''
+  C_BLUE=''
+  C_MAGENTA=''
+  C_CYAN=''
+fi
+
+# 3. 전역 배열 변수
+ACTIVE_SESSIONS=()
+ACTIVE_SESSIONS_INFO=()
+
+# 4. 현재 활성 tmux 세션 목록 파싱
+get_tmux_sessions() {
+  ACTIVE_SESSIONS=()
+  ACTIVE_SESSIONS_INFO=()
+
+  if ! tmux list-sessions >/dev/null 2>&1; then
+    return 0
+  fi
+
+  while IFS='|' read -r name wins attached created; do
+    [[ -z "$name" ]] && continue
+    ACTIVE_SESSIONS+=("$name")
+
+    # 생성 시각 포맷팅
+    local created_fmt=""
+    if [[ -n "$created" && "$created" =~ ^[0-9]+$ ]]; then
+      created_fmt="$(date -d "@$created" '+%m/%d %H:%M' 2>/dev/null || echo "")"
+    fi
+
+    # 윈도우 이름 목록
+    local win_list
+    win_list="$(tmux list-windows -t "$name" -F '#{window_name}' 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
+
+    local att_str="대기 중"
+    if [[ "$attached" -gt 0 ]]; then
+      att_str="접속 중"
+    fi
+
+    ACTIVE_SESSIONS_INFO+=("$wins|$att_str|$created_fmt|$win_list")
+  done < <(tmux list-sessions -F '#{session_name}|#{session_windows}|#{session_attached}|#{session_created}' 2>/dev/null)
+}
+
+# 5. 세션 접속 함수 (내부/외부 tmux 환경 자동 판별)
+attach_session() {
+  local target="$1"
+  if [[ -z "$target" ]]; then
+    echo -e "${C_RED}[오류] 대상 세션명이 지정되지 않았습니다.${C_RESET}" >&2
+    return 1
+  fi
+
+  if ! tmux has-session -t "$target" 2>/dev/null; then
+    echo -e "${C_RED}[오류] tmux 세션 '$target'을(를) 찾을 수 없습니다.${C_RESET}" >&2
+    return 1
+  fi
+
+  echo -e "${C_GREEN}[연결] tmux 세션 '$target'에 접속합니다...${C_RESET}"
+  if [[ -n "${TMUX:-}" ]]; then
+    # 이미 tmux 세션 내부에서 실행한 경우: switch-client 사용
+    tmux switch-client -t "$target"
+  else
+    # 일반 터미널에서 실행한 경우: exec attach로 현재 프로세스 전환
+    exec tmux attach-session -t "$target"
+  fi
+}
+
+# 6. 복구 가능한 체인 인스턴스 탐색 함수
+get_chain_instances() {
+  declare -A seen=()
+  CHAIN_CANDIDATES=()
+
+  # 1) instances/*.env 검색
+  for f in "$HERE"/instances/*.env; do
+    [[ -f "$f" ]] || continue
+    local s
+    s="$(basename "$f" .env)"
+    if [[ -n "$s" && -z "${seen["$s"]:-}" ]]; then
+      seen["$s"]=1
+      CHAIN_CANDIDATES+=("$s")
+    fi
+  done
+
+  # 2) runtime/*/session_name 검색
+  for sn in "$HERE"/runtime/*/session_name; do
+    [[ -f "$sn" ]] || continue
+    local s
+    s="$(head -n1 "$sn" 2>/dev/null | tr -d '\r\n')"
+    if [[ -n "$s" && -z "${seen["$s"]:-}" ]]; then
+      seen["$s"]=1
+      CHAIN_CANDIDATES+=("$s")
+    fi
+  done
+
+  # 정렬
+  if [[ "${#CHAIN_CANDIDATES[@]}" -gt 0 ]]; then
+    IFS=$'\n' CHAIN_CANDIDATES=($(sort <<<"${CHAIN_CANDIDATES[*]}"))
+    unset IFS
+  fi
+}
+
+# 7. 체인 세션 복구 마법사 (기능 2)
+recover_chain() {
+  local target="${1:-}"
+  local dry_run=false
+  shift || true
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry_run=true ;;
+      *) ;;
+    esac
+    shift
+  done
+
+  if [[ -z "$target" ]]; then
+    get_chain_instances
+    echo ""
+    echo -e "${C_BOLD}${C_CYAN}============================================================${C_RESET}"
+    echo -e "${C_BOLD}           기존 체인 세션 복구 (Claude 단독 + RC)${C_RESET}"
+    echo -e "${C_BOLD}${C_CYAN}============================================================${C_RESET}"
+    echo -e "${C_DIM}비정상 종료된 세션의 대화 맥락(--resume) 및 Remote Control을 복원합니다.${C_RESET}"
+    echo ""
+
+    if [[ "${#CHAIN_CANDIDATES[@]}" -gt 0 ]]; then
+      echo -e "${C_YELLOW}[알려진 체인 인스턴스 목록]${C_RESET}"
+      for i in "${!CHAIN_CANDIDATES[@]}"; do
+        local c="${CHAIN_CANDIDATES[$i]}"
+        local st_str="${C_GREEN}DOWN (종료됨 - 복구 가능)${C_RESET}"
+        if tmux has-session -t "$c" 2>/dev/null; then
+          st_str="${C_YELLOW}UP (현재 실행 중)${C_RESET}"
+        fi
+
+        # 런타임 경로 확인
+        local rt=""
+        if [[ -f "$HERE/instances/$c.env" ]]; then
+          rt="$(grep '^ACC_RUNTIME=' "$HERE/instances/$c.env" | cut -d= -f2- | tr -d '"'"' \r\n")"
+        fi
+        if [[ -z "$rt" ]]; then
+          for d in "$HERE"/runtime/*/; do
+            if [[ "$(head -n1 "$d/session_name" 2>/dev/null | tr -d '\r\n')" == "$c" ]]; then
+              rt="${d%/}"
+              break
+            fi
+          done
+        fi
+        local rt_name="$(basename "$rt")"
+        printf "  ${C_BOLD}[%d]${C_RESET} %-18s [%b] ${C_DIM}(런타임: %s)${C_RESET}\n" \
+          "$((i+1))" "$c" "$st_str" "${rt_name:-미정}"
+      done
+    else
+      echo -e "${C_DIM}  등록된 체인 인스턴스가 없습니다.${C_RESET}"
+    fi
+
+    echo ""
+    echo -e "  ${C_BOLD}m${C_RESET} : 세션명 직접 입력"
+    echo -e "  ${C_BOLD}b${C_RESET} : 메인 메뉴로 돌아가기"
+    echo -e "${C_BOLD}${C_CYAN}============================================================${C_RESET}"
+    read -rp "복구할 세션 번호 또는 선택 [1-${#CHAIN_CANDIDATES[@]} / m / b]: " sel
+    sel="${sel:-}"
+
+    case "$sel" in
+      [0-9]*)
+        local idx=$((sel - 1))
+        if [[ "$idx" -ge 0 && "$idx" -lt "${#CHAIN_CANDIDATES[@]}" ]]; then
+          target="${CHAIN_CANDIDATES[$idx]}"
+        else
+          echo -e "${C_RED}[오류] 잘못된 번호입니다.${C_RESET}"
+          return 1
+        fi
+        ;;
+      m|M)
+        read -rp "복구할 세션명을 입력하세요: " manual_target
+        target="$(echo "$manual_target" | tr -d ' ')"
+        [[ -z "$target" ]] && { echo "취소되었습니다."; return 0; }
+        ;;
+      b|B|q|Q)
+        return 0
+        ;;
+      *)
+        echo -e "${C_RED}[오류] 잘못된 선택입니다.${C_RESET}"
+        return 1
+        ;;
+    esac
+  fi
+
+  # 대상 검증: 이미 살아있는 세션이면 복구 거부 (안전 수칙 준수)
+  if tmux has-session -t "$target" 2>/dev/null; then
+    echo ""
+    echo -e "${C_YELLOW}[경고] 세션 '$target'은(는) 이미 tmux에서 실행 중입니다!${C_RESET}"
+    echo -e "${C_DIM}실행 중인 대화와 워커를 보호하기 위해 중복 복구를 거부합니다.${C_RESET}"
+    read -rp "해당 세션에 지금 바로 접속하시겠습니까? [Y/n]: " ans
+    case "${ans:-y}" in
+      [yY]*) attach_session "$target" ;;
+      *) return 0 ;;
+    esac
+    return 0
+  fi
+
+  echo ""
+  echo -e "${C_CYAN}[복구 진행] 세션 '$target' 복구 절차를 시작합니다...${C_RESET}"
+  local recover_script="$HERE/bin/chain-recover.sh"
+  if [[ ! -x "$recover_script" ]]; then
+    echo -e "${C_RED}[오류] 복구 스크립트($recover_script)가 없거나 실행 권한이 없습니다.${C_RESET}" >&2
+    return 1
+  fi
+
+  local dry_opt=""
+  $dry_run && dry_opt="--dry-run"
+
+  if "$recover_script" "$target" $dry_opt; then
+    if $dry_run; then
+      echo -e "${C_CYAN}[dry-run 완료] 실제 세션 생성 없이 명령줄을 확인했습니다.${C_RESET}"
+      return 0
+    fi
+    echo ""
+    echo -e "${C_GREEN}${C_BOLD}[성공] 세션 '$target' 복구가 완료되었습니다!${C_RESET}"
+    echo -e "${C_DIM}(Sonnet 세션 이어붙이기 및 Remote Control 활성화 완료)${C_RESET}"
+    read -rp "복구된 세션에 지금 바로 접속하시겠습니까? [Y/n]: " ans
+    case "${ans:-y}" in
+      [yY]*) attach_session "$target" ;;
+      *) return 0 ;;
+    esac
+  else
+    local code=$?
+    echo -e "${C_RED}[오류] 세션 복구 실패 (종료 코드: $code)${C_RESET}" >&2
+    return "$code"
+  fi
+}
+
+# 8. 신규 체인 전체 기동 마법사 (기능 3)
+new_chain() {
+  local target="${1:-}"
+  local dry_run=false
+  shift || true
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry_run=true ;;
+      *) ;;
+    esac
+    shift
+  done
+
+  echo ""
+  echo -e "${C_BOLD}${C_CYAN}============================================================${C_RESET}"
+  echo -e "${C_BOLD}           신규 에이전트 체인 전체 기동 (v2 Full-Push)${C_RESET}"
+  echo -e "${C_BOLD}${C_CYAN}============================================================${C_RESET}"
+  echo -e "${C_DIM}Claude(Remote Control) + 워치독 v2 + 통신 브리지 + agy + codex 창을 일괄 생성합니다.${C_RESET}"
+  echo ""
+
+  # 1) 세션 이름 입력 및 검증
+  if [[ -z "$target" ]]; then
+    read -rp "새 세션 이름을 입력하세요 (예: agentchain-v4, 취소: Enter): " target
+    target="$(echo "$target" | tr -d ' ')"
+    [[ -z "$target" ]] && { echo "취소되었습니다."; return 0; }
+  fi
+
+  if [[ ! "$target" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    echo -e "${C_RED}[오류] 세션 이름은 영문, 숫자, 하이픈(-), 밑줄(_)만 가능합니다: '$target'${C_RESET}" >&2
+    return 1
+  fi
+
+  # 이미 존재하는 tmux 세션인지 확인
+  if tmux has-session -t "$target" 2>/dev/null; then
+    echo -e "${C_RED}[오류] tmux 세션 '$target'이(가) 이미 존재합니다! 다른 이름을 지정하세요.${C_RESET}" >&2
+    return 1
+  fi
+
+  # 2) 대상 프로젝트 디렉토리 입력
+  local default_proj="/mnt/c/Users/rerun/llm-wiki"
+  [[ -d "$default_proj" ]] || default_proj="$HERE"
+  read -rp "대상 프로젝트 디렉토리 [기본값: $default_proj]: " proj_input
+  local proj_dir="${proj_input:-$default_proj}"
+  if [[ ! -d "$proj_dir" ]]; then
+    echo -e "${C_RED}[오류] 디렉토리가 존재하지 않습니다: $proj_dir${C_RESET}" >&2
+    return 1
+  fi
+  proj_dir="$(cd "$proj_dir" && pwd)"
+
+  # 3) 작업 디렉토리(WORK_DIR) 입력
+  local default_work="/home/rerun/scheduler"
+  [[ -d "$default_work" ]] || default_work="$proj_dir"
+  read -rp "작업 디렉토리(WORK_DIR) [기본값: $default_work]: " work_input
+  local work_dir="${work_input:-$default_work}"
+  [[ -d "$work_dir" ]] && work_dir="$(cd "$work_dir" && pwd)"
+
+  # 4) agy 모드 선택
+  echo ""
+  echo "agy 모드 선택:"
+  echo "  1) resident (상주 TUI 모드 - 권장)"
+  echo "  2) oneshot  (단발 실행 대기 셸 모드)"
+  read -rp "선택 [기본값: 1]: " agy_choice
+  local agy_mode="resident"
+  [[ "${agy_choice:-1}" == "2" ]] && agy_mode="oneshot"
+
+  # 5) 런타임 및 인스턴스 경로 계산
+  local date_tag="$(date +%Y%m%d%H%M%S)"
+  local runtime_dir="$HERE/runtime/${target}-${date_tag}"
+  local inst_file="$HERE/instances/${target}.env"
+
+  # 6) 설정 확인
+  echo ""
+  echo -e "${C_BOLD}------------------------------------------------------------${C_RESET}"
+  echo -e "${C_BOLD}기동 설정 확인:${C_RESET}"
+  echo -e "  - 세션 이름:        ${C_CYAN}$target${C_RESET}"
+  echo -e "  - 프로젝트 디렉토리: $proj_dir"
+  echo -e "  - 작업 디렉토리:     $work_dir"
+  echo -e "  - 워커 구성:        Claude(Remote Control) + agy($agy_mode) + codex(oneshot)"
+  echo -e "  - 브리지/워치독:    Full-Push v2 (FIFO+asyncRewake) + watchdog-v2"
+  echo -e "  - 런타임 디렉토리:   $runtime_dir"
+  echo -e "  - 인스턴스 파일:     $inst_file"
+  echo -e "${C_BOLD}------------------------------------------------------------${C_RESET}"
+
+  if $dry_run; then
+    echo -e "${C_CYAN}[dry-run] 실제 기동하지 않고 시뮬레이션을 종료합니다.${C_RESET}"
+    return 0
+  fi
+
+  read -rp "위 설정으로 신규 체인을 즉시 기동하시겠습니까? [Y/n]: " confirm
+  case "${confirm:-y}" in
+    [yY]*) ;;
+    *) echo "기동이 취소되었습니다."; return 0 ;;
+  esac
+
+  # 7) 런타임 디렉토리 및 인스턴스 파일 생성
+  echo ""
+  echo -e "${C_CYAN}[1/3] 인스턴스 설정 및 런타임 디렉토리 생성 중...${C_RESET}"
+  mkdir -p "$runtime_dir" "$HERE/instances"
+  printf '%s\n' "$target" > "$runtime_dir/session_name"
+  printf '%s\n' "$target" > "$runtime_dir/instance"
+
+  cat > "$inst_file" <<EOF
+# 체인 인스턴스 설정: $target
+SESSION_NAME=$target
+ACC_RUNTIME=$runtime_dir
+PROJECT_DIR=$proj_dir
+WORK_DIR=$work_dir
+HANDOFF_FILE=docs/RESUME_HANDOFF.md
+EOF
+
+  # 8) bootstrap-v2.sh 실행
+  echo -e "${C_CYAN}[2/3] bootstrap-v2.sh 기동 실행 중...${C_RESET}"
+  local bootstrap_script="$HERE/bootstrap-v2.sh"
+  if [[ ! -x "$bootstrap_script" ]]; then
+    echo -e "${C_RED}[오류] 부트스트랩 스크립트($bootstrap_script)가 없거나 실행 권한이 없습니다.${C_RESET}" >&2
+    return 1
+  fi
+
+  if env ACC_INSTANCE="$target" \
+         SESSION_NAME="$target" \
+         PROJECT_DIR="$proj_dir" \
+         WORK_DIR="$work_dir" \
+         ACC_RUNTIME="$runtime_dir" \
+         AGY_MODE="$agy_mode" \
+         START_WATCHDOG=true \
+         "$bootstrap_script"; then
+    echo ""
+    echo -e "${C_GREEN}${C_BOLD}[성공] 신규 체인 세션 '$target'이(가) 가동되었습니다!${C_RESET}"
+    echo -e "${C_DIM}  - Claude(Sonnet + Remote Control) 윈도우 기동 완료${C_RESET}"
+    echo -e "${C_DIM}  - 워치독 v2 백그라운드 안전망 가동 완료${C_RESET}"
+    echo -e "${C_DIM}  - agy($agy_mode), codex(oneshot) 윈도우 생성 완료${C_RESET}"
+    read -rp "새 세션에 지금 바로 접속하시겠습니까? [Y/n]: " ans
+    case "${ans:-y}" in
+      [yY]*) attach_session "$target" ;;
+      *) return 0 ;;
+    esac
+  else
+    local code=$?
+    echo -e "${C_RED}[오류] bootstrap-v2.sh 실행 중 오류가 발생했습니다. (종료 코드: $code)${C_RESET}" >&2
+    return "$code"
+  fi
+}
+
+# 9. 체인 목록 상세 조회 (기능 보조)
+show_chain_list() {
+  echo ""
+  echo -e "${C_BOLD}${C_CYAN}=== 체인 런타임 상세 상태 (bin/chain list) ===${C_RESET}"
+  if [[ -x "$HERE/bin/chain" ]]; then
+    "$HERE/bin/chain" list
+  else
+    echo "bin/chain 스크립트를 찾을 수 없습니다."
+  fi
+  echo ""
+  read -rp "엔터를 누르면 메인 메뉴로 돌아갑니다..." _
+}
+
+# 10. 도움말 출력
+show_help() {
+  echo -e "${C_BOLD}ts - TMUX 빠른 접속 및 에이전트 체인 관리 CLI / TUI${C_RESET}"
+  echo ""
+  echo "사용법:"
+  echo -e "  ${C_BOLD}ts${C_RESET}                      대화형 Tokyo Night TUI 매니저 실행 (기본값)"
+  echo -e "  ${C_BOLD}ts --no-tui${C_RESET}             기존 텍스트 기반 대화형 메뉴 실행"
+  echo -e "  ${C_BOLD}ts tui${C_RESET}                  명시적 TUI 실행"
+  echo -e "  ${C_BOLD}ts <번호>${C_RESET}               해당 번호의 tmux 세션에 즉시 접속 (예: ts 1)"
+  echo -e "  ${C_BOLD}ts <세션명>${C_RESET}             지정한 세션명으로 즉시 접속 (예: ts agentchain-v3)"
+  echo -e "  ${C_BOLD}ts attach <세션|번호>${C_RESET}   지정한 tmux 세션에 접속 (단축어: ts a)"
+  echo -e "  ${C_BOLD}ts recover [세션명]${C_RESET}     기존 체인 세션 복구 (단축어: ts r) (Claude 단독 + RC)"
+  echo -e "  ${C_BOLD}ts new [세션명]${C_RESET}         신규 체인 전체 기동 (단축어: ts n) (Claude+Watchdog+agy+codex)"
+  echo -e "  ${C_BOLD}ts list${C_RESET}                 세션 및 체인 런타임 전체 목록 확인 (단축어: ts ls, ts l)"
+  echo -e "  ${C_BOLD}ts help${C_RESET}                 도움말 표시 (단축어: ts -h, ts --help)"
+  echo ""
+  echo "안전 수칙:"
+  echo "  - 이미 살아있는 세션(agentchain-v3 등)에 대한 중복 복구/기동은 자동 차단됩니다."
+  echo "  - tmux 세션 내부에서 실행 시 switch-client로 자연스럽게 세션을 전환합니다."
+  echo "  - 일반 쉘에서 실행 시 exec tmux attach로 쉘 프로세스를 낭비 없이 전환합니다."
+}
+
+# 11. 대화형 메인 메뉴 루프
+interactive_menu() {
+  while true; do
+    get_tmux_sessions
+
+    echo ""
+    echo -e "${C_BOLD}${C_CYAN}============================================================${C_RESET}"
+    echo -e "${C_BOLD}        TMUX 세션 매니저 & 에이전트 체인 CLI (ts)${C_RESET}"
+    echo -e "${C_BOLD}${C_CYAN}============================================================${C_RESET}"
+
+    local num_sessions="${#ACTIVE_SESSIONS[@]}"
+    if [[ "$num_sessions" -gt 0 ]]; then
+      echo -e "${C_YELLOW}[현재 실행 중인 tmux 세션]${C_RESET}"
+      for i in "${!ACTIVE_SESSIONS[@]}"; do
+        local s="${ACTIVE_SESSIONS[$i]}"
+        IFS="|" read -r wins att dt wl <<< "${ACTIVE_SESSIONS_INFO[$i]}"
+
+        local att_color="$C_DIM"
+        [[ "$att" == "접속 중" ]] && att_color="$C_GREEN"
+
+        printf "  ${C_BOLD}[%d]${C_RESET} ${C_BOLD}%-20s${C_RESET} (창 %s개: ${C_CYAN}%-26s${C_RESET}) [${att_color}%s${C_RESET}] ${C_DIM}(%s)${C_RESET}\n" \
+          "$((i+1))" "$s" "$wins" "$wl" "$att" "$dt"
+      done
+    else
+      echo -e "  ${C_YELLOW}[!] 현재 실행 중인 tmux 세션이 없습니다.${C_RESET}"
+    fi
+
+    echo ""
+    echo -e "${C_YELLOW}[작업 메뉴]${C_RESET}"
+    if [[ "$num_sessions" -gt 0 ]]; then
+      echo -e "  ${C_BOLD}1 ~ $num_sessions${C_RESET} : 해당 번호 세션 접속 (tmux attach)"
+    fi
+    echo -e "  ${C_BOLD}r${C_RESET}     : 기존 체인 세션 복구 (Claude 단독 + Remote Control)"
+    echo -e "  ${C_BOLD}n${C_RESET}     : 신규 체인 전체 기동 (Claude + Watchdog + agy + codex)"
+    echo -e "  ${C_BOLD}l${C_RESET}     : 체인 런타임 상세 상태 확인 (bin/chain list)"
+    echo -e "  ${C_BOLD}q${C_RESET}     : 종료 (Quit)"
+    echo -e "${C_BOLD}${C_CYAN}============================================================${C_RESET}"
+
+    local default_hint=""
+    [[ "$num_sessions" -gt 0 ]] && default_hint=" (기본값: 1)"
+    read -rp "선택${default_hint}: " choice
+    choice="${choice:-}"
+    [[ -z "$choice" && "$num_sessions" -gt 0 ]] && choice="1"
+
+    case "$choice" in
+      [0-9]*)
+        if [[ "$choice" -ge 1 && "$choice" -le "$num_sessions" ]]; then
+          local idx=$((choice - 1))
+          attach_session "${ACTIVE_SESSIONS[$idx]}"
+          break
+        else
+          echo -e "${C_RED}[오류] 잘못된 세션 번호입니다: $choice (1~$num_sessions 범위 입력)${C_RESET}"
+          sleep 1
+        fi
+        ;;
+      r|R|recover)
+        recover_chain
+        ;;
+      n|N|new)
+        new_chain
+        ;;
+      l|L|list|ls)
+        show_chain_list
+        ;;
+      q|Q|quit|exit)
+        echo -e "${C_DIM}종료합니다.${C_RESET}"
+        exit 0
+        ;;
+      *)
+        # 입력값이 실행 중인 세션명과 일치하는지 확인
+        if tmux has-session -t "$choice" 2>/dev/null; then
+          attach_session "$choice"
+          break
+        else
+          echo -e "${C_RED}[오류] 알 수 없는 선택입니다: '$choice'${C_RESET}"
+          sleep 1
+        fi
+        ;;
+    esac
+  done
+}
+
+# 12. 메인 CLI 디스패처
+main() {
+  command -v tmux >/dev/null 2>&1 || {
+    echo -e "${C_RED}[오류] tmux가 설치되어 있지 않습니다. sudo apt install tmux 로 설치해주세요.${C_RESET}" >&2
+    exit 1
+  }
+
+  if [[ $# -eq 0 ]]; then
+    # 대화형 터미널에서 실행 시 기본적으로 Tokyo Night TUI 매니저 실행
+    if [[ -t 0 && -t 1 && -x "$BIN_DIR/ts-tui" ]]; then
+      exec "$BIN_DIR/ts-tui"
+    fi
+    interactive_menu
+    return
+  fi
+
+  local cmd="$1"; shift || true
+  case "$cmd" in
+    --no-tui)
+      interactive_menu
+      return
+      ;;
+    tui)
+      if [[ -x "$BIN_DIR/ts-tui" ]]; then
+        exec "$BIN_DIR/ts-tui" "$@"
+      else
+        echo -e "${C_RED}[오류] ts-tui 스크립트를 찾을 수 없습니다: $BIN_DIR/ts-tui${C_RESET}" >&2
+        exit 1
+      fi
+      ;;
+    [0-9]*)
+      get_tmux_sessions
+      local idx=$((cmd - 1))
+      if [[ "$idx" -ge 0 && "$idx" -lt "${#ACTIVE_SESSIONS[@]}" ]]; then
+        attach_session "${ACTIVE_SESSIONS[$idx]}"
+      else
+        echo -e "${C_RED}[오류] 세션 번호 $cmd 번을 찾을 수 없습니다. (현재 활성 세션: 1~${#ACTIVE_SESSIONS[@]}번)${C_RESET}" >&2
+        exit 1
+      fi
+      ;;
+    a|attach)
+      local target="${1:-}"
+      if [[ -z "$target" ]]; then
+        echo -e "${C_RED}사용법: ts attach <세션명|번호>${C_RESET}" >&2
+        exit 1
+      fi
+      if [[ "$target" =~ ^[0-9]+$ ]]; then
+        get_tmux_sessions
+        local idx=$((target - 1))
+        if [[ "$idx" -ge 0 && "$idx" -lt "${#ACTIVE_SESSIONS[@]}" ]]; then
+          target="${ACTIVE_SESSIONS[$idx]}"
+        fi
+      fi
+      attach_session "$target"
+      ;;
+    r|recover)
+      recover_chain "${1:-}" "$@"
+      ;;
+    n|new)
+      new_chain "${1:-}" "$@"
+      ;;
+    l|ls|list)
+      echo -e "${C_BOLD}${C_CYAN}=== 활성 tmux 세션 목록 ===${C_RESET}"
+      get_tmux_sessions
+      if [[ "${#ACTIVE_SESSIONS[@]}" -gt 0 ]]; then
+        for i in "${!ACTIVE_SESSIONS[@]}"; do
+          local s="${ACTIVE_SESSIONS[$i]}"
+          IFS="|" read -r wins att dt wl <<< "${ACTIVE_SESSIONS_INFO[$i]}"
+          printf "  [%d] %-20s (창 %s개: %-25s) [%s] (%s)\n" \
+            "$((i+1))" "$s" "$wins" "$wl" "$att" "$dt"
+        done
+      else
+        echo "  (활성 세션 없음)"
+      fi
+      echo ""
+      echo -e "${C_BOLD}${C_CYAN}=== 체인 런타임 목록 (bin/chain list) ===${C_RESET}"
+      if [[ -x "$HERE/bin/chain" ]]; then
+        "$HERE/bin/chain" list
+      fi
+      ;;
+    h|help|-h|--help)
+      show_help
+      ;;
+    *)
+      # 활성 tmux 세션 이름인지 확인
+      if tmux has-session -t "$cmd" 2>/dev/null; then
+        attach_session "$cmd"
+      else
+        # 알려진 복구 대상 세션인지 확인
+        local known=false
+        if [[ -f "$HERE/instances/$cmd.env" ]]; then
+          known=true
+        else
+          for sn in "$HERE"/runtime/*/session_name; do
+            if [[ -f "$sn" && "$(head -n1 "$sn" 2>/dev/null | tr -d '\r\n')" == "$cmd" ]]; then
+              known=true
+              break
+            fi
+          done
+        fi
+
+        if [[ "$known" == "true" ]]; then
+          echo -e "${C_YELLOW}세션 '$cmd'은(는) 현재 실행 중이지 않지만 복구 가능한 체인입니다.${C_RESET}"
+          read -rp "지금 복구하시겠습니까? [Y/n]: " ans
+          case "${ans:-y}" in
+            [yY]*) recover_chain "$cmd" ;;
+            *) exit 0 ;;
+          esac
+        else
+          echo -e "${C_RED}[오류] 세션 또는 명령어 '$cmd'을(를) 찾을 수 없습니다.${C_RESET}" >&2
+          echo -e "도움말을 보려면 ${C_BOLD}ts --help${C_RESET}를 실행하세요." >&2
+          exit 1
+        fi
+      fi
+      ;;
+  esac
+}
+
+main "$@"

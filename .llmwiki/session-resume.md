@@ -329,3 +329,20 @@ Claude Sonnet(계층 1 감독자)으로서 지켜야 할 핵심 행동 규범이
 5. **논의는 승인이 아니다 (Discussion != Approval)**:
    - 사용자가 "어떻게 생각하세요?", "이런 방향은 어떨까요?"라고 질문한 것은 계획 수립을 위한 의견 교환일 뿐, 구현 착수 승인이 아니다.
    - 반드시 계획을 정리하여 제시한 뒤 사용자의 명시적인 진행 승인을 얻고 디스패치하라.
+
+---
+
+## 부록: tmux 서버 사망(WSL/윈도우 재부팅) 후 세션 복구
+
+`tmux ls` 가 "no server running" 이면 세션·워치독·상주 워커가 모두 죽은 것이다 (디스크의 `runtime/` 과 Claude 대화 transcript 는 보존).
+세션명은 인스턴스마다 다르므로 `bin/chain list` 로 확인 후:
+
+```bash
+bin/chain-recover.sh <세션명> --dry-run   # 런타임/PROJECT_DIR/감독자 session id 탐색 결과 확인
+bin/chain-recover.sh <세션명>             # sonnet/agy/codex 창 재생성 + claude --resume --remote-control
+bin/ts                                     # 또는 Tokyo Night TUI 매니저 실행 후 세션 선택 및 [r] 복구
+```
+
+복구되지 않는 것: 워치독, agy 상주 TUI, 진행 중 codex/agy 작업, 끊긴 백그라운드 쉘. 감독자 세션에서 인계 파일을 재읽고 재dispatch 한다.
+정식 재기동(워치독 포함)은 `bootstrap-v2.sh --restart` 이나 감독자가 새 세션이 되어 이력이 이어지지 않는다.
+Claude 스킬: `~/.claude/skills/agentchain-recover`.

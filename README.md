@@ -84,6 +84,10 @@ tmux session: agentchain (config.env의 SESSION_NAME)
 | | `bin/event-emit.sh` | 원자적 이벤트 스풀링(Durable Outbox) 및 FIFO 펄스 전송 |
 | | `bin/sonnet-event-wait.sh` | Claude Code asyncRewake 전용 FIFO 이벤트 대기 어댑터 (exit 2로 기상) |
 | | `bin/event-ack.sh` | 처리 완료된 이벤트의 archive 이동 및 FIFO 드레인 |
+| | `bin/ts`, `bin/ts-tui` | TMUX 빠른 접속 및 에이전트 체인 복구/신규 기동 통합 CLI & Tokyo Night TUI (`ts`) ([상세 가이드](tools/ts/README.md)) |
+| | `tools/ts/` | `ts` 세션 매니저 통합 도구 킷 보관소 및 설치 스크립트 ([문서](tools/ts/README.md)) |
+| | `bin/chain-recover.sh` | 비정상 종료된 체인 복구 (Claude 단독 + Remote Control) |
+| | `bin/chain` | 체인 런타임/리스너/워치독 목록 및 상태 점검 도구 |
 | | `bin/dispatch.sh` | 작업 디스패처 (4계층 세션 자동 해석, v2 마커 검증, `--dry-run` 지원) |
 | | `bin/agy-stop-hook.sh` | Stage 1 agy 상주 모드 Native Stop 훅 핸들러 |
 | | `lib/session.sh` | 세션명 자동 해석 및 v2 런타임/마커 검증 공통 라이브러리 |
@@ -127,6 +131,7 @@ SESSION_NAME=agentchain-v2 ~/agent-command-chain-template/bin/dispatch.sh agy --
 # ~/agent-command-chain-template/watchdog.sh &
 
 tmux attach -t agentchain-v2                       # 직접 들어가서 보고 싶을 때 (v2 세션)
+./bin/ts                                           # Tokyo Night TUI 세션 매니저 및 체인 복구/기동
 ```
 
 ## 5. 알려진 한계 및 주의사항
