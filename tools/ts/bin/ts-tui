@@ -1472,12 +1472,14 @@ class TsTuiApp:
             return
 
         curses.endwin()
+        ret_code = None
         try:
             print("\033c", end="")  # 터미널 화면 클리어
             cmd = [os.path.join(TEMPLATE_ROOT, "bin", "ts"), "recover"]
             if target_name:
                 cmd.append(target_name)
-            subprocess.run(cmd)
+            res = subprocess.run(cmd)
+            ret_code = res.returncode
             print("\n엔터를 누르면 TUI 매니저로 복귀합니다...")
             input()
         except KeyboardInterrupt:
@@ -1485,15 +1487,22 @@ class TsTuiApp:
         finally:
             self.stdscr.refresh()
             self.reload_data()
-            self.set_toast("복구 절차가 완료되었습니다.", "purple")
+            if ret_code == 0:
+                self.set_toast("복구 절차가 완료되었습니다.", "purple")
+            elif ret_code is not None:
+                self.set_toast(f"복구 절차가 실패했습니다 (종료 코드 {ret_code})", "red")
+            else:
+                self.set_toast("복구 절차가 취소되었습니다.", "yellow")
 
     def action_new_chain(self):
         """신규 체인 전체 기동 마법사 호출"""
         curses.endwin()
+        ret_code = None
         try:
             print("\033c", end="")
             cmd = [os.path.join(TEMPLATE_ROOT, "bin", "ts"), "new"]
-            subprocess.run(cmd)
+            res = subprocess.run(cmd)
+            ret_code = res.returncode
             print("\n엔터를 누르면 TUI 매니저로 복귀합니다...")
             input()
         except KeyboardInterrupt:
@@ -1501,7 +1510,12 @@ class TsTuiApp:
         finally:
             self.stdscr.refresh()
             self.reload_data()
-            self.set_toast("신규 체인 마법사가 종료되었습니다.", "purple")
+            if ret_code == 0:
+                self.set_toast("신규 체인 마법사가 종료되었습니다.", "purple")
+            elif ret_code is not None:
+                self.set_toast(f"신규 체인 마법사가 실패했습니다 (종료 코드 {ret_code})", "red")
+            else:
+                self.set_toast("신규 체인 마법사가 취소되었습니다.", "yellow")
 
     def action_detach(self):
         """현재 세션에서 클라이언트 Detach"""
