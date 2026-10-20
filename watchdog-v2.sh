@@ -255,6 +255,53 @@ write_task_state() {
   fi
 }
 
+# 상주 agy 완료 보정: Stop hook이 완료를 놓쳐(무작업 종료·timeout 등) running으로 고착된 작업을
+# transcript 센티널로 되살린다. 판정과 커밋은 hook을 합성 payload로 다시 불러 hook의 가드를 그대로 쓴다.
+RECONCILE_QUIET_SECONDS="${RECONCILE_QUIET_SECONDS:-120}"
+
+reconcile_resident_sentinel() {
+  local task_id="$1" task_dir="$2" now="$3"
+  local trans_path="" res_pane=""
+  if [[ -f "$ACC_RUNTIME/workers/agy.transcript" ]]; then
+    trans_path="$(head -n 1 "$ACC_RUNTIME/workers/agy.transcript" 2>/dev/null | tr -d '\r\n')"
+  fi
+  [[ -n "$trans_path" && -f "$trans_path" ]] || return 0
+  res_pane="$(sed -n 's/^pane_id=//p' "$ACC_RUNTIME/workers/agy.resident" 2>/dev/null | head -n 1 | tr -d '\r\n')"
+  [[ -n "$res_pane" ]] || return 0
+
+  # 메인 transcript가 조용해야 한다(정상 hook이 먼저 처리할 시간)
+  local t_mtime
+  t_mtime="$(stat -c %Y "$trans_path" 2>/dev/null || echo 0)"
+  (( now - t_mtime >= RECONCILE_QUIET_SECONDS )) || return 0
+
+  # 같은 transcript 상태로는 한 번만 시도
+  local tried_file="$task_dir/reconcile.tried"
+  if [[ -f "$tried_file" && "$(head -n 1 "$tried_file" 2>/dev/null)" == "$t_mtime" ]]; then
+    return 0
+  fi
+
+  # 센티널 후보가 있을 때만(최종 판정은 hook: 마지막 MODEL 응답·started 이후)
+  tail -c 262144 "$trans_path" 2>/dev/null | grep -qE "\[\[(DONE|BLOCKED)[[:space:]]+${task_id}[[:space:]]*\]\]" || return 0
+
+  # 이 대화의 subagent transcript가 최근에 움직였으면 아직 일하는 중
+  local conv_dir="${trans_path%/.system_generated/*}"
+  local conv_id="${conv_dir##*/}" brain_dir="${conv_dir%/*}" sub=""
+  while IFS= read -r sub; do
+    if head -n 1 "$sub" 2>/dev/null | grep -qF "sender=$conv_id"; then
+      return 0
+    fi
+  done < <(find "$brain_dir" -mindepth 4 -maxdepth 4 -path '*/.system_generated/logs/transcript_full.jsonl' \
+             -newermt "@$(( now - RECONCILE_QUIET_SECONDS ))" ! -path "$conv_dir/*" 2>/dev/null)
+
+  printf '%s\n' "$t_mtime" > "$tried_file"
+  printf '{"fullyIdle":true,"transcriptPath":"%s"}' "$trans_path" | \
+    ACC_RUNTIME="$ACC_RUNTIME" TMUX_PANE="$res_pane" ACC_HOOK_SOURCE=watchdog \
+    timeout 60 "$HERE/bin/agy-stop-hook.sh" >/dev/null 2>&1 || true
+  local new_status
+  new_status="$(sed -n 's/^status=//p' "$task_dir/state" 2>/dev/null | head -n 1)"
+  log "Task $task_id 센티널 보정 시도 (transcript 정지 $(( now - t_mtime ))s) → status=${new_status:-unknown}"
+}
+
 check_running_tasks() {
   local now
   now="$(date +%s)"
@@ -452,6 +499,12 @@ check_running_tasks() {
         [[ -n "$term_fd" ]] && exec {term_fd}>&-
       fi
       continue
+    fi
+
+    # 1b. 상주 agy: hook이 놓친 완료 보정
+    if [[ "$this_mode" == "resident" && "$worker" == "agy" && "$status" == "running" ]]; then
+      reconcile_resident_sentinel "$task_id" "$task_dir" "$now"
+      grep -q '^status=running' "$state_file" 2>/dev/null || continue
     fi
 
     # 2. Deadline 초과 검사

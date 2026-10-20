@@ -17,9 +17,28 @@ runtime="${ACC_RUNTIME:-}"
 res_pane_id=""
 mismatch_tag=""
 
+# 결정 사유는 ACC_HOOK_DEBUG와 무관하게 항상 한 줄 남긴다(무작업 종료 원인 확정용, 1MB 넘으면 .1로 회전).
+# 런타임을 모르면 ~/.cache/acc-hook.log. 'start' 줄만 있고 결정 줄이 없으면 hook이 도중에 죽은 것(timeout 등).
+decision_log() {
+  local reason_tag="${1:-none}"
+  local log_path="${HOME:-/tmp}/.cache/acc-hook.log"
+  if [[ -n "$runtime" && -d "$runtime" ]]; then
+    log_path="$runtime/hook-decisions.log"
+  else
+    mkdir -p "${log_path%/*}" 2>/dev/null || true
+  fi
+  if [[ -f "$log_path" ]] && (( $(stat -c %s "$log_path" 2>/dev/null || echo 0) > 1048576 )); then
+    mv -f "$log_path" "$log_path.1" 2>/dev/null || true
+  fi
+  printf '%s pid=%s src=%s task=%s tag=%s fullyIdle=%s termReason=%s payload_bytes=%s pane=%s\n' \
+    "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$$" "${ACC_HOOK_SOURCE:-stop}" "${task_id:-none}" "$reason_tag" \
+    "${fully_idle:-unknown}" "${term_reason:-none}" "${#raw_payload}" "${TMUX_PANE:-none}" >> "$log_path" 2>/dev/null || true
+}
+
 debug_log() {
   local decision="${1:-allow}"
   local reason_tag="${2:-none}"
+  decision_log "$reason_tag"
   if [[ "${ACC_HOOK_DEBUG:-0}" == "1" && -n "$runtime" && -d "$runtime" ]]; then
     printf '[%s] pane=%s res_pane=%s fullyIdle=%s termReason=%s decision=%s tag=%s trans=%s\n' \
       "$(date +%s)" "${TMUX_PANE:-}" "${res_pane_id:-none}" "${fully_idle:-unknown}" "${term_reason:-none}" "$decision" "$reason_tag" "${trans_path:-none}" >> "$runtime/hook-debug.log" 2>/dev/null || true
@@ -34,6 +53,8 @@ respond_and_exit() {
   printf '{"decision": "%s"}\n' "$decision"
   exit 0
 }
+
+decision_log "start"
 
 # 빈 페이로드 방어
 if [[ -z "$raw_payload" ]]; then
@@ -348,7 +369,8 @@ else:
       # 센티널 부재: deadline 확인
       now="$(date +%s)"
       deadline_epoch="$(sed -n 's/^deadline_epoch=//p' "$state_file" 2>/dev/null | head -n 1 | tr -d '\r\n')"
-      if [[ -n "$deadline_epoch" && "$deadline_epoch" =~ ^[0-9]+$ ]] && (( now > deadline_epoch )); then
+      # watchdog 보정 호출은 완료 판정만 한다(마감 처리는 watchdog 자체 정책, WATCHDOG_AUTO_KILL)
+      if [[ "${ACC_HOOK_SOURCE:-}" != "watchdog" && -n "$deadline_epoch" && "$deadline_epoch" =~ ^[0-9]+$ ]] && (( now > deadline_epoch )); then
         # 기한 초과: timeout 에러 발행 및 종료
         final_kind="error"
         summary="Task deadline exceeded (${now} > ${deadline_epoch}): timeout"
@@ -361,6 +383,10 @@ else:
       fi
       ;;
   esac
+  # watchdog 보정 호출(ACC_HOOK_SOURCE=watchdog)은 transcript 센티널을 보고 들어오므로 표시를 남긴다
+  if [[ "${ACC_HOOK_SOURCE:-}" == "watchdog" ]]; then
+    summary="$summary (reconciled by watchdog)"
+  fi
 fi
 
 # 11. 완료 또는 에러 이벤트 발행
@@ -373,6 +399,7 @@ export ACC_EXIT_CODE="$exit_code"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # event-emit.sh 호출 (Durable Outbox 및 FIFO 펄스)
+emit_tag="event_emitted"
 if eval "\"$HERE/bin/event-emit.sh\" agy \"$final_kind\" \"$task_id\" \"$summary\" \"$detail_path\" \"$term_evt_id\" ${term_fd}>&-"; then
   # 12. 작업 상태 갱신
   completed_epoch="$(date +%s)"
@@ -390,6 +417,8 @@ if eval "\"$HERE/bin/event-emit.sh\" agy \"$final_kind\" \"$task_id\" \"$summary
     rm -f "$busy_file"
   fi
   rm -rf "$runtime/workers/agy.lock" 2>/dev/null || true
+else
+  emit_tag="event_emit_failed"
 fi
 
 flock -u "$term_fd" 2>/dev/null || true
@@ -398,5 +427,5 @@ flock -u "$term_fd" 2>/dev/null || true
 if [[ -n "$mismatch_tag" ]]; then
   respond_and_exit "allow" "$mismatch_tag"
 else
-  respond_and_exit "allow" "event_emitted"
+  respond_and_exit "allow" "$emit_tag"
 fi
