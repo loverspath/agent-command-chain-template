@@ -275,7 +275,7 @@ for tid in post["tasks"]:
         diffs.append(f"Unexpected new task created: {tid}")
 
 if pre["workers"] != post["workers"]:
-    diffs.append("Workers directory altered: pre={} post={}".format(list(pre['workers'].keys()), list(post['workers'].keys())))
+    diffs.append("Workers directory altered: pre={} post={}".format(list(pre["workers"].keys()), list(post["workers"].keys())))
 
 events_diff = (pre["events_active"] != post["events_active"]) or (pre["archive_count"] != post["archive_count"])
 running_task_changed = any(post["tasks"].get(tid) != pre["tasks"].get(tid) for tid in pre_running)
@@ -289,7 +289,7 @@ if (events_diff or running_task_changed):
         print("[lib-isolated-env] 경고: 라이브 task 진행 중 — 시그니처 비교 생략(경고 출력)", file=sys.stderr)
         sys.exit(0)
     else:
-        print("[lib-isolated-env] FATAL ISOLATION VIOLATION: Events mutated without running tasks (pre_evts={}, post_evts={})".format(pre['events_active'], post['events_active']), file=sys.stderr)
+        print("[lib-isolated-env] FATAL ISOLATION VIOLATION: Events mutated without running tasks (pre_evts={}, post_evts={})".format(pre["events_active"], post["events_active"]), file=sys.stderr)
         sys.exit(1)
 
 sys.exit(0)
@@ -563,7 +563,7 @@ if os.path.lexists(token_path):
         data["token"]["link_target"] = os.readlink(token_path)
 
 excluded_dirs = {"brain", "conversations", "cache", "log", "presence", "annotations", "crashes", "scratch"}
-excluded_exts = {".db", ".db-shm", ".db-wal", ".log", ".pb"}
+excluded_exts = {".db", ".db-shm", ".db-wal", ".log", ".pb", ".tmp"}
 excluded_files = {"history.jsonl", "last_check.timestamp", "antigravity-oauth-token"}
 
 if os.path.isdir(cli_dir):
@@ -648,7 +648,7 @@ if os.path.lexists(token_path):
         post["token"]["link_target"] = os.readlink(token_path)
 
 excluded_dirs = {"brain", "conversations", "cache", "log", "presence", "annotations", "crashes", "scratch"}
-excluded_exts = {".db", ".db-shm", ".db-wal", ".log", ".pb"}
+excluded_exts = {".db", ".db-shm", ".db-wal", ".log", ".pb", ".tmp"}
 excluded_files = {"history.jsonl", "last_check.timestamp", "antigravity-oauth-token"}
 
 if os.path.isdir(cli_dir):

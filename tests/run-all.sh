@@ -79,6 +79,11 @@ run_suite "test_resolve_model.sh"
 run_suite "test_task_abandon.sh"
 run_suite "test-config-layering.sh"
 run_suite "test-watchdog-runtime.sh"
+run_suite "test_reason_code.sh"
+run_suite "test_recovery_note.sh"
+run_suite "test_worktree_isolation.sh"
+run_suite "test_term_wrapper.sh"
+run_suite "test_observe_gate.sh"
 
 end_time=$(date +%s)
 elapsed=$((end_time - start_time))

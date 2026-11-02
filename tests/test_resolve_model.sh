@@ -170,5 +170,117 @@ if [[ "$rc" -eq 0 ]]; then
 fi
 echo "PASS: Both fail returns non-zero (rc=$rc)"
 
+echo "=== Test 8: Agy live catalog highest version selection ==="
+cat > "$FAKE_BIN/agy" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$*" == *"models"* ]]; then
+  cat <<'TXT'
+gemini-3.5-argon-high	Gemini 3.5 Argon (High)
+gemini-4-argon-high	Gemini 4 Argon (High)
+gemini-3.10-argon-high	Gemini 3.10 Argon (High)
+claude-opus-4-6-high	Claude Opus 4.6 (High)
+claude-opus-5-5-high	Claude Opus 5.5 (High)
+TXT
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$FAKE_BIN/agy"
+
+out_argon="$("$RESOLVE_SCRIPT" --harness agy default)"
+if [[ "$out_argon" != "gemini-4-argon-high" ]]; then
+  echo "FAIL: Expected 'gemini-4-argon-high', got '$out_argon'" >&2
+  exit 1
+fi
+out_opus="$("$RESOLVE_SCRIPT" --harness agy deep)"
+if [[ "$out_opus" != "claude-opus-5-5-high" ]]; then
+  echo "FAIL: Expected 'claude-opus-5-5-high', got '$out_opus'" >&2
+  exit 1
+fi
+echo "PASS: Agy highest version selection verified"
+
+echo "=== Test 9: Agy role aliases and --effort override ==="
+cat > "$FAKE_BIN/agy" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$*" == *"models"* ]]; then
+  cat <<'TXT'
+gemini-4-argon-low	Gemini 4 Argon (Low)
+gemini-4-argon-high	Gemini 4 Argon (High)
+gemini-3.8-flash-high	Gemini 3.8 Flash (High)
+claude-opus-5-5-high	Claude Opus 5.5 (High)
+claude-sonnet-5-5-medium	Claude Sonnet 5.5 (Medium)
+TXT
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$FAKE_BIN/agy"
+
+out_fast="$("$RESOLVE_SCRIPT" --harness agy fast)"
+if [[ "$out_fast" != "gemini-3.8-flash-high" ]]; then
+  echo "FAIL: Expected 'gemini-3.8-flash-high', got '$out_fast'" >&2
+  exit 1
+fi
+out_low="$("$RESOLVE_SCRIPT" --harness agy argon --effort low)"
+if [[ "$out_low" != "gemini-4-argon-low" ]]; then
+  echo "FAIL: Expected 'gemini-4-argon-low', got '$out_low'" >&2
+  exit 1
+fi
+echo "PASS: Agy role aliases and --effort override verified"
+
+echo "=== Test 10: Agy live fails -> falls back to AGY_MODELS_CACHE ==="
+cat > "$FAKE_BIN/agy" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$FAKE_BIN/agy"
+
+AGY_CACHE="$TMP_DIR/agy_cache.txt"
+cat > "$AGY_CACHE" <<'EOF'
+gemini-4-argon-high	Gemini 4 Argon (High)
+gemini-3.8-flash-high	Gemini 3.8 Flash (High)
+EOF
+
+out_cache="$(AGY_MODELS_CACHE="$AGY_CACHE" "$RESOLVE_SCRIPT" --harness agy argon)"
+if [[ "$out_cache" != "gemini-4-argon-high" ]]; then
+  echo "FAIL: Expected 'gemini-4-argon-high' from cache, got '$out_cache'" >&2
+  exit 1
+fi
+echo "PASS: Agy cache fallback verified"
+
+echo "=== Test 11: Agy missing cache exit 66 and unlisted tier exit 1 ==="
+rc=0
+AGY_MODELS_CACHE="$TMP_DIR/nonexistent.txt" "$RESOLVE_SCRIPT" --harness agy argon 2>/dev/null || rc=$?
+if [[ "$rc" -ne 66 ]]; then
+  echo "FAIL: Expected exit 66 for missing agy cache, got $rc" >&2
+  exit 1
+fi
+
+rc=0
+AGY_MODELS_CACHE="$AGY_CACHE" "$RESOLVE_SCRIPT" --harness agy nonexistent_tier 2>/dev/null || rc=$?
+if [[ "$rc" -ne 1 ]]; then
+  echo "FAIL: Expected exit 1 for unlisted agy tier, got $rc" >&2
+  exit 1
+fi
+echo "PASS: Agy error code conventions (66 and 1) verified"
+
+echo "=== Test 12: Positional shorthand syntax (agy opus high) ==="
+cat > "$FAKE_BIN/agy" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$*" == *"models"* ]]; then
+  echo -e "claude-opus-5-5-high\tClaude Opus 5.5 (High)"
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$FAKE_BIN/agy"
+
+out_pos="$("$RESOLVE_SCRIPT" agy opus high)"
+if [[ "$out_pos" != "claude-opus-5-5-high" ]]; then
+  echo "FAIL: Expected 'claude-opus-5-5-high' for positional shorthand, got '$out_pos'" >&2
+  exit 1
+fi
+echo "PASS: Positional shorthand syntax verified"
+
 echo "All tests in test_resolve_model.sh passed successfully!"
 exit 0
