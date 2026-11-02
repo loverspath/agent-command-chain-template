@@ -23,6 +23,8 @@ fi
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # 초안 위치(scratchpad)에서 돌릴 때를 위한 템플릿 경로 해석
 [[ -f "$HERE/bootstrap-v2.sh" ]] || HERE="${ACC_TEMPLATE_ROOT_OVERRIDE:-/home/rerun/agent-command-chain-template}"
+# shellcheck disable=SC1091
+[[ -f "$HERE/lib/term.sh" ]] && source "$HERE/lib/term.sh"
 
 # 호출자 환경 스냅샷 (판단용으로만 쓰고 그대로 신뢰하지 않음)
 CALLER_ACC_RUNTIME="${ACC_RUNTIME:-}"
@@ -239,8 +241,8 @@ else
 fi
 if [[ -n "$RT" ]]; then
   last_codex="$(ls -1d "$RT"/tasks/codex-* 2>/dev/null | sort | tail -n1)"
-  if [[ -n "$last_codex" ]] && lim="$(tail -c 4000 "$last_codex/output.log" 2>/dev/null | grep -m1 -oE "hit your usage limit.*try again at [^.]*")"; then
-    add WARN "codex 쿼터" "최근 codex 작업이 사용 한도로 실패(${lim##*try again at }까지) → 그동안 agy 로 폴백"
+  if [[ -n "$last_codex" ]] && { grep -q '^reason_code=transient_quota' "$last_codex/state" 2>/dev/null || lim="$(tail -c 4000 "$last_codex/output.log" 2>/dev/null | grep -m1 -oE "hit your usage limit.*try again at [^.]*")"; }; then
+    add WARN "codex 쿼터" "최근 codex 작업이 사용 한도로 실패 → 그동안 agy 로 폴백"
   else
     add PASS "codex 쿼터" "최근 codex 작업 로그에 한도 초과 흔적 없음"
   fi
@@ -378,7 +380,11 @@ if (( ${#BRIDGED[@]} == 1 )); then
   printf 'pid=%s\nstarted=%s\n' "$$" "$(date +%s)" >"$MARK"   # (워치독 패치용 표식, 패치 전엔 무해)
   trap 'rm -f "$MARK"' EXIT
   say "[1/4] 옛 감독관에 /exit 전송 (PID $OLD, pane $old_pane) — 대화는 claude --resume 으로 복구 가능"
-  tmux send-keys -t "$old_pane" -l "/exit" && tmux send-keys -t "$old_pane" Enter
+  if declare -F term_send_line >/dev/null; then
+    term_send_line "$old_pane" "/exit"
+  else
+    tmux send-keys -t "$old_pane" -l "/exit" && tmux send-keys -t "$old_pane" Enter
+  fi
   for _ in $(seq 1 30); do alive_same "$OLD" "$OLD_TOK" || break; sleep 1; done
   if alive_same "$OLD" "$OLD_TOK"; then
     say "      30초 내 종료 안 됨 → 정확한 PID $OLD 에 SIGTERM"
@@ -425,14 +431,24 @@ EOF
   chmod 700 "$LAUNCH"
 
   # --- C. sonnet 창에서 기동 ---
-  if ! tmux list-windows -t "$SESSION" -F '#{window_name}' | grep -qx "$SONNET_WINDOW"; then
-    tmux new-window -d -t "$SESSION" -n "$SONNET_WINDOW" -c "$PROJECT"; sleep 1
+  if declare -F term_has_window >/dev/null; then
+    if ! term_has_window "$SESSION" "$SONNET_WINDOW"; then
+      term_new_window "$SESSION" "$SONNET_WINDOW" "$PROJECT"; sleep 1
+    fi
+  else
+    if ! tmux list-windows -t "$SESSION" -F '#{window_name}' | grep -qx "$SONNET_WINDOW"; then
+      tmux new-window -d -t "$SESSION" -n "$SONNET_WINDOW" -c "$PROJECT"; sleep 1
+    fi
   fi
   pid_pane="$(pane_id)"
   for _ in $(seq 1 10); do is_shell "$(pane_cmd)" && break; sleep 1; done
   if is_shell "$(pane_cmd)"; then
     say "[2/4] $SESSION:$SONNET_WINDOW 에서 새 감독관 기동"
-    tmux send-keys -t "$pid_pane" -l "bash $(printf '%q' "$LAUNCH")" && tmux send-keys -t "$pid_pane" Enter
+    if declare -F term_send_line >/dev/null; then
+      term_send_line "$pid_pane" "bash $(printf '%q' "$LAUNCH")"
+    else
+      tmux send-keys -t "$pid_pane" -l "bash $(printf '%q' "$LAUNCH")" && tmux send-keys -t "$pid_pane" Enter
+    fi
     launched_by=us
   else
     say "[2/4] 창이 이미 '$(pane_cmd)' 실행 중 (워치독이 먼저 재기동했을 수 있음) → 기동 생략, 검증만 수행"
@@ -450,7 +466,11 @@ EOF
   # --- D. 기동 후 검증 ---
   say "[3/4] 검증 (최대 60초)"
   NEW=""
-  pane_root="$(tmux display-message -p -t "$pid_pane" '#{pane_pid}')"
+  if declare -F term_pane_pid >/dev/null; then
+    pane_root="$(term_pane_pid "$pid_pane")"
+  else
+    pane_root="$(tmux display-message -p -t "$pid_pane" '#{pane_pid}')"
+  fi
   for _ in $(seq 1 60); do
     for p in $(pgrep -x claude); do
       [[ "${OLD:-}" == "$p" ]] && continue

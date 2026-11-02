@@ -2,6 +2,8 @@
 # bin/chain list|status [id]: 체인(런타임) 목록·상태 (읽기 전용)
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$HERE/lib/term.sh"
 cmd="${1:-list}"; want="${2:-}"
 alive() { [[ -n "${1:-}" ]] && kill -0 "$1" 2>/dev/null && echo "alive($1)" || echo "-"; }
 show() {
@@ -9,8 +11,8 @@ show() {
   id="$(head -n1 "$rt/instance" 2>/dev/null | tr -d '\r\n')"; [[ -n "$id" ]] || id="$(basename "$rt")"
   sess="$(head -n1 "$rt/session_name" 2>/dev/null | tr -d '\r\n')"; [[ -n "$sess" ]] || sess="$id"
   [[ -z "$want" || "$want" == "$id" || "$want" == "$sess" ]] || return 0
-  local up="down"; tmux has-session -t "$sess" 2>/dev/null && up="up"
-  local envrt; envrt="$(tmux show-environment -t "$sess" ACC_RUNTIME 2>/dev/null | sed -n 's/^ACC_RUNTIME=//p')"
+  local up="down"; term_session_exists "$sess" && up="up"
+  local envrt; envrt="$(term_get_env "$sess" ACC_RUNTIME)"
   local envok="n/a"; [[ "$up" == up ]] && { [[ "$envrt" == "$rt" ]] && envok="match" || envok="MISMATCH"; }
   pend="$(ls "$rt/events/pending" 2>/dev/null | wc -l)"
   busy="$(ls "$rt/workers"/*.busy 2>/dev/null | wc -l)"

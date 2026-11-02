@@ -151,21 +151,39 @@ with open(src_path, "r", encoding="utf-8", errors="replace") as f:
 
 new_lines = []
 status_replaced = False
+reason_replaced = False
 for line in lines:
     if line.startswith("status="):
         new_lines.append("status=abandoned\n")
         status_replaced = True
+    elif line.startswith("reason_code="):
+        new_lines.append("reason_code=interrupted\n")
+        reason_replaced = True
     else:
         new_lines.append(line)
 
 if not status_replaced:
     new_lines.append("status=abandoned\n")
+if not reason_replaced:
+    new_lines.append("reason_code=interrupted\n")
 
 with open(dst_path, "w", encoding="utf-8") as f:
     f.writelines(new_lines)
 PY
 
 mv "$tmp_state" "$state_file"
+
+# Record last_interrupted marker for automatic RECOVERY_NOTE injection
+if [[ -n "$worker" ]]; then
+  interrupted_file="$runtime/workers/${worker}.last_interrupted"
+  {
+    printf 'task_id=%s\n' "$task_id"
+    printf 'status=abandoned\n'
+    printf 'reason_code=interrupted\n'
+    printf 'interrupted_epoch=%s\n' "$(date +%s)"
+  } > "${interrupted_file}.tmp.$$"
+  mv "${interrupted_file}.tmp.$$" "$interrupted_file" 2>/dev/null || true
+fi
 
 # Compatible with dispatch.sh lease cleanup
 if [[ -n "$worker" ]]; then
@@ -187,7 +205,7 @@ fi
 
 # Emit canceled event for bridge notification
 if [[ -x "$HERE/bin/event-emit.sh" && -n "$worker" ]]; then
-  "$HERE/bin/event-emit.sh" "${worker:-watchdog}" canceled "$task_id" "Task was abandoned" "$state_file" >/dev/null 2>&1 || true
+  ACC_REASON_CODE=interrupted "$HERE/bin/event-emit.sh" "${worker:-watchdog}" canceled "$task_id" "Task was abandoned" "$state_file" "" "interrupted" >/dev/null 2>&1 || true
 fi
 
 echo "Task '$task_id' successfully marked as abandoned."

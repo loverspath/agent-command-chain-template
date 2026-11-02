@@ -6,9 +6,10 @@ worker="${1:-}"
 task_id="${2:-}"
 prompt_file="${3:-}"
 timeout_s="${4:-1800}"
+worktree_dir="${5:-}"
 
 if [[ -z "$worker" || -z "$task_id" || -z "$prompt_file" ]]; then
-  echo "Usage: $0 <worker> <task_id> <prompt_file> [timeout_s]" >&2
+  echo "Usage: $0 <worker> <task_id> <prompt_file> [timeout_s] [worktree_dir]" >&2
   exit 64
 fi
 
@@ -17,6 +18,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
 source "$HERE/lib/config.sh"
 acc_load_config "$HERE" || exit $?
+# shellcheck disable=SC1091
+source "$HERE/lib/reason.sh"
 
 SESSION_NAME="${SESSION_NAME:-agentchain}"
 session_safe="$(printf '%s' "$SESSION_NAME" | tr -cd '[:alnum:]_-')"
@@ -48,19 +51,32 @@ proc_start_token="$started_epoch"
 write_state() {
   local status="$1"
   local term_evt_id="${2:-}"
+  local reason_code="${3:-}"
   local tmp="$state.tmp.$$"
+
+  local rec_from=""
+  if [[ -f "$task_dir/recovery.meta" ]]; then
+    rec_from="$(grep '^recovered_from=' "$task_dir/recovery.meta" 2>/dev/null | cut -d= -f2- || true)"
+  fi
+  local wt_branch=""
+  if [[ -f "$task_dir/worktree.meta" ]]; then
+    wt_branch="$(grep '^worktree_branch=' "$task_dir/worktree.meta" 2>/dev/null | cut -d= -f2- || true)"
+  fi
+
   {
     printf 'task_id=%s\n' "$task_id"
     printf 'worker=%s\n' "$worker"
     printf 'status=%s\n' "$status"
+    [[ -n "$reason_code" ]] && printf 'reason_code=%s\n' "$reason_code"
     printf 'pid=%s\n' "${worker_pid:-$$}"
     printf 'pgid=%s\n' "${worker_pgid:-$$}"
     printf 'proc_token=%s\n' "$proc_start_token"
     printf 'started_epoch=%s\n' "$started_epoch"
     printf 'deadline_epoch=%s\n' "$deadline_epoch"
-    if [[ -n "$term_evt_id" ]]; then
-      printf 'terminal_event_id=%s\n' "$term_evt_id"
-    fi
+    [[ -n "$term_evt_id" ]] && printf 'terminal_event_id=%s\n' "$term_evt_id"
+    [[ -n "$rec_from" ]] && printf 'recovered_from=%s\n' "$rec_from"
+    [[ -n "$worktree_dir" ]] && printf 'worktree_dir=%s\n' "$worktree_dir"
+    [[ -n "$wt_branch" ]] && printf 'worktree_branch=%s\n' "$wt_branch"
   } >"$tmp"
 
   local close_fds=()
@@ -150,6 +166,7 @@ cleanup_on_signal() {
       printf 'id=%s\n' "$sig_term_id"
       printf 'source=%s\n' "$worker"
       printf 'kind=canceled\n'
+      printf 'reason_code=interrupted\n'
       printf 'task_id=%s\n' "$task_id"
       printf 'created_epoch=%s\n' "$(date +%s)"
       printf 'exit_code=130\n'
@@ -188,12 +205,12 @@ cleanup_on_signal() {
 
         if [[ "$sig_evt_exists" == "false" ]]; then
           if eval "mv \"\$sig_tmp\" \"\$sig_pending/\$sig_term_id.evt\" ${sig_term_fd}>&-"; then
-            write_state "canceled" "$sig_term_id"
+            write_state "canceled" "$sig_term_id" "interrupted"
           else
-            write_state notification_error ""
+            write_state notification_error "" "interrupted"
           fi
         else
-          write_state "canceled" "$sig_term_id"
+          write_state "canceled" "$sig_term_id" "interrupted"
         fi
       fi
       flock -u "$sig_term_fd" 2>/dev/null || true
@@ -223,7 +240,16 @@ case "$worker" in
 esac
 
 # setsid를 통해 완전히 격리된 새 프로세스 세션/그룹 리더로 worker 실행
-setsid timeout --foreground --kill-after=10s "${timeout_s}s" "${adapter_cmd[@]}" > "$log" 2>&1 &
+if [[ -n "$worktree_dir" && -d "$worktree_dir" ]]; then
+  setsid bash -c '
+    export PROJECT_DIR="$1"
+    cd "$1" || exit 73
+    shift
+    exec "$@"
+  ' _ "$worktree_dir" timeout --foreground --kill-after=10s "${timeout_s}s" "${adapter_cmd[@]}" > "$log" 2>&1 &
+else
+  setsid timeout --foreground --kill-after=10s "${timeout_s}s" "${adapter_cmd[@]}" > "$log" 2>&1 &
+fi
 worker_pid=$!
 worker_pgid="$(ps -o pgid= -p "$worker_pid" 2>/dev/null | tr -d ' ' || echo "$worker_pid")"
 proc_start_token="$(awk '{print $22}' "/proc/$worker_pid/stat" 2>/dev/null || echo "$started_epoch")"
@@ -245,27 +271,33 @@ fi
 term_kind=""
 term_code=0
 term_summary=""
+term_reason_code=""
 
 if (( rc == 0 )); then
-  term_kind="done"
-  term_code=0
-  term_summary="$(tail -n 10 "$log" 2>/dev/null || echo "ok")"
+  blocked_line="$(tail -n 15 "$log" 2>/dev/null | grep -E '^\s*\[\[BLOCKED\s+' | tail -n 1 || true)"
+  if [[ -n "$blocked_line" ]]; then
+    term_kind="error"
+    term_code=1
+    term_summary="$blocked_line"
+    term_reason_code="$(acc_normalize_blocked_reason "$blocked_line")"
+  else
+    term_kind="done"
+    term_code=0
+    term_summary="$(tail -n 10 "$log" 2>/dev/null || echo "ok")"
+    term_reason_code="ok"
+  fi
 elif (( rc == 124 || rc == 137 )); then
   term_kind="error"
   term_code="$rc"
   term_summary="timed out after ${timeout_s}s; $(tail -n 5 "$log" 2>/dev/null || echo "")"
+  term_reason_code="timeout"
 else
   term_kind="error"
   term_code="$rc"
   term_summary="exit code $rc; $(tail -n 5 "$log" 2>/dev/null || echo "")"
+  term_reason_code="$(acc_classify_reason_from_text "$(tail -n 30 "$log" 2>/dev/null || true)" "exec_error")"
 fi
 
-term_event_id="${task_id}-${term_kind}"
-pending="$runtime/events/pending"
-fifo="$runtime/event.fifo"
-mkdir -p "$pending"
-
-# 단일 안정 결정적 ID 규격: ${task_id}-terminal (모든 terminal producer가 동일 ID를 공유하여 중복 발행 원천 방지)
 term_event_id="${task_id}-terminal"
 pending="$runtime/events/pending"
 fifo="$runtime/event.fifo"
@@ -282,6 +314,7 @@ tmp_evt="$pending/.event.$term_event_id.tmp"
   printf 'id=%s\n' "$term_event_id"
   printf 'source=%s\n' "$worker"
   printf 'kind=%s\n' "$term_kind"
+  [[ -n "$term_reason_code" ]] && printf 'reason_code=%s\n' "$term_reason_code"
   printf 'task_id=%s\n' "$task_id"
   printf 'created_epoch=%s\n' "$(date +%s)"
   printf 'exit_code=%s\n' "$term_code"
@@ -347,7 +380,7 @@ if [[ "$evt_already_exists" == "false" ]]; then
   fi
 fi
 
-write_state "$term_kind" "$term_event_id"
+write_state "$term_kind" "$term_event_id" "$term_reason_code"
 terminal_emitted=true
 
 # 5. Lock 즉시 해제 (모든 임계구역 작업 완료 후 즉시 락 해제)

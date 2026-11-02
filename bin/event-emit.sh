@@ -8,6 +8,13 @@ task_id="${3:-}"
 summary="${4:-}"
 detail_path="${5:-}"
 custom_id="${6:-}"
+reason_code="${7:-${ACC_REASON_CODE:-}}"
+if [[ -z "$reason_code" ]]; then
+  case "$kind" in
+    done) reason_code="ok" ;;
+    canceled) reason_code="interrupted" ;;
+  esac
+fi
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -31,8 +38,8 @@ fi
 pending="$runtime/events/pending"
 fifo="$runtime/event.fifo"
 
-case "$source_name" in agy|codex|watchdog|bridge) ;; *) echo "Invalid source: $source_name" >&2; exit 64 ;; esac
-case "$kind" in started|done|error|canceled|stalled|process_exit|bridge_degraded) ;;
+case "$source_name" in agy|codex|watchdog|bridge|poller|cron|external) ;; *) echo "Invalid source: $source_name" >&2; exit 64 ;; esac
+case "$kind" in started|done|error|canceled|stalled|process_exit|bridge_degraded|proactive) ;;
   *) echo "Invalid kind: $kind" >&2; exit 64 ;;
 esac
 
@@ -67,9 +74,13 @@ path_b64="$(printf '%s' "$clean_path" | base64 -w0)"
   printf 'id=%s\n' "$id"
   printf 'source=%s\n' "$source_name"
   printf 'kind=%s\n' "$kind"
+  [[ -n "$reason_code" ]] && printf 'reason_code=%s\n' "$reason_code"
   printf 'task_id=%s\n' "$task_id"
   printf 'created_epoch=%s\n' "$(date +%s)"
   printf 'exit_code=%s\n' "${ACC_EXIT_CODE:-}"
+  [[ -n "${ACC_EVENT_ACTOR:-}" ]] && printf 'actor=%s\n' "$ACC_EVENT_ACTOR"
+  [[ -n "${ACC_DEDUPE_KEY:-}" ]] && printf 'dedupe_key=%s\n' "$ACC_DEDUPE_KEY"
+  [[ -n "${ACC_RULE_ID:-}" ]] && printf 'rule_id=%s\n' "$ACC_RULE_ID"
   printf 'summary_b64=%s\n' "$summary_b64"
   printf 'detail_path_b64=%s\n' "$path_b64"
 } >"$tmp"

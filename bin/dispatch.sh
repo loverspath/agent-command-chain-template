@@ -43,6 +43,10 @@ timeout="${DEFAULT_TASK_TIMEOUT:-1800}"
 prompt_file=""
 prompt_inline=""
 dry_run=false
+recover_from=""
+no_recovery_note=false
+use_worktree=false
+worktree_branch=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -60,6 +64,22 @@ while [[ $# -gt 0 ]]; do
       ;;
     --prompt)
       prompt_inline="$2"
+      shift 2
+      ;;
+    --recover-from)
+      recover_from="$2"
+      shift 2
+      ;;
+    --no-recovery-note)
+      no_recovery_note=true
+      shift
+      ;;
+    --worktree|--isolate)
+      use_worktree=true
+      shift
+      ;;
+    --worktree-branch)
+      worktree_branch="$2"
       shift 2
       ;;
     *)
@@ -97,17 +117,32 @@ elif [[ "$worker" == "codex" ]]; then
   target_window="${CODEX_WINDOW:-codex}"
 fi
 
+# Git worktree isolation 사전 검증
+if [[ "$use_worktree" == "true" ]]; then
+  orig_project_dir="${PROJECT_DIR:-$PWD}"
+  if ! git -C "$orig_project_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "Error: --worktree requires PROJECT_DIR to be a valid git repository" >&2
+    exit 65
+  fi
+  if [[ -n "$worktree_branch" ]]; then
+    if ! git check-ref-format --branch "$worktree_branch" 2>/dev/null; then
+      echo "Error: Invalid branch name '$worktree_branch'" >&2
+      exit 64
+    fi
+  fi
+fi
+
 # 세션명 및 런타임 디렉토리 자동 해석 (우선순위: ①환경변수 -> ②런타임마커 -> ③현재tmux -> ④config기본값)
 resolve_session_and_runtime "dispatch" "$target_window" false
 runtime="$ACC_RUNTIME"
 
 # 세션 및 대상 윈도우 존재 확인
-if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+if ! term_session_exists "$SESSION_NAME"; then
   echo "Error: tmux session '$SESSION_NAME' does not exist." >&2
   exit 69
 fi
 
-if ! tmux list-windows -t "$SESSION_NAME" -F '#{window_name}' 2>/dev/null | grep -qx "$target_window"; then
+if ! term_has_window "$SESSION_NAME" "$target_window"; then
   echo "Error: Target window '$target_window' not found in session '$SESSION_NAME'." >&2
   exit 69
 fi
@@ -139,7 +174,8 @@ case "$worker_mode" in
 esac
 
 # 대상 pane의 현재 프로세스 검증 (상주 모드는 worker TUI, oneshot은 idle shell 요구)
-cur_cmd="$(tmux display-message -p -t "$SESSION_NAME:$target_window" '#{pane_current_command}' 2>/dev/null || echo "")"
+cur_cmd="$(term_fg_cmd "$SESSION_NAME:$target_window")"
+cur_cmd="${cur_cmd:-}"
 if [[ "$worker_mode" == "resident" ]]; then
   if [[ "$cur_cmd" != "$worker" ]]; then
     echo "Error: Target window '$target_window' in session '$SESSION_NAME' is running '$cur_cmd' instead of resident TUI '$worker'. Dispatch rejected." >&2
@@ -161,6 +197,9 @@ fi
 if [[ "$dry_run" == "true" ]]; then
   echo "[dry-run] Target window '$target_window' in session '$SESSION_NAME' is ready (mode: $worker_mode, current command: '$cur_cmd')."
   echo "[dry-run] Task would be dispatched to $worker with timeout ${timeout}s."
+  if [[ "$use_worktree" == "true" ]]; then
+    echo "[dry-run] Isolated git worktree would be created under $runtime/worktrees/<task_id> (base: $(git -C "${PROJECT_DIR:-$PWD}" rev-parse --short HEAD 2>/dev/null || echo "HEAD"))."
+  fi
   exit 0
 fi
 
@@ -259,10 +298,59 @@ task_id="${worker}-$(date +%s%N)"
 task_dir="$runtime/tasks/$task_id"
 mkdir -p "$task_dir"
 
+wt_dir=""
+wt_branch=""
+if [[ "$use_worktree" == "true" ]]; then
+  orig_project_dir="${PROJECT_DIR:-$PWD}"
+  wt_root="$runtime/worktrees"
+  wt_dir="$wt_root/$task_id"
+  wt_branch="${worktree_branch:-acc/$task_id}"
+  mkdir -p "$wt_root"
+  base_sha="$(git -C "$orig_project_dir" rev-parse HEAD 2>/dev/null || echo "")"
+  if ! timeout 120 git -C "$orig_project_dir" worktree add -b "$wt_branch" "$wt_dir" "$base_sha" >"$task_dir/worktree.log" 2>&1; then
+    echo "Error: Failed to prepare isolated git worktree at $wt_dir (see $task_dir/worktree.log)" >&2
+    git -C "$orig_project_dir" worktree remove --force "$wt_dir" >/dev/null 2>&1 || rm -rf "$wt_dir" 2>/dev/null || true
+    git -C "$orig_project_dir" branch -D "$wt_branch" >/dev/null 2>&1 || true
+    rm -rf "$task_dir"
+    exit 73
+  fi
+  {
+    printf 'worktree_dir=%s\n' "$wt_dir"
+    printf 'worktree_branch=%s\n' "$wt_branch"
+    printf 'base_project_dir=%s\n' "$orig_project_dir"
+    printf 'base_sha=%s\n' "$base_sha"
+  } > "$task_dir/worktree.meta"
+fi
+
+rollback_worktree_on_abort() {
+  if [[ "$use_worktree" == "true" && -n "$wt_dir" ]]; then
+    git -C "${PROJECT_DIR:-$PWD}" worktree remove --force "$wt_dir" >/dev/null 2>&1 || rm -rf "$wt_dir" 2>/dev/null || true
+    git -C "${PROJECT_DIR:-$PWD}" branch -D "$wt_branch" >/dev/null 2>&1 || true
+  fi
+}
+
 brief_header=""
 if [[ "${ACC_NO_BRIEF_HEADER:-0}" != "1" ]]; then
   target_project_dir="${PROJECT_DIR:-$PWD}"
-  brief_header="[CHAIN CONTEXT]
+  if [[ "$use_worktree" == "true" ]]; then
+    brief_header="[CHAIN CONTEXT]
+TEMPLATE_ROOT: $HERE
+CHAIN_WIKI_INDEX: $HERE/.llmwiki/INDEX.md
+ROLES: $HERE/ROLES.md
+PROJECT_DIR: $wt_dir
+BASE_PROJECT_DIR: $target_project_dir
+WORKTREE_DIR: $wt_dir
+WORKTREE_BRANCH: $wt_branch
+WORKTREE_ISOLATION: active (반드시 WORKTREE_DIR 내부에서만 파일을 수정하고 BASE_PROJECT_DIR은 직접 수정하지 마라)
+SESSION_NAME: $SESSION_NAME
+TASK_ID: $task_id
+WORKER_RULES:
+- agy: oneshot router mode. Do not directly execute with Read/Edit/Bash. Delegate using invoke_subagent. If delegation fails, report [[BLOCKED <id>]].
+- codex: Project convention files (e.g. AGENTS.md) take precedence over chain rules for coding conventions.
+---
+"
+  else
+    brief_header="[CHAIN CONTEXT]
 TEMPLATE_ROOT: $HERE
 CHAIN_WIKI_INDEX: $HERE/.llmwiki/INDEX.md
 ROLES: $HERE/ROLES.md
@@ -274,10 +362,54 @@ WORKER_RULES:
 - codex: Project convention files (e.g. AGENTS.md) take precedence over chain rules for coding conventions.
 ---
 "
+  fi
 fi
 
-if [[ -n "$brief_header" ]]; then
-  printf '%s\n' "$brief_header" >"$task_dir/prompt.md"
+recovery_note=""
+recovered_task=""
+if [[ "${ACC_NO_BRIEF_HEADER:-0}" != "1" && "${ACC_NO_RECOVERY_NOTE:-0}" != "1" && "$no_recovery_note" == "false" ]]; then
+  prev_tid=""
+  prev_status=""
+  prev_reason=""
+  if [[ -n "$recover_from" ]]; then
+    if [[ ! -f "$runtime/tasks/$recover_from/state" ]]; then
+      echo "Error: Task to recover from not found: $recover_from" >&2
+      rollback_worktree_on_abort
+      exit 66
+    fi
+    prev_tid="$recover_from"
+    prev_status="$(grep '^status=' "$runtime/tasks/$recover_from/state" 2>/dev/null | cut -d= -f2- || true)"
+    prev_reason="$(grep '^reason_code=' "$runtime/tasks/$recover_from/state" 2>/dev/null | cut -d= -f2- || true)"
+  elif [[ -f "$runtime/workers/$worker.last_interrupted" ]]; then
+    i_epoch="$(grep '^interrupted_epoch=' "$runtime/workers/$worker.last_interrupted" 2>/dev/null | cut -d= -f2- || echo 0)"
+    ttl="${RECOVERY_NOTE_TTL:-86400}"
+    now_epoch="$(date +%s)"
+    if (( now_epoch - i_epoch < ttl )); then
+      prev_tid="$(grep '^task_id=' "$runtime/workers/$worker.last_interrupted" 2>/dev/null | cut -d= -f2- || true)"
+      prev_status="$(grep '^status=' "$runtime/workers/$worker.last_interrupted" 2>/dev/null | cut -d= -f2- || true)"
+      prev_reason="$(grep '^reason_code=' "$runtime/workers/$worker.last_interrupted" 2>/dev/null | cut -d= -f2- || true)"
+    fi
+  fi
+
+  if [[ -n "$prev_tid" ]]; then
+    recovered_task="$prev_tid"
+    prev_reason_display="${prev_reason:-interrupted}"
+    recovery_note="[RECOVERY NOTE]
+PREV_TASK_ID: $prev_tid
+PREV_STATUS: ${prev_status:-unknown} (reason_code: $prev_reason_display)
+PREV_LOG: $runtime/tasks/$prev_tid/output.log
+INSTRUCTION: 직전 작업(${prev_tid})이 완료되지 못하고 중단되었습니다. 파일 수정, 외부 명령 실행, git commit을 반복하기 전에 반드시 현재 작업 트리(\`git status\`, \`git diff\`, \`git log -n 5\`)와 직전 작업 로그/산출물을 먼저 확인하십시오. 이미 반영된 변경사항은 중복 실행하지 말고 남은 단계만 이어서 완료하십시오.
+---
+"
+    printf 'recovered_from=%s\n' "$prev_tid" > "$task_dir/recovery.meta"
+  fi
+fi
+
+if [[ -n "$brief_header" || -n "$recovery_note" ]]; then
+  {
+    [[ -n "$brief_header" ]] && printf '%s\n' "$brief_header"
+    [[ -n "$recovery_note" ]] && printf '%s\n' "$recovery_note"
+  } >"$task_dir/prompt.md"
   if [[ -n "$prompt_file" ]]; then
     cat "$prompt_file" >>"$task_dir/prompt.md"
   elif [[ -n "$prompt_inline" ]]; then
@@ -310,6 +442,7 @@ fi
 prompt_size="$(wc -c < "$task_dir/prompt.md")"
 if (( prompt_size > 131072 )); then
   echo "Error: Prompt file exceeds maximum allowed size (128KB)" >&2
+  rollback_worktree_on_abort
   rm -rf "$task_dir"
   exit 65
 fi
@@ -317,7 +450,8 @@ fi
 if [[ "$worker_mode" == "resident" ]]; then
   started_epoch="$(date +%s)"
   deadline_epoch=$((started_epoch + timeout))
-  pane_pid="$(tmux display-message -p -t "$SESSION_NAME:$target_window" '#{pane_pid}' 2>/dev/null || echo "$$")"
+  pane_pid="$(term_pane_pid "$SESSION_NAME:$target_window")"
+  pane_pid="${pane_pid:-$$}"
   child_pid="$(pgrep -P "$pane_pid" "$worker" 2>/dev/null | head -n 1 || echo "")"
   target_pid="${child_pid:-$pane_pid}"
   proc_token="$(awk '{print $22}' "/proc/$target_pid/stat" 2>/dev/null || echo "$started_epoch")"
@@ -335,6 +469,8 @@ proc_token=$proc_token
 started_epoch=$started_epoch
 deadline_epoch=$deadline_epoch
 EOF
+  [[ -n "$recovered_task" ]] && printf 'recovered_from=%s\n' "$recovered_task" >> "$task_dir/state"
+  [[ -n "$wt_dir" ]] && printf 'worktree_dir=%s\nworktree_branch=%s\n' "$wt_dir" "$wt_branch" >> "$task_dir/state"
 
   # 작업 예약 마커 설정 및 락 해제
   printf '%s\n%s\n' "$task_id" "$started_epoch" > "$busy_file"
@@ -348,13 +484,16 @@ EOF
 
   # 1줄 트리거 주입 (개행 폭주 방지)
   trigger="Read and execute task prompt: $task_dir/prompt.md"
-  if ! tmux send-keys -l -t "$SESSION_NAME:$target_window" "$trigger" || ! tmux send-keys -t "$SESSION_NAME:$target_window" Enter; then
+  if ! term_send_line "$SESSION_NAME:$target_window" "$trigger"; then
     echo "Error: Failed to inject command into tmux window '$target_window'." >&2
+    rollback_worktree_on_abort
     if grep -q "^$task_id$" "$busy_file" 2>/dev/null; then
       rm -f "$busy_file"
     fi
     exit 72
   fi
+  # 주입 성공 후 이전 중단 마커 정리
+  rm -f "$runtime/workers/$worker.last_interrupted" 2>/dev/null || true
 else
   # oneshot 모드: 작업 예약 마커 설정 및 락 해제
   printf '%s\n%s\n' "$task_id" "$(date +%s)" > "$busy_file"
@@ -364,14 +503,21 @@ else
   fi
 
   # 안전하게 인자 이스케이프 후 literal 모드로 명령 주입
-  run_cmd=$(printf '%q %q %q %q %q' "$HERE/bin/run-task.sh" "$worker" "$task_id" "$task_dir/prompt.md" "$timeout")
-  if ! tmux send-keys -l -t "$SESSION_NAME:$target_window" "$run_cmd" || ! tmux send-keys -t "$SESSION_NAME:$target_window" C-m; then
+  if [[ "$use_worktree" == "true" ]]; then
+    run_cmd=$(printf '%q %q %q %q %q %q' "$HERE/bin/run-task.sh" "$worker" "$task_id" "$task_dir/prompt.md" "$timeout" "$wt_dir")
+  else
+    run_cmd=$(printf '%q %q %q %q %q' "$HERE/bin/run-task.sh" "$worker" "$task_id" "$task_dir/prompt.md" "$timeout")
+  fi
+  if ! term_run_cmd "$SESSION_NAME:$target_window" "$run_cmd"; then
     echo "Error: Failed to inject command into tmux window '$target_window'." >&2
+    rollback_worktree_on_abort
     if grep -q "^$task_id$" "$busy_file" 2>/dev/null; then
       rm -f "$busy_file"
     fi
     exit 72
   fi
+  # 주입 성공 후 이전 중단 마커 정리
+  rm -f "$runtime/workers/$worker.last_interrupted" 2>/dev/null || true
 fi
 
 echo "Dispatched task $task_id to $worker (target: $SESSION_NAME:$target_window, mode: $worker_mode)"

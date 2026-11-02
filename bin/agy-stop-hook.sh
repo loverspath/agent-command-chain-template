@@ -17,6 +17,12 @@ runtime="${ACC_RUNTIME:-}"
 res_pane_id=""
 mismatch_tag=""
 
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$HERE/lib/reason.sh"
+# shellcheck disable=SC1091
+source "$HERE/lib/term.sh"
+
 # 결정 사유는 ACC_HOOK_DEBUG와 무관하게 항상 한 줄 남긴다(무작업 종료 원인 확정용, 1MB 넘으면 .1로 회전).
 # 런타임을 모르면 ~/.cache/acc-hook.log. 'start' 줄만 있고 결정 줄이 없으면 hook이 도중에 죽은 것(timeout 등).
 decision_log() {
@@ -107,12 +113,12 @@ if [[ ! -f "$resident_marker" ]]; then
   respond_and_exit "allow" "no_resident_marker"
 fi
 
-# 6. TMUX_PANE 일치 검증 (Requirement 2.1b)
+# 6. 상주 Pane 일치 검증 (Requirement 2.1b)
 # 상주 윈도우 agy 프로세스에서 발행된 Stop hook인지 검증
 res_pane_id="$(sed -n 's/^pane_id=//p' "$resident_marker" 2>/dev/null | head -n 1 | tr -d '\r\n')"
 res_session="$(sed -n -E 's/^(session|session_name)=//p' "$resident_marker" 2>/dev/null | head -n 1 | tr -d '\r\n')"
-cur_pane="${TMUX_PANE:-}"
-if [[ -z "$cur_pane" || -z "$res_pane_id" || "$cur_pane" != "$res_pane_id" ]]; then
+cur_pane="$(term_current_pane_id)"
+if ! term_verify_resident_pane "$resident_marker"; then
   respond_and_exit "allow" "pane_mismatch"
 fi
 
@@ -169,13 +175,29 @@ is_term_error=false
 final_kind="done"
 summary="Task completed"
 exit_code=0
+reason_code=""
 
 case "$term_reason" in
-  error|interrupted|INTERRUPTED|cancel|cancelled|canceled|user_cancel*|timeout|max_steps_exceeded)
+  timeout|max_steps_exceeded)
     is_term_error=true
     final_kind="error"
     summary="Agy execution error or interrupted: ${err_msg:-$term_reason}"
     exit_code=1
+    reason_code="timeout"
+    ;;
+  interrupted|INTERRUPTED|cancel|cancelled|canceled|user_cancel*)
+    is_term_error=true
+    final_kind="error"
+    summary="Agy execution error or interrupted: ${err_msg:-$term_reason}"
+    exit_code=1
+    reason_code="interrupted"
+    ;;
+  error)
+    is_term_error=true
+    final_kind="error"
+    summary="Agy execution error or interrupted: ${err_msg:-$term_reason}"
+    exit_code=1
+    reason_code="$(acc_classify_reason_from_text "${err_msg:-$term_reason}" "exec_error")"
     ;;
   *)
     if [[ -n "$err_msg" && "$err_msg" != "null" ]]; then
@@ -183,6 +205,7 @@ case "$term_reason" in
       final_kind="error"
       summary="Agy execution error: $err_msg"
       exit_code=1
+      reason_code="$(acc_classify_reason_from_text "$err_msg" "exec_error")"
     fi
     ;;
 esac
@@ -349,6 +372,7 @@ else:
       ;;
     DONE)
       final_kind="done"
+      reason_code="ok"
       if [[ -n "$sentinel_rest" ]]; then
         summary="Task completed: $sentinel_rest"
       else
@@ -358,6 +382,7 @@ else:
       ;;
     BLOCKED)
       final_kind="error"
+      reason_code="$(acc_normalize_blocked_reason "$sentinel_rest")"
       if [[ -n "$sentinel_rest" ]]; then
         summary="Task blocked: $sentinel_rest"
       else
@@ -373,6 +398,7 @@ else:
       if [[ "${ACC_HOOK_SOURCE:-}" != "watchdog" && -n "$deadline_epoch" && "$deadline_epoch" =~ ^[0-9]+$ ]] && (( now > deadline_epoch )); then
         # 기한 초과: timeout 에러 발행 및 종료
         final_kind="error"
+        reason_code="timeout"
         summary="Task deadline exceeded (${now} > ${deadline_epoch}): timeout"
         exit_code=124
       else
@@ -395,18 +421,20 @@ term_evt_id="${task_id}-terminal"
 
 export ACC_RUNTIME="$runtime"
 export ACC_EXIT_CODE="$exit_code"
+export ACC_REASON_CODE="$reason_code"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # event-emit.sh 호출 (Durable Outbox 및 FIFO 펄스)
 emit_tag="event_emitted"
-if eval "\"$HERE/bin/event-emit.sh\" agy \"$final_kind\" \"$task_id\" \"$summary\" \"$detail_path\" \"$term_evt_id\" ${term_fd}>&-"; then
+if eval "\"$HERE/bin/event-emit.sh\" agy \"$final_kind\" \"$task_id\" \"$summary\" \"$detail_path\" \"$term_evt_id\" \"$reason_code\" ${term_fd}>&-"; then
   # 12. 작업 상태 갱신
   completed_epoch="$(date +%s)"
   tmp_state="$state_file.tmp.$$"
   {
-    grep -vE '^(status|completed_epoch|terminal_event_id)=' "$state_file" 2>/dev/null || true
+    grep -vE '^(status|completed_epoch|terminal_event_id|reason_code)=' "$state_file" 2>/dev/null || true
     printf 'status=%s\n' "$final_kind"
+    [[ -n "$reason_code" ]] && printf 'reason_code=%s\n' "$reason_code"
     printf 'completed_epoch=%s\n' "$completed_epoch"
     printf 'terminal_event_id=%s\n' "$term_evt_id"
   } > "$tmp_state"

@@ -18,4 +18,18 @@ if (( prompt_size > 131072 )); then
 fi
 
 prompt="$(<"$prompt_file")"
-exec agy --dangerously-skip-permissions -p "$prompt"
+
+resolved_model="${AGY_MODEL:-}"
+if [[ -z "$resolved_model" && -n "${AGY_TIER:-}" ]]; then
+  HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  resolved_model="$("$HERE/bin/resolve-model.sh" --harness agy "$AGY_TIER" --effort "${AGY_EFFORT:-high}")" || {
+    echo "Error: cannot resolve agy model for tier '$AGY_TIER' (effort='${AGY_EFFORT:-high}')." >&2
+    exit 65
+  }
+fi
+
+if [[ -n "$resolved_model" ]]; then
+  exec agy --dangerously-skip-permissions --model "$resolved_model" -p "$prompt"
+else
+  exec agy --dangerously-skip-permissions -p "$prompt"
+fi

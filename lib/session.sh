@@ -7,12 +7,20 @@
 #   ③ 현재 tmux 안이면 `tmux display -p '#S'` (단 그 세션에 대상 윈도우가 있고 v2 마커가 있을 때)
 #   ④ config.env 기본값
 
+# shellcheck disable=SC1091
+_LIB_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[[ -f "$_LIB_HERE/term.sh" ]] && source "$_LIB_HERE/term.sh"
+
 # Session 내 특정 윈도우 존재 여부 검사
 session_has_window() {
   local sess="$1"
   local win="$2"
   [[ -z "$sess" || -z "$win" ]] && return 1
-  tmux list-windows -t "$sess" -F '#{window_name}' 2>/dev/null | grep -qx "$win"
+  if declare -F term_has_window >/dev/null; then
+    term_has_window "$sess" "$win"
+  else
+    tmux list-windows -t "$sess" -F '#{window_name}' 2>/dev/null | grep -qx "$win"
+  fi
 }
 
 # 세션이 v2 Full-Push 마커를 보유하고 있는지 검사
@@ -29,16 +37,26 @@ session_has_v2_marker() {
 
   # 1. tmux 세션 환경변수 확인
   local env_marker
-  env_marker="$(tmux show-environment -t "$sess" ACC_BOOTSTRAP_VERSION 2>/dev/null || true)"
-  if [[ "$env_marker" == "ACC_BOOTSTRAP_VERSION=2" ]]; then
-    return 0
-  fi
-
-  # 2. tmux 세션의 ACC_RUNTIME 경로 확인
-  local sess_runtime
-  sess_runtime="$(tmux show-environment -t "$sess" ACC_RUNTIME 2>/dev/null | sed -n 's/^ACC_RUNTIME=//p')"
-  if [[ -n "$sess_runtime" && -f "$sess_runtime/bootstrap_version" ]] && grep -q '^bootstrap_version=2' "$sess_runtime/bootstrap_version" 2>/dev/null; then
-    return 0
+  if declare -F term_get_env >/dev/null; then
+    env_marker="$(term_get_env "$sess" ACC_BOOTSTRAP_VERSION)"
+    if [[ "$env_marker" == "2" ]]; then
+      return 0
+    fi
+    local sess_runtime
+    sess_runtime="$(term_get_env "$sess" ACC_RUNTIME)"
+    if [[ -n "$sess_runtime" && -f "$sess_runtime/bootstrap_version" ]] && grep -q '^bootstrap_version=2' "$sess_runtime/bootstrap_version" 2>/dev/null; then
+      return 0
+    fi
+  else
+    env_marker="$(tmux show-environment -t "$sess" ACC_BOOTSTRAP_VERSION 2>/dev/null || true)"
+    if [[ "$env_marker" == "ACC_BOOTSTRAP_VERSION=2" ]]; then
+      return 0
+    fi
+    local sess_runtime
+    sess_runtime="$(tmux show-environment -t "$sess" ACC_RUNTIME 2>/dev/null | sed -n 's/^ACC_RUNTIME=//p')"
+    if [[ -n "$sess_runtime" && -f "$sess_runtime/bootstrap_version" ]] && grep -q '^bootstrap_version=2' "$sess_runtime/bootstrap_version" 2>/dev/null; then
+      return 0
+    fi
   fi
 
   # 3. 프로젝트 해시 기반 기본 런타임 디렉토리 검사
@@ -79,7 +97,7 @@ find_v2_candidate_sessions() {
         printf '%s\n' "$s_name"
       fi
     fi
-  done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
+  done < <(declare -F term_list_sessions >/dev/null && term_list_sessions || tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
 }
 
 # 세션명 및 런타임 자동 해석 메인 함수

@@ -4,6 +4,8 @@
 # 감독자 Claude 를 --resume 으로 이어 붙인다. watchdog/agy/codex 워커는 건드리지 않는다.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$HERE/lib/term.sh"
 want="${1:-}"; shift || true
 DRY=false; SID=""
 while [[ $# -gt 0 ]]; do
@@ -35,7 +37,7 @@ SONNET_WINDOW=sonnet; AGY_WINDOW=agy; CODEX_WINDOW=codex
 [[ -f "$HERE/instances/$S.env" ]] && source "$HERE/instances/$S.env"
 P="${PROJECT_DIR:?PROJECT_DIR 미설정}"
 
-if tmux has-session -t "$S" 2>/dev/null; then echo "이미 살아있음: tmux attach -t $S" >&2; exit 0; fi
+if term_session_exists "$S"; then echo "이미 살아있음: tmux attach -t $S" >&2; exit 0; fi
 
 # 3) 감독자 Claude 트랜스크립트 탐색: PROJECT_DIR 의 프로젝트 폴더에서 이 런타임의 훅을 언급하는 가장 최근 세션
 PD="$HOME/.claude/projects/$(printf '%s' "$P" | sed 's#[/._]#-#g')"
@@ -45,18 +47,50 @@ if [[ -z "$SID" ]]; then
 fi
 echo "session=$S runtime=$RT project=$P supervisor-session-id=${SID:-<없음: 새 세션>}"
 
+# 3.1) 고아 running 태스크 정리 및 RECOVERY_NOTE 마커 기록
+for t_state in "$RT"/tasks/*/state; do
+  [[ -f "$t_state" ]] || continue
+  if grep -q '^status=running' "$t_state" 2>/dev/null; then
+    t_id="$(grep '^task_id=' "$t_state" 2>/dev/null | cut -d= -f2- || true)"
+    w_name="$(grep '^worker=' "$t_state" 2>/dev/null | cut -d= -f2- || true)"
+    if [[ "$DRY" == "true" ]]; then
+      echo "[dry-run] Would mark running task $t_id as abandoned (reason_code=host_restarted)"
+    else
+      tmp_s="${t_state}.tmp.$$"
+      sed -e 's/^status=running/status=abandoned/' "$t_state" > "$tmp_s"
+      if ! grep -q '^reason_code=' "$tmp_s"; then
+        printf 'reason_code=host_restarted\n' >> "$tmp_s"
+      else
+        sed -i 's/^reason_code=.*/reason_code=host_restarted/' "$tmp_s"
+      fi
+      mv "$tmp_s" "$t_state"
+      if [[ -n "$w_name" ]]; then
+        rm -f "$RT/workers/${w_name}.busy" 2>/dev/null || true
+        i_file="$RT/workers/${w_name}.last_interrupted"
+        {
+          printf 'task_id=%s\n' "$t_id"
+          printf 'status=abandoned\n'
+          printf 'reason_code=host_restarted\n'
+          printf 'interrupted_epoch=%s\n' "$(date +%s)"
+        } > "${i_file}.tmp.$$"
+        mv "${i_file}.tmp.$$" "$i_file" 2>/dev/null || true
+      fi
+    fi
+  fi
+done
+
 RESUME=""; [[ -n "$SID" ]] && RESUME="--resume $SID"
 LAUNCH="export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 ACC_RUNTIME=\"$RT\" ACC_TEMPLATE_ROOT=\"$HERE\" SESSION_NAME=\"$S\"; $SONNET_CMD $RESUME --settings \"$RT/claude-bridge.settings.json\" --add-dir \"$HERE\" --append-system-prompt \"\$(cat '$RT/session_brief.md')\""
 $DRY && { echo "[dry-run] $LAUNCH"; exit 0; }
 
 export PATH="$HOME/.local/bin:$PATH"
-tmux new-session -d -s "$S" -n "$SONNET_WINDOW" -c "$P"
-tmux set-environment -t "$S" HOME "$HOME"
-tmux set-environment -t "$S" ACC_RUNTIME "$RT"
-tmux set-environment -t "$S" ACC_BOOTSTRAP_VERSION 2
+term_new_session "$S" "$SONNET_WINDOW" "$P"
+term_set_env "$S" HOME "$HOME"
+term_set_env "$S" ACC_RUNTIME "$RT"
+term_set_env "$S" ACC_BOOTSTRAP_VERSION 2
 for w in "$AGY_WINDOW" "$CODEX_WINDOW"; do
-  tmux new-window -t "$S" -n "$w" -c "$P"
-  tmux send-keys -t "$S:$w" "export ACC_RUNTIME=\"$RT\" PROJECT_DIR=\"$P\" HERE=\"$HERE\"; cd \"$P\"" C-m
+  term_new_window "$S" "$w" "$P"
+  term_run_cmd "$S:$w" "export ACC_RUNTIME=\"$RT\" PROJECT_DIR=\"$P\" HERE=\"$HERE\"; cd \"$P\""
 done
-tmux send-keys -t "$S:$SONNET_WINDOW" "$LAUNCH" C-m
+term_run_cmd "$S:$SONNET_WINDOW" "$LAUNCH"
 echo "복구 완료: tmux attach -t $S   (워치독/agy 상주/codex 는 미기동 — 필요시 감독자에게 지시)"

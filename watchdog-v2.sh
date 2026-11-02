@@ -166,7 +166,7 @@ resolve_briefing_file() {
 }
 
 check_session_and_sonnet() {
-  if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+  if ! term_session_exists "$SESSION_NAME"; then
     log "세션 '$SESSION_NAME' 부재 — bootstrap-v2.sh 재실행"
     PROJECT_DIR="$PROJECT_DIR" WORK_DIR="$WORK_DIR" SESSION_NAME="$SESSION_NAME" ACC_RUNTIME="$ACC_RUNTIME" "$HERE/bootstrap-v2.sh" >> "$LOG_FILE" 2>&1 || true
     return
@@ -179,16 +179,17 @@ check_session_and_sonnet() {
   fi
 
   local cur
-  cur="$(tmux display-message -p -t "${SESSION_NAME}:${SONNET_WINDOW}" '#{pane_current_command}' 2>/dev/null || echo "MISSING")"
+  cur="$(term_fg_cmd "${SESSION_NAME}:${SONNET_WINDOW}")"
+  cur="${cur:-MISSING}"
   case "$cur" in
     MISSING)
       log "Sonnet 윈도우 부재 — 재생성"
-      tmux new-window -t "$SESSION_NAME" -n "$SONNET_WINDOW" -c "$SUPERVISOR_CWD"
+      term_new_window "$SESSION_NAME" "$SONNET_WINDOW" "$SUPERVISOR_CWD"
       local bridge_settings="$ACC_RUNTIME/claude-bridge.settings.json"
       local brief_file
       brief_file="$(resolve_briefing_file)"
       local sonnet_launch="cd \"$SUPERVISOR_CWD\" && export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 PROJECT_DIR=\"$PROJECT_DIR\" WORK_DIR=\"$WORK_DIR\" ACC_RUNTIME=\"$ACC_RUNTIME\" ACC_TEMPLATE_ROOT=\"$HERE\" SESSION_NAME=\"$SESSION_NAME\"; $SONNET_CMD --settings \"$bridge_settings\" --add-dir \"$HERE\" --append-system-prompt \"\$(cat '$brief_file' 2>/dev/null || echo '')\""
-      tmux send-keys -t "${SESSION_NAME}:${SONNET_WINDOW}" "$sonnet_launch" C-m
+      term_run_cmd "${SESSION_NAME}:${SONNET_WINDOW}" "$sonnet_launch"
       ;;
     bash|zsh|sh|-bash|-zsh|-sh)
       log "Sonnet 프로세스 종료 감지(현재: $cur) — 재기동"
@@ -196,7 +197,7 @@ check_session_and_sonnet() {
       local brief_file
       brief_file="$(resolve_briefing_file)"
       local sonnet_launch="cd \"$SUPERVISOR_CWD\" && export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 PROJECT_DIR=\"$PROJECT_DIR\" WORK_DIR=\"$WORK_DIR\" ACC_RUNTIME=\"$ACC_RUNTIME\" ACC_TEMPLATE_ROOT=\"$HERE\" SESSION_NAME=\"$SESSION_NAME\"; $SONNET_CMD --settings \"$bridge_settings\" --add-dir \"$HERE\" --append-system-prompt \"\$(cat '$brief_file' 2>/dev/null || echo '')\""
-      tmux send-keys -t "${SESSION_NAME}:${SONNET_WINDOW}" "$sonnet_launch" C-m
+      term_run_cmd "${SESSION_NAME}:${SONNET_WINDOW}" "$sonnet_launch"
       ;;
     *)
       ;;
@@ -209,11 +210,13 @@ write_task_state() {
   local new_killed_by="${3:-}"
   local new_term_evt_id="${4:-}"
   local close_fd="${5:-}"
+  local new_reason_code="${6:-}"
 
   local t_dir="${target_state%/*}"
   local tmp_state="$t_dir/.state.tmp.$$"
 
-  local t_id="" w_name="" p_id="" pg_id="" p_tok="" s_epoch="" d_epoch="" old_term_id=""
+  local t_id="" w_name="" p_id="" pg_id="" p_tok="" s_epoch="" d_epoch="" old_term_id="" old_reason_code=""
+  local old_recovered_from="" old_worktree_dir="" old_worktree_branch=""
   if [[ -f "$target_state" ]]; then
     while IFS= read -r line; do
       case "$line" in
@@ -225,16 +228,22 @@ write_task_state() {
         started_epoch=*) s_epoch="${line#started_epoch=}" ;;
         deadline_epoch=*) d_epoch="${line#deadline_epoch=}" ;;
         terminal_event_id=*) old_term_id="${line#terminal_event_id=}" ;;
+        reason_code=*) old_reason_code="${line#reason_code=}" ;;
+        recovered_from=*) old_recovered_from="${line#recovered_from=}" ;;
+        worktree_dir=*) old_worktree_dir="${line#worktree_dir=}" ;;
+        worktree_branch=*) old_worktree_branch="${line#worktree_branch=}" ;;
       esac
     done < "$target_state"
   fi
 
   local effective_term_id="${new_term_evt_id:-$old_term_id}"
+  local effective_reason="${new_reason_code:-$old_reason_code}"
 
   {
     printf 'task_id=%s\n' "$t_id"
     printf 'worker=%s\n' "$w_name"
     printf 'status=%s\n' "$new_status"
+    [[ -n "$effective_reason" ]] && printf 'reason_code=%s\n' "$effective_reason"
     printf 'pid=%s\n' "$p_id"
     printf 'pgid=%s\n' "$pg_id"
     printf 'proc_token=%s\n' "$p_tok"
@@ -246,6 +255,9 @@ write_task_state() {
     if [[ -n "$effective_term_id" && "$new_status" != "notification_error" ]]; then
       printf 'terminal_event_id=%s\n' "$effective_term_id"
     fi
+    [[ -n "$old_recovered_from" ]] && printf 'recovered_from=%s\n' "$old_recovered_from"
+    [[ -n "$old_worktree_dir" ]] && printf 'worktree_dir=%s\n' "$old_worktree_dir"
+    [[ -n "$old_worktree_branch" ]] && printf 'worktree_branch=%s\n' "$old_worktree_branch"
   } > "$tmp_state"
 
   if [[ -n "$close_fd" ]]; then
@@ -253,6 +265,19 @@ write_task_state() {
   else
     mv "$tmp_state" "$target_state"
   fi
+}
+
+record_worker_interrupted() {
+  local w="$1" t="$2" s="$3" rc="$4"
+  local ifile="$ACC_RUNTIME/workers/${w}.last_interrupted"
+  local itmp="$ifile.tmp.$$"
+  {
+    printf 'task_id=%s\n' "$t"
+    printf 'status=%s\n' "$s"
+    printf 'reason_code=%s\n' "$rc"
+    printf 'interrupted_epoch=%s\n' "$(date +%s)"
+  } > "$itmp"
+  mv "$itmp" "$ifile" 2>/dev/null || true
 }
 
 # 상주 agy 완료 보정: Stop hook이 완료를 놓쳐(무작업 종료·timeout 등) running으로 고착된 작업을
@@ -364,7 +389,8 @@ check_running_tasks() {
     local pane_dead=false
     local pane_cmd=""
     if [[ "$this_mode" == "resident" ]]; then
-      pane_cmd="$(tmux display-message -p -t "${SESSION_NAME}:${worker}" '#{pane_current_command}' 2>/dev/null || echo "MISSING")"
+      pane_cmd="$(term_fg_cmd "${SESSION_NAME}:${worker}")"
+      pane_cmd="${pane_cmd:-MISSING}"
       if [[ "$pane_cmd" != "$worker" ]]; then
         if [[ "$pid_alive" == "true" && ( "$proc_state" == "T" || "$proc_state" == "t" ) ]]; then
           pane_dead=false
@@ -456,18 +482,19 @@ check_running_tasks() {
             fi
             local detail_file="$task_dir/output.log"
             [[ -f "$detail_file" ]] || detail_file="$task_dir/prompt.md"
+            export ACC_REASON_CODE="worker_crash"
             if eval "\"$HERE/bin/event-emit.sh\" watchdog process_exit \"$task_id\" \
-              \"$exit_reason\" \"$detail_file\" \"$term_evt_id\" ${term_fd}>&-"; then
+              \"$exit_reason\" \"$detail_file\" \"$term_evt_id\" \"worker_crash\" ${term_fd}>&-"; then
               emit_ok=true
             fi
           fi
 
           if [[ "$emit_ok" == "true" ]]; then
-            if write_task_state "$state_file" "$final_status" "$killed_by" "$term_evt_id" "$term_fd"; then
+            if write_task_state "$state_file" "$final_status" "$killed_by" "$term_evt_id" "$term_fd" "worker_crash"; then
               state_committed=true
             fi
           else
-            write_task_state "$state_file" "notification_error" "" "" "$term_fd" || true
+            write_task_state "$state_file" "notification_error" "" "" "$term_fd" "worker_crash" || true
           fi
         fi
 
@@ -477,6 +504,9 @@ check_running_tasks() {
         term_fd=""
 
         if [[ "$state_committed" == "true" ]]; then
+          if [[ "$final_status" == "error" ]]; then
+            record_worker_interrupted "$worker" "$task_id" "error" "worker_crash"
+          fi
           if [[ "$should_pulse_fifo" == "true" && -p "$ACC_RUNTIME/event.fifo" ]]; then
             timeout 0.2 bash -c 'printf ".\n" >"$1"' _ "$ACC_RUNTIME/event.fifo" >/dev/null 2>&1 || true
           fi
@@ -543,7 +573,7 @@ check_running_tasks() {
             if [[ "$is_term" == "false" ]]; then
               if [[ "$this_mode" == "resident" ]]; then
                 # 상주 TUI 인터럽트 (C-c)
-                tmux send-keys -t "${SESSION_NAME}:${worker}" C-c 2>/dev/null || true
+                term_send_key "${SESSION_NAME}:${worker}" C-c
               else
                 # Worker group 강제 종료
                 kill -9 -- "-$pgid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true
@@ -566,18 +596,19 @@ check_running_tasks() {
                 emit_ok=true
                 should_pulse_fifo=true
               else
+                export ACC_REASON_CODE="timeout"
                 if eval "\"$HERE/bin/event-emit.sh\" watchdog error \"$task_id\" \
-                  \"Task exceeded deadline ($DEFAULT_TASK_TIMEOUT s) and was terminated\" \"$task_dir/output.log\" \"$term_evt_id\" ${term_fd}>&-"; then
+                  \"Task exceeded deadline ($DEFAULT_TASK_TIMEOUT s) and was terminated\" \"$task_dir/output.log\" \"$term_evt_id\" \"timeout\" ${term_fd}>&-"; then
                   emit_ok=true
                 fi
               fi
 
               if [[ "$emit_ok" == "true" ]]; then
-                if write_task_state "$state_file" "error" "watchdog" "$term_evt_id" "$term_fd"; then
+                if write_task_state "$state_file" "error" "watchdog" "$term_evt_id" "$term_fd" "timeout"; then
                   state_committed=true
                 fi
               else
-                write_task_state "$state_file" "notification_error" "" "" "$term_fd" || true
+                write_task_state "$state_file" "notification_error" "" "" "$term_fd" "timeout" || true
               fi
             fi
 
@@ -587,6 +618,7 @@ check_running_tasks() {
             term_fd=""
 
             if [[ "$state_committed" == "true" ]]; then
+              record_worker_interrupted "$worker" "$task_id" "error" "timeout"
               if [[ "$should_pulse_fifo" == "true" && -p "$ACC_RUNTIME/event.fifo" ]]; then
                 timeout 0.2 bash -c 'printf ".\n" >"$1"' _ "$ACC_RUNTIME/event.fifo" >/dev/null 2>&1 || true
               fi
@@ -625,8 +657,9 @@ check_running_tasks() {
         else
           local warn_detail="$task_dir/output.log"
           [[ -f "$warn_detail" ]] || warn_detail="$task_dir/prompt.md"
+          export ACC_REASON_CODE="timeout"
           if "$HERE/bin/event-emit.sh" watchdog stalled "$task_id" \
-            "Task exceeded deadline ($DEFAULT_TASK_TIMEOUT s) but remains running. Recovery: bin/task-abandon.sh $task_id then re-dispatch" "$warn_detail" "${task_id}-deadline-warn"; then
+            "Task exceeded deadline ($DEFAULT_TASK_TIMEOUT s) but remains running. Recovery: bin/task-abandon.sh $task_id then re-dispatch" "$warn_detail" "${task_id}-deadline-warn" "timeout"; then
             touch "$task_dir/deadline.notified"
           fi
         fi
@@ -641,8 +674,9 @@ check_running_tasks() {
         log "Task $task_id 워커 프로세스 일시정지(SIGSTOP) 감지 (state: $proc_state)"
         local warn_detail="$task_dir/output.log"
         [[ -f "$warn_detail" ]] || warn_detail="$task_dir/prompt.md"
+        export ACC_REASON_CODE="stalled_sigstop"
         if "$HERE/bin/event-emit.sh" watchdog stalled "$task_id" \
-          "Worker process stopped by signal (SIGSTOP)" "$warn_detail" "${task_id}-stop-warn"; then
+          "Worker process stopped by signal (SIGSTOP)" "$warn_detail" "${task_id}-stop-warn" "stalled_sigstop"; then
           touch "$task_dir/stall.notified"
         fi
       fi
@@ -700,8 +734,9 @@ check_running_tasks() {
       local idle_seconds=$(( now - last_act ))
       if (( idle_seconds >= NO_OUTPUT_WARN_SECONDS )); then
         log "Task $task_id 출력/활동 장기 정체 감지 (${idle_seconds}s >= ${NO_OUTPUT_WARN_SECONDS}s)"
+        export ACC_REASON_CODE="stalled_no_output"
         if "$HERE/bin/event-emit.sh" watchdog stalled "$task_id" \
-          "No output or activity detected for ${idle_seconds}s (exceeds ${NO_OUTPUT_WARN_SECONDS}s threshold)" "$log_file" "${task_id}-stall-warn"; then
+          "No output or activity detected for ${idle_seconds}s (exceeds ${NO_OUTPUT_WARN_SECONDS}s threshold)" "$log_file" "${task_id}-stall-warn" "stalled_no_output"; then
           touch "$task_dir/stall.notified"
         fi
       fi
@@ -854,11 +889,8 @@ check_bridge_health() {
           printf '%s\n' "$now" > "$marker"
           log "경고: 브리지 리스너 비활성 및 pending 이벤트 고립 (${age}s) — 비상 폴백 발동"
           local emergency_msg="[ACC_WATCHDOG_EMERGENCY] Push listener degraded. Pending events isolated for ${age}s. Check $pending_dir"
-          local sanitized_sess="${SESSION_NAME//[^A-Za-z0-9_-]/_}"
-          local buf_name="acc-${sanitized_sess}"
-          tmux set-buffer -b "$buf_name" "$emergency_msg" 2>/dev/null || true
-          tmux paste-buffer -d -b "$buf_name" -t "${SESSION_NAME}:${SONNET_WINDOW}" 2>/dev/null || true
-          tmux send-keys -t "${SESSION_NAME}:${SONNET_WINDOW}" C-m 2>/dev/null || true
+          term_paste_emergency "$SESSION_NAME" "${SESSION_NAME}:${SONNET_WINDOW}" "$emergency_msg"
+          term_send_key "${SESSION_NAME}:${SONNET_WINDOW}" C-m
 
           "$HERE/bin/event-emit.sh" bridge bridge_degraded "system" \
             "Listener inactive, fallback paste-buffer triggered" "" || true
