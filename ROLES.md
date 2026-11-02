@@ -103,32 +103,43 @@ codex 창에 처음 작업을 넘길 때 (라우터 어댑터의 프롬프트 �
 
 ## 3. 기계/사람 협업 통신 프로토콜 (Sentinels & Reporting)
 
-### 3.1 상태 Sentinel 규격
+### 3.1 상태 Sentinel 및 사유 코드(`reason_code`) 규격
 워커는 작업 진행 단계 및 결과 보고 시 다음 표준 머신/사람 판독용 sentinel을 출력의 마지막 줄(또는 상태 전이 시점)에 명시해야 한다:
 
 | Sentinel 포맷 | 발행 시점 및 의미 | 비고 |
 |---|---|---|
 | `[[ACK <id>]]` | 작업 디스패치를 수신하고 실행을 시작할 때 | 즉각적인 수신 확인 |
 | `[[DONE <id>]] result=<요약> \| learning=<한줄\|none>` | 작업이 성공적으로 완료되었을 때 | 학습 캡슐 한 줄 필수 |
-| `[[BLOCKED <id>]] reason=<subagent-unavailable\|ambiguous-spec\|needs-terra>` | 서브에이전트 소환 실패, 스펙 모호, 권한/능력 초과 시 | 감독자(Sonnet)가 즉시 재라우팅 |
+| `[[BLOCKED <id>]] reason=<코드>` | 서브에이전트 소환 실패, 스펙 모호, 권한/능력 초과 시 | 감독자(Sonnet)가 즉시 재라우팅 |
+
+**표준 사유 코드 (`reason_code`)**:
+이벤트 및 상태 파일(`state`)에 기록되는 기계 판독용 사유 코드:
+- 정상 완료: `ok`
+- 블로커/에스컬레이션: `subagent_unavailable`, `ambiguous_spec`, `needs_terra`
+- 인프라/실행 오류: `rate_limit`, `tool_failed`, `exec_error`
+- 안전망 회수/중단: `timeout`, `stalled`, `interrupted`, `unknown`
 
 > [!IMPORTANT]
 > **완료 판정의 단일 진실 공급원 (SSOT)**:
 > 상기 Sentinel 텍스트는 **사람과 감독자가 읽고 모니터링하기 위한 보고 형식**일 뿐이다.
-> 시스템 수준의 작업 완료 및 성공/실패 판정의 단일 진실 공급원은 **v2 Durable Outbox 이벤트(`run-task.sh`가 워커 프로세스 종료 후 원자적으로 발행하는 `kind=done|error`)**이다. 감독자 스크립트나 상위 자동화 도구가 Sentinel 텍스트 파싱 결과만으로 작업 완료를 판정해서는 안 된다.
+> 시스템 수준의 작업 완료 및 성공/실패 판정의 단일 진실 공급원은 **v2 Durable Outbox 이벤트(`run-task.sh` 또는 `agy-stop-hook.sh`가 워커 프로세스 종료/Stop 감지 후 원자적으로 발행하는 `kind=done|error`)**이다. 감독자 스크립트나 상위 자동화 도구가 Sentinel 텍스트 파싱 결과만으로 작업 완료를 판정해서는 안 된다.
 
 ### 3.2 디스패치 및 보고 규격
 1. **디스패치 프롬프트 (`knowledge_refs` 주입)**:
    - 감독자(Sonnet)는 디스패치 시 작업에 필요한 위키 및 규약 문서 목록을 `knowledge_refs` 항목으로 명시해야 한다.
    - 워커는 지정된 문서를 반드시 사전에 열람해야 한다.
-2. **종료 보고 형식 (`refs_loaded` 및 `learning_capsule`)**:
+2. **복구 컨텍스트 주입 (`RECOVERY_NOTE`)**:
+   - 직전 작업이 비정상 중단(`last_interrupted` 마커 존재)되었거나 `--recover-from <old_task_id>`가 지정된 경우, `dispatch.sh`가 컨텍스트 헤더에 이전 작업의 실패 사유(`reason_code`)와 로그 꼬리를 `[RECOVERY_NOTE]`로 자동 주입한다 (불필요 시 `--no-recovery-note`).
+3. **병렬 작업 공간 격리 (`--worktree`)**:
+   - 병렬 쓰기 작업 시 `--worktree` 플래그를 지정하면 메인 워킹 트리를 오염시키지 않고 임시 `git worktree`에서 작업이 수행되며, 작업 완료 후 `bin/worktree-clean.sh`로 안전하게 정리할 수 있다.
+4. **종료 보고 형식 (`refs_loaded` 및 `learning_capsule`)**:
    - 워커는 최종 보고서에 다음 5개 필드를 필수로 포함해야 한다:
      - `worker_id`: 담당 서브에이전트 또는 워커 식별자
      - `files_changed`: 실제로 수정한 파일 목록
      - `checks_run`: 검증을 위해 실행한 정적/동적 검사 목록 (`git diff --check`, 테스트 등)
      - `refs_loaded`: 실제로 열람한 `knowledge_refs` 문서 목록
      - `learning_capsule`: `unexpected: <내용> / cause: <내용> / reusable: <규칙>` (없으면 `none`)
-3. **2층 감사 구조 (Two-Tier Audit)**:
+5. **2층 감사 구조 (Two-Tier Audit)**:
    - **1층 (자기 보고)**: 워커가 제출한 `refs_loaded` 및 `learning_capsule` 검토.
    - **2층 (실제 로그 대조)**: `$ACC_RUNTIME/tasks/<task_id>/output.log` 및 Antigravity transcript의 실제 도구 호출 내역(`Read`, `view_file`, `git diff` 등)을 대조하여 허위 보고가 없는지 교차 검증.
 
@@ -140,6 +151,18 @@ codex 창에 처음 작업을 넘길 때 (라우터 어댑터의 프롬프트 �
 SESSION_NAME=agentchain-v2 ./bin/dispatch.sh agy --prompt-file /path/to/prompt.md
 SESSION_NAME=agentchain-v2 ./bin/dispatch.sh codex --prompt-file /path/to/prompt.md --timeout 1800
 
+# 병렬 쓰기 격리 (git worktree 기반)
+SESSION_NAME=agentchain-v2 ./bin/dispatch.sh agy --prompt-file /path/to/prompt.md --worktree
+
+# 특정 중단 작업 인계 복구 디스패치
+SESSION_NAME=agentchain-v2 ./bin/dispatch.sh agy --prompt-file /path/to/prompt.md --recover-from task-abc12345
+
+# 작업트리 안전 정리 (미커밋 변경사항 확인 후 정리, 강제 시 --force)
+SESSION_NAME=agentchain-v2 ./bin/worktree-clean.sh /path/to/worktree [--force]
+
+# 비정상 작업 수동 포기/회수 (reason_code 기록)
+SESSION_NAME=agentchain-v2 ./bin/task-abandon.sh <task_id> [reason_code]
+
 # 인라인 프롬프트 디스패치
 SESSION_NAME=agentchain-v2 ./bin/dispatch.sh agy --prompt "다음 작업 지시 내용..."
 
@@ -149,8 +172,12 @@ SESSION_NAME=agentchain-v2 ./bin/dispatch.sh agy --dry-run
 # 수신된 이벤트 확인 및 아카이브 처리 (Sonnet 기상 후)
 SESSION_NAME=agentchain-v2 ./bin/event-ack.sh <batch_id>
 
-# 수동 이벤트 발행 테스트 (SESSION_NAME 명시 형태)
-SESSION_NAME=agentchain-v2 ./bin/event-emit.sh agy done <task_id> "작업 완료 요약"
+# 수동 이벤트 발행 테스트 (SESSION_NAME 및 reason_code 지원)
+SESSION_NAME=agentchain-v2 ./bin/event-emit.sh agy done <task_id> "작업 완료 요약" [summary_b64] [reason_code]
+
+# 하네스별 모델 동적 해석 (agy / codex)
+./bin/resolve-model.sh --harness agy fast
+./bin/resolve-model.sh --harness codex sol
 ```
 
 ### v1 tmux 순수 pull 명령 (폴백/레거시)

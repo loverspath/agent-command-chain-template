@@ -1,12 +1,12 @@
-# Agent Command Chain — Template (MVP)
+# Agent Command Chain — Template (v2.3)
 
 간소화된 4계층 멀티 에이전트 명령계통의 템플릿. `eraweb-fork`의 실전 구조
 (Sol/Terra/agy 3역할 + Sonnet/Terra/Sol-Opus 3티어 라우터, `docs/workflows/`)를
 관찰한 뒤, 더 가볍게 재구성한 것이다.
 
 > [!IMPORTANT]
-> **실행 경로 안내 (v2 기본 권장 / v1 폴백)**
-> - **기본 권장 경로**: **v2 Full-Push 이벤트 통지 브리지** (`bootstrap-v2.sh`, `watchdog-v2.sh`, `bin/*`, `adapters/*`). FIFO 기반 즉각 깨우기(`asyncRewake`)와 4대 안전망 워치독을 통해 지연 없는 이벤트 통지와 신뢰성을 보장합니다. 상주 관찰이 필요한 경우 Stage 1 resident TUI 모드(`AGY_MODE=resident`)를 지원합니다.
+> **실행 경로 안내 (v2.3 기본 권장 / v1 폴백)**
+> - **기본 권장 경로**: **v2.3 Full-Push 이벤트 통지 및 구조 계약 브리지** (`bootstrap-v2.sh`, `watchdog-v2.sh`, `bin/*`, `adapters/*`, `lib/*`). FIFO 기반 즉각 깨우기(`asyncRewake`)와 4대 안전망 워치독을 기반으로 하며, v2.3에서는 **구조 계약(사유 코드 세분화, 복구 컨텍스트 주입, 능동성 관찰 게이트)**과 **구현 유연성(병렬 worktree 격리, 터미널 추상화 래퍼, agy 모델 동적 해석)**이 완전히 분리되었습니다. 상주 관찰이 필요한 경우 Stage 1 resident TUI 모드(`AGY_MODE=resident`)를 지원합니다.
 > - **폴백/레거시 경로**: **v1 기본 브리지** (`bootstrap.sh`, `watchdog.sh`). 순수 tmux 화면 캡처(pull) 방식으로 동작하며, v2 환경 구성이 어렵거나 최소 세션 테스트 시의 폴백으로 완전 보존됩니다. (v1 파일은 절대 삭제되지 않음)
 > - **세션 재개 런북**: 신규 Claude 세션에서 환경을 재현하거나 중단된 작업을 이어받을 때는 [`.llmwiki/session-resume.md`](.llmwiki/session-resume.md)를 참조하세요.
 
@@ -58,6 +58,13 @@ v2는 tmux의 pull 모델(화면 스크래핑/폴링)의 지연과 불안정성�
   `AGY_MODE=resident` 지정 시 agy가 tmux 창에 상시 대화형 TUI로 유지되며, 디스패처는 파일(`$task_dir/prompt.md`)과 1줄 도어벨 트리거로 안전하게 지시를 전달합니다. 완료 통지는 Antigravity CLI의 `Stop` 라이프사이클 훅(`bin/agy-stop-hook.sh`)을 통해 `fullyIdle: true` 및 마지막 모델 응답의 완료 센티널(`[[DONE <id>]]` / `[[BLOCKED <id>]]`) 검증을 거쳐 원자적으로 발행되며(지시서가 논리적 이름 ID를 사용해도 유연하게 허용, 이전 작업 잔여 센티널 오탐 방지 타임스탬프 가드 적용), 디스패치 시 지시서 규약 D가 자동 주입됩니다.
 - **세션 타겟팅 및 4계층 자동 해석**:
   `bin/dispatch.sh` 및 관련 도구들은 세션 오조준 방지를 위해 `SESSION_NAME` 4계층 자동 해석(환경변수 > 런타임 마커 > 현재 tmux 세션 > config.env) 및 v2 마커 가드(오조준 시 `exit 70`)를 내장하고 있습니다. 명시적인 `SESSION_NAME=agentchain-v2` 사용을 강력 권장합니다.
+- **v2.3 구조 계약(Structure Contracts) 및 구현 유연성 분리**:
+  1. *종단 사유 코드 (`reason_code`)*: 모든 종료 이벤트와 상태에 머신 판독용 사유 코드(`ok`, `timeout`, `stalled`, `interrupted`, `rate_limit`, `tool_failed`, `exec_error` 등)를 기록하고 비휘발성 저장.
+  2. *복구 컨텍스트 주입 (`RECOVERY_NOTE`)*: 비정상 중단 작업(`last_interrupted`) 후속 디스패치 시 이전 작업 정보 및 실패 상태 자동 주입 (`--recover-from`, `--no-recovery-note`).
+  3. *병렬 작업 공간 격리 (`--worktree`)*: 단일 리포 내 병렬 쓰기 충돌을 방지하는 온디맨드 `git worktree` 격리 및 검증/정리 도구(`bin/worktree-clean.sh`).
+  4. *터미널 추상화 계층 (`lib/term.sh`)*: 스크립트 전반의 멀티플렉서 명령을 순수 함수형 래퍼로 캡슐화 (`ACC_TERM_BACKEND=tmux|herdr`).
+  5. *Agy 모델 동적 해석 확장*: `bin/resolve-model.sh --harness agy <tier>` 지원 (`fast`, `deep`, `argon` 등) 및 `AGY_TIER`, `AGY_EFFORT` 설정 연동.
+  6. *능동성 관찰 게이트 (`Rules-then-LLM`, `lib/gate.sh`)*: `ACC_PROACTIVE_MODE=observe|notify|off` 설정을 통해 능동적 트리거를 결정론적으로 필터링하고, 감독자 기상 없이 `events/archive/observed-*`에 감사 기록.
 
 ### 2.2 tmux 브리지 (v1, 폴백/레거시)
 세 프로세스(Sonnet CLI, agy CLI, Codex CLI)를 **같은 WSL Ubuntu tmux 세션의 서로 다른 윈도우**에 띄우고, 외부 컨트롤러(사람 또는 Sonnet 자신의 Bash 툴)가 `tmux send-keys` / `capture-pane` / `pipe-pane`으로 조작하는 기존 순수 pull 방식입니다.
@@ -81,25 +88,32 @@ tmux session: agentchain (config.env의 SESSION_NAME)
 |---|---|---|
 | **v2 (기본 권장)** | `bootstrap-v2.sh` | v2 원클릭: 런타임 디렉토리·FIFO 초기화 + tmux 세션 기동 + 워치독 v2 자동 백그라운드 구동 |
 | | `watchdog-v2.sh` | 4대 비정상 상태(세션/Sonnet, PID증발, Stall/Deadline, 브리지 정체) 전담 안전망 |
-| | `bin/event-emit.sh` | 원자적 이벤트 스풀링(Durable Outbox) 및 FIFO 펄스 전송 |
-| | `bin/sonnet-event-wait.sh` | Claude Code asyncRewake 전용 FIFO 이벤트 대기 어댑터 (exit 2로 기상) |
+| | `bin/event-emit.sh` | 원자적 이벤트 스풀링(Durable Outbox), 사유 코드(`reason_code`) 및 FIFO 펄스 전송 |
+| | `bin/sonnet-event-wait.sh` | Claude Code asyncRewake 전용 FIFO 이벤트 대기 어댑터 (exit 2로 기상, 게이트 필터링) |
 | | `bin/event-ack.sh` | 처리 완료된 이벤트의 archive 이동 및 FIFO 드레인 |
 | | `bin/ts`, `bin/ts-tui` | TMUX 빠른 접속 및 에이전트 체인 복구/신규 기동 통합 CLI & Tokyo Night TUI (`ts`) ([상세 가이드](tools/ts/README.md)) |
 | | `tools/ts/` | `ts` 세션 매니저 통합 도구 킷 보관소 및 설치 스크립트 ([문서](tools/ts/README.md)) |
 | | `bin/chain-recover.sh` | 비정상 종료된 체인 복구 (Claude 단독 + Remote Control) |
 | | `bin/chain` | 체인 런타임/리스너/워치독 목록 및 상태 점검 도구 |
-| | `bin/dispatch.sh` | 작업 디스패처 (4계층 세션 자동 해석, v2 마커 검증, `--dry-run` 지원) |
+| | `bin/dispatch.sh` | 작업 디스패처 (4계층 세션 자동 해석, v2 마커 검증, `--worktree`, `--recover-from`, `--dry-run`) |
+| | `bin/worktree-clean.sh` | 작업트리 미커밋 오염 검사 및 안전 회수/삭제 도구 (`--force`) |
+| | `bin/task-abandon.sh` | 비정상 중단 작업 원자적 회수 및 `last_interrupted` 마커 기록 |
+| | `bin/resolve-model.sh` | Codex 및 Agy 하네스별 최신 모델 동적 해석 (`--harness agy|codex`) |
 | | `bin/agy-stop-hook.sh` | Stage 1 agy 상주 모드 Native Stop 훅 핸들러 |
+| | `lib/term.sh` | 터미널 멀티플렉서 추상화 레이어 (`tmux` / `herdr`) |
+| | `lib/reason.sh` | 종단 이벤트 및 상태 `reason_code` 검증 및 출력/센티널 자동 분류기 |
+| | `lib/gate.sh` | 능동적 트리거 필터링 및 침묵 감사를 위한 Rules-then-LLM 결정론적 게이트 |
 | | `lib/session.sh` | 세션명 자동 해석 및 v2 런타임/마커 검증 공통 라이브러리 |
 | | `bin/run-task.sh` | 커널 자동 해제형 terminal flock 기반 워커 프로세스 실행 및 상태/이벤트 발행 |
-| | `adapters/agy-oneshot.sh` | agy 단발 실행기 어댑터 |
+| | `adapters/agy-oneshot.sh` | agy 단발 실행기 어댑터 (모델 해석 및 사유 코드 전달) |
 | | `adapters/codex-oneshot.sh` | Codex 단발 실행기 어댑터 |
 | | `claude-bridge.settings.json` | Claude Code asyncRewake 훅 및 명령어 권한 설정 |
 | **대시보드** | `dashboard/` | 상태 모니터링 대시보드 (읽기 전용, tailnet 바인딩, 작업 슬라이싱 및 민감 정보 마스킹) |
 | **v1 (폴백/레거시)** | `bootstrap.sh` | v1 tmux 세션 생성 → sonnet/agy/codex 윈도우 기동 (순수 pull 기반, 자동 신뢰 확인/브리핑 지원) |
 | | `watchdog.sh` | v1 세션/프로세스 생존 감시 및 단순 재기동 (순수 pull 기반) |
-| **공통** | `config.env.example` | 세션명, 타임아웃, 브리지 모드 등 전체 환경설정 템플릿 |
-| | `ROLES.md` | 역할별 프롬프트 템플릿 및 운용 가이드 |
+| **공통/문서** | `config.env.example` | 세션명, 타임아웃, 브리지 모드, agy 모델 티어, 터미널 백엔드, 능동성 모드 등 전체 환경설정 |
+| | `ROLES.md` | 역할별 프롬프트 템플릿, 상태 Sentinel 및 사유 코드 규격, 운용 가이드 |
+| | `docs/` | 구조 계약 및 구현 설계서 (`PRINCIPLES-structure-vs-implementation.md`, `IMPL-DESIGN-20261102.md`) |
 | | `.llmwiki/` | 아키텍처 및 상세 사용법 위키 문서 |
 
 ## 4. 빠른 시작
@@ -119,6 +133,15 @@ cd /path/to/your/actual/project
 
 # [작업 디스패치: 세션명 명시 권장]
 SESSION_NAME=agentchain-v2 ~/agent-command-chain-template/bin/dispatch.sh agy --prompt-file /path/to/prompt.md
+
+# [병렬 쓰기 격리 디스패치: 독립 worktree 생성]
+SESSION_NAME=agentchain-v2 ~/agent-command-chain-template/bin/dispatch.sh agy --prompt-file /path/to/prompt.md --worktree
+
+# [작업트리 정리 (작업 종료 후)]
+SESSION_NAME=agentchain-v2 ~/agent-command-chain-template/bin/worktree-clean.sh /path/to/worktree
+
+# [중단 작업 명시 복구 디스패치]
+SESSION_NAME=agentchain-v2 ~/agent-command-chain-template/bin/dispatch.sh agy --prompt-file /path/to/prompt.md --recover-from task-12345678
 
 # [Stage 1: agy 상주 TUI 모드로 기동할 경우]
 # AGY_MODE=resident ~/agent-command-chain-template/bootstrap-v2.sh
@@ -153,3 +176,22 @@ tmux attach -t agentchain-v2                       # 직접 들어가서 보고 
 - **tmux 조작 주의**: tmux 창 안에서 다시 `tmux attach`를 실행하면 중첩 세션 경고가 뜨며 Ctrl+b가 먹통처럼 보일 수 있다. 창 전환 시에는 `Ctrl+b`를 눌렀다 **손을 뗀 다음** 숫자 키(0/1/2)나 `w`를 눌러야 한다. 또한 사람(RC/attach)과 스크립트가 같은 창에 동시에 `send-keys`를 보내면 입력이 섞일 수 있으므로 주의해야 한다.
 - 인증/쿼터 관리, 헬스 상태머신, 스티키 라우팅은 없음. 필요해지면
   `eraweb-fork/docs/workflows/multi_model_router.md`의 §5를 참고해 확장.
+
+## 6. 변경 이력 (Changelog)
+
+- **v2.3 (2026-11-02)**: 구조 계약(Structure Contracts) 및 구현 유연성 분리 (6대 도입 후보 완수)
+  - `reason_code` 세분화 및 기계 판독용 표준 사유 코드 규격화 (`lib/reason.sh`, 이벤트 및 `state` 스키마 확장)
+  - 비정상 중단 작업 복구 인계 자동 주입 (`RECOVERY_NOTE`, `bin/task-abandon.sh`, `--recover-from`)
+  - 병렬 쓰기 작업 공간 격리를 위한 온디맨드 `git worktree` 격리 (`--worktree`) 및 회수 도구 (`bin/worktree-clean.sh`)
+  - 터미널 멀티플렉서 추상화 레이어 도입 (`lib/term.sh`, `ACC_TERM_BACKEND=tmux|herdr` 지원)
+  - Agy 모델 동적 해석 확장 (`bin/resolve-model.sh --harness agy`, `AGY_TIER`, `AGY_EFFORT` 연동)
+  - 능동적 트리거를 위한 결정론적 게이트 및 `observe` 침묵 관찰 모드 (`lib/gate.sh`, `ACC_PROACTIVE_MODE=observe|notify|off`)
+  - 구조 계약 및 구현 설계서 제정 (`docs/PRINCIPLES-structure-vs-implementation.md`, `docs/IMPL-DESIGN-20261102.md`)
+- **v2.2 (2026-09-25)**: 상주 agy TUI 모드(Stage 1, 옵션) 및 격리 시험 스위트
+  - `bin/agy-stop-hook.sh`: agy Stop 훅 기반 원자적 완료 통지
+  - `watchdog-v2.sh`: 상주 워커 감시 (마감/스톨/pane 종료)
+  - `tests/lib-isolated-env.sh`: 라이브 세션 시그니처 및 오염 불변 검증 하네스
+- **v2.1 (2026-09-24)**: Full-Push 이벤트 통지 브리지 및 Durable Outbox
+  - FIFO 기반 즉각 깨우기(`asyncRewake`) 및 4대 안전망 워치독
+  - 커널 `flock` 기반 터미널 소유권 보장
+- **v1.0 (2026-09-23)**: 4계층 명령계통 tmux 풀(pull) 기반 템플릿 최초 릴리스
