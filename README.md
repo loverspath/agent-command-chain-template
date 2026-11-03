@@ -8,26 +8,34 @@
 > **실행 경로 안내 (v2.3 기본 권장 / v1 폴백)**
 > - **기본 권장 경로**: **v2.3 Full-Push 이벤트 통지 및 구조 계약 브리지** (`bootstrap-v2.sh`, `watchdog-v2.sh`, `bin/*`, `adapters/*`, `lib/*`). FIFO 기반 즉각 깨우기(`asyncRewake`)와 4대 안전망 워치독을 기반으로 하며, v2.3에서는 **구조 계약(사유 코드 세분화, 복구 컨텍스트 주입, 능동성 관찰 게이트)**과 **구현 유연성(병렬 worktree 격리, 터미널 추상화 래퍼, agy 모델 동적 해석)**이 완전히 분리되었습니다. 상주 관찰이 필요한 경우 Stage 1 resident TUI 모드(`AGY_MODE=resident`)를 지원합니다.
 > - **폴백/레거시 경로**: **v1 기본 브리지** (`bootstrap.sh`, `watchdog.sh`). 순수 tmux 화면 캡처(pull) 방식으로 동작하며, v2 환경 구성이 어렵거나 최소 세션 테스트 시의 폴백으로 완전 보존됩니다. (v1 파일은 절대 삭제되지 않음)
+> - **단일 정본(SSOT)**: 감독자 운영·경중 판단·지시서 작성은 [SUPERVISOR.md](SUPERVISOR.md), 워커 보고 계약은 [ROLES.md](ROLES.md), 지침 3층 구조는 [docs/INSTRUCTION-LAYERS.md](docs/INSTRUCTION-LAYERS.md)를 참조하세요.
 > - **세션 재개 런북**: 신규 Claude 세션에서 환경을 재현하거나 중단된 작업을 이어받을 때는 [`.llmwiki/session-resume.md`](.llmwiki/session-resume.md)를 참조하세요.
 
-## 1. 역할 구조 (4계층)
+## 1. 역할 구조 및 분배 토폴로지
 
-| 계층 | 주체 | 역할 | 비고 |
+> [!NOTE]
+> **단일 정본(SSOT) 안내**: 감독자 운영 지침·경중 판단·지시서 작성·공통 실행 원칙의 정본은 [SUPERVISOR.md](SUPERVISOR.md)이며, 워커 보고 계약과 센티널 규격은 [ROLES.md](ROLES.md), 지침의 3층 구조는 [docs/INSTRUCTION-LAYERS.md](docs/INSTRUCTION-LAYERS.md)에 정의되어 있습니다. 본 문서는 개요 및 빠른 참조만 제공합니다.
+
+체인에서 반드시 지켜야 하는 것은 **분배 토폴로지(Dispatch Topology)**뿐입니다:
+$$\text{모니터/오케스트레이터(감독자)} \longrightarrow \text{디스패처 / 워커} \longrightarrow \text{리드} \longrightarrow \text{워커}$$
+
+| 계층 / 역할 | 기본 슬롯 | 주요 책임 | 핵심 원칙 및 규약 |
 |---|---|---|---|
-| **0. 사용자** | 사람 | 최종 의사결정, 승인 | RC로 Sonnet 세션에 원격 개입 |
-| **1. 감독/디스패치** | Claude Sonnet | 모니터링·감사, 작업 디스패치, 루프 관리, RC(원격제어) | 사람과의 상시 소통 창구. **사용자가 직접 요청하지 않는 한 실질 작업(문서/코드 작성/조사)은 스스로 하지 않고 agy/codex에 위임** |
-| **2. 라우터 겸 워커 총괄** | agy (Gemini 3.8 Flash) | 난이도 판단(hard routing) 및 서브에이전트 위임·총괄 | **메인 세션 직접 작업(Read/Bash/Edit) 금지 및 서브에이전트(`invoke_subagent`) 위임.** v2 단발 실행(oneshot 한 턴) 라우팅 또는 Stage 1 상주 TUI 모드. 소환 불가/실패 시 직접 처리 금지 및 `[[BLOCKED <id>]] reason=subagent-unavailable\|needs-terra` 보고. (v1 상주 TUI responsive state는 legacy) |
-| **2-내부 Tier 2** | Codex Terra | 중난이도 작업의 설계 및 직접 수행 | 별도 tmux 창(§2). agy가 자동 호출하진 않음 — 아래 "한계" 참고 |
-| **2-내부 Tier 3** | Sol / Opus | 최고난도 문제, 전체 플래닝 상담 | 상시 창 없음. 필요할 때 codex 창의 커맨드를 Sol 계열 최신(`resolve-model.sh sol`)으로 바꿔 send-keys, 또는 claude 쪽은 `--model opus`로 즉석 실행 |
+| **0. 사용자** | 사람 | 최종 의사결정, 승인, 명시적 개입 | RC(Remote Control) 또는 터미널을 통해 감독자 세션에 개입 |
+| **1. 모니터/오케스트레이터 (감독자)** | Claude Sonnet | 사용자 소통, 배분, 경중 판단, 증거 감사 | **실작업 위임 원칙**: 사용자가 직접 수행을 명시하지 않는 한 실질 작업(문서/코드 작성/조사)은 스스로 하지 않고 워커에 위임. 사용자 요청 원문을 그대로 전달 ([SUPERVISOR.md](SUPERVISOR.md)) |
+| **2. 디스패처 / 라우터** | agy (워커) | 리드 및 모델 결정, 작업 배정 | **agy 기본 판단 원칙**: 어떤 리드를 부를지(디스패치)는 **명시가 없으면 기본적으로 agy(워커)가 판단**. 감독자나 사용자는 구체적인 지정(예: "이건 Sol로")이 있을 때만 개입 |
+| **3. 리드** | Codex Terra / Sol | 설계·검증설계·판단·운영 반영 | **운영 반영 전담**: 검증 방법을 정하고 결과를 판단하며, 커밋/푸시/배포 등 운영 반영은 리드만 직접 수행. **Terra 6.1**(`resolve-model.sh terra`)은 소·중 작업의 간단한 리드에 권장되며, 영향이 넓은 대 작업이나 고난도 판단은 **Sol**(`resolve-model.sh sol`)이 기본 |
+| **4. 워커 (구현·조사·검증)** | agy / 서브에이전트 | 실작업(조사·구현·테스트) 실행 | **메인 직접 작업 금지 및 서브에이전트 위임**: agy 메인은 지시·취합·보고만 수행하고 조사·구현·테스트·git 정리를 포함한 모든 실작업은 `invoke_subagent`에 전량 위임. 메인이 직접 작업 시 응답 불가(busy)가 되므로 직접 작업 엄격 금지 (`bin/agy-main-audit.sh`로 감사). 실패 시 `[[BLOCKED <id>]]` 보고 |
 
-핵심 원칙:
-1. **계층 1 Sonnet(감독)은 사람과의 상시 소통 창구이자 agy/codex의 모니터링·감사가 주 역할이다.** 사용자가 Sonnet에게 직접 수행하라고 명시적으로 요구하지 않는 한, 문서 작성/코드 작성/조사 같은 실질적인 작업은 스스로 직접 처리하지 않고 agy 또는 codex(Terra/Sol)에 위임해야 한다.
-2. **계층 2 agy는 v2 Full-Push 환경에서 `WORKER_MODE=oneshot`의 단발 실행 한 턴으로 기동되며, 자신이 직접 Read/Bash/Edit 등의 툴을 호출해 파일 읽기/쓰기/수정 작업에 몰입하지 말고 내장 도구 `invoke_subagent`를 호출해 서브에이전트에 실작업을 위임해야 한다 (경량 작업 예외 없음).** 서브에이전트 소환이 불가능하거나 실패하면 조용히 직접 처리하지 말고 즉시 `[[BLOCKED <id>]] reason=subagent-unavailable|needs-terra`로 보고하여 Sonnet이 Codex Terra 등으로 재라우팅할 수 있게 해야 한다. (참고: v1의 "상주 대화형 TUI 라우터/responsive state"는 legacy이며, Antigravity TUI의 비선점형 입력 큐잉(`queued messages`)으로 인해 직접 툴 루프 시 상위 지시가 지연되는 문제가 확인되어 v2 유휴 셸 + oneshot 구조로 전환됨)
-
-핵심 단순화: **Sonnet은 agy와 codex(Terra) 두 창만 직접 본다.** Sol/Opus는
-상시 프로세스가 아니라 필요할 때만 커맨드를 바꿔 일회성으로 부르는 대상
-(eraweb-fork 원본의 "Terra는 agy 보고를 정규화해 Sol에게만 전달, agy는
-Sol에게 직접 보고 안 함" 규칙을 계층 자체로 끌어올린 것).
+### 핵심 원칙 및 계층 참조
+1. **모델 배정은 교체 가능한 구현 슬롯**: 모델 이름(Sonnet, agy, Terra, Sol 등)은 기본값일 뿐이며, 작업 성격·품질·사용량 한도 소진 등에 따라 언제든 변경될 수 있습니다 (토폴로지 위반 아님). 단, 진행 중인 작업의 리드는 임의로 교체하지 않고 교체 시 사용자에게 알립니다.
+2. **지침 3층 구조 ([docs/INSTRUCTION-LAYERS.md](docs/INSTRUCTION-LAYERS.md))**:
+   - **체인 템플릿**: [SUPERVISOR.md](SUPERVISOR.md), [ROLES.md](ROLES.md), [구조 원칙](docs/PRINCIPLES-structure-vs-implementation.md) (프로젝트 비종속 공통 계약)
+   - **프로젝트 지침**: [projects/](projects/) 디렉터리 (`projects/<프로젝트>.md`, `projects/README.md`) (프로젝트별 조율, 배포·검증 기본, 편성 예외)
+   - **개인 메모리**: 감독자의 사용자 선호·교정과 위 정본 링크만 유지 (실행 절차 복제 금지)
+3. **경중 판단 및 지시서 작성 ([SUPERVISOR.md](SUPERVISOR.md))**:
+   - 파일 수나 모델 티어가 아닌 **영향과 불확실성**으로 판정 (소: 국소 수정 / 중: 작은 설계 판단 / 대: 공통 구조·데이터 변경).
+   - 지시서는 **목표 + 맥락만** 작성하며, 소 작업 지시서 본문은 1KB 이내로 제한하고 공통 절차나 안전 규칙을 불필요하게 복제하지 않습니다.
 
 ## 2. 브리지 설계
 
@@ -86,39 +94,46 @@ tmux session: agentchain (config.env의 SESSION_NAME)
 
 | 구분 | 파일 / 디렉토리 | 역할 |
 |---|---|---|
+| **지침 및 계약 (SSOT)** | `SUPERVISOR.md` | **감독자 운영 정본 지침**: 분배 토폴로지, 역할, 경중 판단, 지시서 규격, 공통 실행 원칙 |
+| | `ROLES.md` | 역할 진입점 및 워커 보고 계약, 완료 센티널(`[[DONE]]`/`[[BLOCKED]]`) 및 사유 코드 규격 |
+| | `projects/` | 프로젝트별 설정 및 오버라이드 지침 (`projects/README.md`, `projects/<프로젝트>.md`) |
+| | `docs/INSTRUCTION-LAYERS.md` | 지침 계층 구조 (체인 템플릿 → 프로젝트 → 개인 메모리 3층) 및 참조 경로 |
+| | `docs/PRINCIPLES-structure-vs-implementation.md` | 구조 계약(토폴로지, Durable Outbox, 2층 감사)과 구현 유연성 분리 원칙 정본 |
+| | `docs/IMPL-DESIGN-20261102.md` | v2.3 6대 구조 계약 도입 사양 및 구현 설계서 |
 | **v2 (기본 권장)** | `bootstrap-v2.sh` | v2 원클릭: 런타임 디렉토리·FIFO 초기화 + tmux 세션 기동 + 워치독 v2 자동 백그라운드 구동 |
 | | `watchdog-v2.sh` | 4대 비정상 상태(세션/Sonnet, PID증발, Stall/Deadline, 브리지 정체) 전담 안전망 |
+| | `bin/dispatch.sh` | 작업 디스패처 (4계층 세션 자동 해석, v2 마커 검증, `--worktree`, `--recover-from`, `--dry-run`) |
+| | `bin/agy-main-audit.sh` | agy 메인 세션 감사 도구 (서브에이전트 위임 횟수 및 메인 직접 작업 위반 점검) |
+| | `bin/session-init.sh` | 세션 초기화 브리프 생성 및 정본 포인터 주입 스크립트 |
 | | `bin/event-emit.sh` | 원자적 이벤트 스풀링(Durable Outbox), 사유 코드(`reason_code`) 및 FIFO 펄스 전송 |
 | | `bin/sonnet-event-wait.sh` | Claude Code asyncRewake 전용 FIFO 이벤트 대기 어댑터 (exit 2로 기상, 게이트 필터링) |
 | | `bin/event-ack.sh` | 처리 완료된 이벤트의 archive 이동 및 FIFO 드레인 |
-| | `bin/ts`, `bin/ts-tui` | TMUX 빠른 접속 및 에이전트 체인 복구/신규 기동 통합 CLI & Tokyo Night TUI (`ts`) ([상세 가이드](tools/ts/README.md)) |
-| | `tools/ts/` | `ts` 세션 매니저 통합 도구 킷 보관소 및 설치 스크립트 ([문서](tools/ts/README.md)) |
-| | `bin/chain-recover.sh` | 비정상 종료된 체인 복구 (Claude 단독 + Remote Control) |
-| | `bin/chain` | 체인 런타임/리스너/워치독 목록 및 상태 점검 도구 |
-| | `bin/dispatch.sh` | 작업 디스패처 (4계층 세션 자동 해석, v2 마커 검증, `--worktree`, `--recover-from`, `--dry-run`) |
+| | `bin/run-task.sh` | 커널 자동 해제형 terminal flock 기반 워커 프로세스 실행 및 상태/이벤트 발행 |
+| | `bin/resolve-model.sh` | Codex 및 Agy 하네스별 최신 모델 동적 해석 (`--harness agy\|codex`) |
 | | `bin/worktree-clean.sh` | 작업트리 미커밋 오염 검사 및 안전 회수/삭제 도구 (`--force`) |
 | | `bin/task-abandon.sh` | 비정상 중단 작업 원자적 회수 및 `last_interrupted` 마커 기록 |
-| | `bin/resolve-model.sh` | Codex 및 Agy 하네스별 최신 모델 동적 해석 (`--harness agy|codex`) |
+| | `bin/chain`, `bin/chain-recover.sh` | 체인 런타임/리스너/워치독 목록 점검 및 비정상 체인 복구 도구 |
+| | `bin/ts`, `bin/ts-tui` | TMUX 빠른 접속 및 에이전트 체인 복구/신규 기동 통합 CLI & Tokyo Night TUI (`ts`) ([상세 가이드](tools/ts/README.md)) |
+| | `tools/ts/` | `ts` 세션 매니저 통합 도구 킷 보관소 및 설치 스크립트 ([문서](tools/ts/README.md)) |
 | | `bin/agy-stop-hook.sh` | Stage 1 agy 상주 모드 Native Stop 훅 핸들러 |
 | | `lib/term.sh` | 터미널 멀티플렉서 추상화 레이어 (`tmux` / `herdr`) |
 | | `lib/reason.sh` | 종단 이벤트 및 상태 `reason_code` 검증 및 출력/센티널 자동 분류기 |
 | | `lib/gate.sh` | 능동적 트리거 필터링 및 침묵 감사를 위한 Rules-then-LLM 결정론적 게이트 |
 | | `lib/session.sh` | 세션명 자동 해석 및 v2 런타임/마커 검증 공통 라이브러리 |
-| | `bin/run-task.sh` | 커널 자동 해제형 terminal flock 기반 워커 프로세스 실행 및 상태/이벤트 발행 |
 | | `adapters/agy-oneshot.sh` | agy 단발 실행기 어댑터 (모델 해석 및 사유 코드 전달) |
 | | `adapters/codex-oneshot.sh` | Codex 단발 실행기 어댑터 |
 | | `claude-bridge.settings.json` | Claude Code asyncRewake 훅 및 명령어 권한 설정 |
+| **설정 및 환경** | `config.env.example` | 세션명, 타임아웃, 브리지 모드, agy 모델 티어, 터미널 백엔드, 능동성 모드 등 전체 환경설정 |
+| | `instances/` | 인스턴스별 환경설정 오버라이드 디렉터리 (`instances/<id>.env`) |
 | **대시보드** | `dashboard/` | 상태 모니터링 대시보드 (읽기 전용, tailnet 바인딩, 작업 슬라이싱 및 민감 정보 마스킹) |
 | **v1 (폴백/레거시)** | `bootstrap.sh` | v1 tmux 세션 생성 → sonnet/agy/codex 윈도우 기동 (순수 pull 기반, 자동 신뢰 확인/브리핑 지원) |
 | | `watchdog.sh` | v1 세션/프로세스 생존 감시 및 단순 재기동 (순수 pull 기반) |
-| **공통/문서** | `config.env.example` | 세션명, 타임아웃, 브리지 모드, agy 모델 티어, 터미널 백엔드, 능동성 모드 등 전체 환경설정 |
-| | `ROLES.md` | 역할별 프롬프트 템플릿, 상태 Sentinel 및 사유 코드 규격, 운용 가이드 |
-| | `docs/` | 구조 계약 및 구현 설계서 (`PRINCIPLES-structure-vs-implementation.md`, `IMPL-DESIGN-20261102.md`) |
-| | `.llmwiki/` | 아키텍처 및 상세 사용법 위키 문서 |
+| **위키/문서** | `.llmwiki/` | 아키텍처 및 상세 사용법 위키 문서 (`usage.md`, `session-resume.md`, `architecture.md` 등) |
 
 ## 4. 빠른 시작
 
 **이 템플릿은 프로젝트 종속적이지 않다.** `bootstrap-v2.sh`나 `bootstrap.sh`를 실행한 디렉토리가 곧 대상 프로젝트가 됩니다 (세 tmux 창 모두 그 경로에서 시작). 경로를 고정하고 싶으면 `config.env`의 `PROJECT_DIR`을 채우면 됩니다.
+감독관과 리드는 세션 기동 시 [SUPERVISOR.md](SUPERVISOR.md)와 [docs/INSTRUCTION-LAYERS.md](docs/INSTRUCTION-LAYERS.md)를 먼저 읽고, 해당 프로젝트 지침([projects/](projects/))을 확인합니다.
 
 ```bash
 # 템플릿 클론 및 설정 준비 (한 번만 수행)
@@ -143,6 +158,9 @@ SESSION_NAME=agentchain-v2 ~/agent-command-chain-template/bin/worktree-clean.sh 
 # [중단 작업 명시 복구 디스패치]
 SESSION_NAME=agentchain-v2 ~/agent-command-chain-template/bin/dispatch.sh agy --prompt-file /path/to/prompt.md --recover-from task-12345678
 
+# [agy 메인 세션 서브에이전트 위임 감사]
+~/agent-command-chain-template/bin/agy-main-audit.sh <task-id>
+
 # [Stage 1: agy 상주 TUI 모드로 기동할 경우]
 # AGY_MODE=resident ~/agent-command-chain-template/bootstrap-v2.sh
 
@@ -164,13 +182,12 @@ tmux attach -t agentchain-v2                       # 직접 들어가서 보고 
   API 키 인증만으로는 안 됨. Team/Enterprise는 조직 Owner가
   claude.ai/admin-settings/claude-code에서 RC를 켜둬야 한다. 세션 안에서
   `/remote-control` 을 치면 상태 패널(URL, 연결 상태)을 볼 수 있다.
-- **agy → codex 자동 호출은 없다** (위 §2 마지막 항목). Sonnet이 사람 대신
-  그 연결을 수동으로 메꾸는 구조다.
+- **agy → codex 자동 호출 부재 및 라우팅 원칙**: 외부 라우터 엔진 하네스를 배제하여 agy 프로세스가 codex 프로세스를 직접 spawn하지 않습니다. 디스패처 역할(어떤 리드와 모델을 부를지)은 기본적으로 agy가 판단하여 보고(`[[BLOCKED]] reason=needs-terra` 등)하며, 사용자나 감독자가 `bin/dispatch.sh`로 해당 리드/워커를 디스패치합니다.
 - **agy는 네이티브 Linux 빌드가 있다** (`~/.local/bin/agy` 등에 설치되는 형태 —
   2026-09 실측 확인). 비대화형 셸 환경을 위해 `bootstrap.sh`/`bootstrap-v2.sh`가 자체적으로
   `PATH="$HOME/.local/bin:$PATH"`를 추가해 확인한다. 정말 Windows 전용 빌드만 있는
   환경이라면 `config.env.example`의 주석에 적힌 `cmd.exe` 우회를 대신 써라.
-- **codex는 대화형 TUI 모드로 구동된다**: one-shot인 `codex exec` 대신 지속형 TUI인 `codex`를 기본값으로 사용한다. WSL 환경에서는 `npm install -g @openai/codex@latest`를 WSL 안에서 직접 설치해야 리눅스 네이티브 바이너리가 정상 작동한다.
+- **codex 실행 모드**: v1 브리지에서는 대화형 지속 TUI `codex`를 기본값으로 사용하며, v2 브리지의 oneshot 실행(`adapters/codex-oneshot.sh`)에서는 `codex exec`를 통해 단발 실행됩니다. WSL 환경에서는 `npm install -g @openai/codex@latest`를 WSL 안에서 직접 설치해야 리눅스 네이티브 바이너리가 정상 작동합니다.
 - **디렉토리 신뢰 프롬프트 자동 승인**: claude/codex의 신규 디렉토리 "trust this folder?" 프롬프트는 `--dangerously-skip-permissions`로 건너뛸 수 없어 스크립트가 화면 텍스트를 감지한 후 자동으로 키 입력을 전송한다 (`AUTO_CONFIRM_TRUST=true`).
 - **세션 지속성 경고 (`CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`)**: 부모 Claude Code 세션 감지로 인한 transcript 저장 비활성화 경고는 v2.1.274 기준 환경변수로 억제되지 않는 제품 자체 버그다. RC/대화는 정상 동작하지만 `--resume` 복원은 불가능하다.
 - **tmux 조작 주의**: tmux 창 안에서 다시 `tmux attach`를 실행하면 중첩 세션 경고가 뜨며 Ctrl+b가 먹통처럼 보일 수 있다. 창 전환 시에는 `Ctrl+b`를 눌렀다 **손을 뗀 다음** 숫자 키(0/1/2)나 `w`를 눌러야 한다. 또한 사람(RC/attach)과 스크립트가 같은 창에 동시에 `send-keys`를 보내면 입력이 섞일 수 있으므로 주의해야 한다.
@@ -179,14 +196,19 @@ tmux attach -t agentchain-v2                       # 직접 들어가서 보고 
 
 ## 6. 변경 이력 (Changelog)
 
-- **v2.3 (2026-11-02)**: 구조 계약(Structure Contracts) 및 구현 유연성 분리 (6대 도입 후보 완수)
-  - `reason_code` 세분화 및 기계 판독용 표준 사유 코드 규격화 (`lib/reason.sh`, 이벤트 및 `state` 스키마 확장)
-  - 비정상 중단 작업 복구 인계 자동 주입 (`RECOVERY_NOTE`, `bin/task-abandon.sh`, `--recover-from`)
-  - 병렬 쓰기 작업 공간 격리를 위한 온디맨드 `git worktree` 격리 (`--worktree`) 및 회수 도구 (`bin/worktree-clean.sh`)
-  - 터미널 멀티플렉서 추상화 레이어 도입 (`lib/term.sh`, `ACC_TERM_BACKEND=tmux|herdr` 지원)
-  - Agy 모델 동적 해석 확장 (`bin/resolve-model.sh --harness agy`, `AGY_TIER`, `AGY_EFFORT` 연동)
-  - 능동적 트리거를 위한 결정론적 게이트 및 `observe` 침묵 관찰 모드 (`lib/gate.sh`, `ACC_PROACTIVE_MODE=observe|notify|off`)
-  - 구조 계약 및 구현 설계서 제정 (`docs/PRINCIPLES-structure-vs-implementation.md`, `docs/IMPL-DESIGN-20261102.md`)
+- **v2.3 (2026-11-03)**: 감독자 운영 지침 정본화 및 지침 계층 구조 정립
+  - `SUPERVISOR.md` 정본 제정: 분배 토폴로지(`감독자 → 디스패처/워커 → 리드 → 워커`), agy 기본 리드/모델 판단 원칙, 작업 경중(소/중/대) 판정 및 지시서 규격 통합.
+  - 지침 3층 구조 확립 (`docs/INSTRUCTION-LAYERS.md`): 체인 템플릿 → 프로젝트 지침(`projects/`) → 개인 메모리의 명확한 책임 분리.
+  - agy 메인 에이전트 실작업 전량 위임(`invoke_subagent`) 및 메인 감사 도구(`bin/agy-main-audit.sh`) 도입.
+  - 리드 모델 선택 기준 명확화: 간단한 리드(소·중)는 Terra 6.1 권장, 복잡·고난도 리드(대)는 Sol 기본.
+  - 구조 계약(Structure Contracts) 및 구현 유연성 분리 (6대 도입 후보 완수):
+    - `reason_code` 세분화 및 기계 판독용 표준 사유 코드 규격화 (`lib/reason.sh`, 이벤트 및 `state` 스키마 확장)
+    - 비정상 중단 작업 복구 인계 자동 주입 (`RECOVERY_NOTE`, `bin/task-abandon.sh`, `--recover-from`)
+    - 병렬 쓰기 작업 공간 격리를 위한 온디맨드 `git worktree` 격리 (`--worktree`) 및 회수 도구 (`bin/worktree-clean.sh`)
+    - 터미널 멀티플렉서 추상화 레이어 도입 (`lib/term.sh`, `ACC_TERM_BACKEND=tmux|herdr` 지원)
+    - Agy 모델 동적 해석 확장 (`bin/resolve-model.sh --harness agy`, `AGY_TIER`, `AGY_EFFORT` 연동)
+    - 능동적 트리거를 위한 결정론적 게이트 및 `observe` 침묵 관찰 모드 (`lib/gate.sh`, `ACC_PROACTIVE_MODE=observe|notify|off`)
+    - 구조 계약 및 구현 설계서 제정 (`docs/PRINCIPLES-structure-vs-implementation.md`, `docs/IMPL-DESIGN-20261102.md`)
 - **v2.2 (2026-09-25)**: 상주 agy TUI 모드(Stage 1, 옵션) 및 격리 시험 스위트
   - `bin/agy-stop-hook.sh`: agy Stop 훅 기반 원자적 완료 통지
   - `watchdog-v2.sh`: 상주 워커 감시 (마감/스톨/pane 종료)
