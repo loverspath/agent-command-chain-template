@@ -2,6 +2,10 @@
 
 감독자 운영·경중 라우팅·지시서 작성·공통 실행 원칙은 [SUPERVISOR.md](SUPERVISOR.md) 한 곳에 둔다. 감독자·리드·워커는 그 문서와 선택한 프로젝트 지침을 읽고 적용한다. 프로젝트 선택은 [문서 3층 참조](docs/INSTRUCTION-LAYERS.md)를 따른다.
 
+## agy 메인 에이전트
+
+agy 메인은 조사·구현·테스트 실행·`git add/commit/push`를 포함한 **모든 실작업을 서브에이전트(`invoke_subagent`)에 맡기고**, 자신은 지시·결과 취합·보고만 한다. 작업이 끝나는 시점의 git 정리·push, 테스트 실행도 서브에이전트가 한다. 메인이 직접 작업하면 그동안 응답 불가(busy)가 된다. 감독자는 `bin/agy-main-audit.sh <task-id> [로그] [다음-task-id]`로 한 작업 구간의 서브에이전트 호출 수와 메인 직접 작업을 확인할 수 있고, 직접 작업이 보이면 교정 메시지를 보낸다.
+
 ## 실행과 이벤트
 
 기본은 v2 Full-Push, v1은 레거시 폴백이다. oneshot/resident는 실행 방식이며 역할 변경이 아니다. v2 디스패치·ACK 명령은 [.llmwiki/usage.md](.llmwiki/usage.md)에 둔다. 반복 화면 폴링 대신 이벤트를 기다린다. 상태 문의·장애 진단의 단발 화면 확인만 필요할 때 사용한다.
