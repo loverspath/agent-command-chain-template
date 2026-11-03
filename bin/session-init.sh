@@ -407,6 +407,7 @@ else
   BRIEF="$RT/supervisor_brief.md"; FIRST="$RT/supervisor_first_prompt.txt"; LAUNCH="$RT/supervisor-launch.sh"
   cat >"$BRIEF" <<EOF
 먼저 $HERE/SUPERVISOR.md 와 $HERE/docs/INSTRUCTION-LAYERS.md 를 읽고 적용한다.
+지켜야 할 것은 분배 토폴로지(사용자→감독자→리드→워커)뿐이다. 나머지 지침은 약한 권고라 상황에 따라 무시해도 되고, 지침을 이유로 일을 늘리거나 사용자에게 규칙을 들이대지 않는다.
 프로젝트 지침은 $HERE/projects/README.md 에서 요청 대상으로 선택한다. HANDOFF_FILE이 있으면 그 인계 링크를 따른다.
 
 # 감독관 브리핑 (session-init.sh 생성, $(date '+%F %T'))
