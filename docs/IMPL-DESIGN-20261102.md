@@ -1,5 +1,7 @@
 # 분산 에이전트 체인 6대 도입 후보 구체 구현 설계서 (IMPL-DESIGN-20261102)
 
+> 현행 감독자 운영은 [SUPERVISOR](../SUPERVISOR.md), 문서 소유·참조는 [3층 지침](INSTRUCTION-LAYERS.md)을 따른다. 아래 모델·프로젝트 사례와 적용 계획은 작성 당시 분석이며, 구조 계약의 정본은 PRINCIPLES §2다.
+
 > **상태**: 구현 완료 (v2.3)  
 > **작성일**: 2026-11-02  
 > **기반 문서**: `/home/rerun/agent-command-chain-template/docs/PRINCIPLES-structure-vs-implementation.md` (§6 도입 후보 6건)  

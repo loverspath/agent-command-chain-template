@@ -164,6 +164,9 @@ with open(out_path, "w", encoding="utf-8") as f:
 BRIEF_FILE="$LOG_DIR/session_brief.md"
 mkdir -p "$(dirname "$BRIEF_FILE")"
 cat > "$BRIEF_FILE" <<EOF
+먼저 $HERE/SUPERVISOR.md 와 $HERE/docs/INSTRUCTION-LAYERS.md 를 읽고 적용한다.
+프로젝트 지침은 $HERE/projects/README.md 에서 요청 대상으로 선택한다. HANDOFF_FILE이 있으면 그 인계 링크를 따른다.
+
 # 이 tmux 세션 실제 작동 방식 (Full-Push 이벤트 통지 브리지 v2, $(date '+%Y-%m-%d %H:%M:%S'))
 
 너(Sonnet)는 tmux 세션 \`$SESSION_NAME\`의 상위 감독자다.
@@ -204,7 +207,7 @@ if [[ -n "${HANDOFF_FILE:-}" ]]; then
 
 ## 작업 재개 지침 (Handoff)
 - 지정된 인계 파일: \`$HANDOFF_FILE\`
-- 작업을 재개하기 전 반드시 위 인계 파일을 먼저 읽고 현재 상태를 사용자에게 간략히 보고하라 (사용자의 명시적 작업 지시/승인이 있을 때까지 dispatch 등 독자 작업을 수행하지 마라).
+- 작업을 재개하기 전 반드시 위 인계 파일을 먼저 읽고 현재 상태를 사용자에게 간략히 보고하라. 이미 위임받은 작업 범위는 이어서 진행한다.
 EOF
 fi
 

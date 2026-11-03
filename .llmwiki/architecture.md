@@ -2,7 +2,7 @@
 title: Architecture
 tags: [architecture, roles, tmux-bridge, 4-tier-command, full-push, fifo, outbox, watchdog, resident-tui, isolation, dashboard]
 related: ["[[INDEX]]", "[[usage]]", "[[known-issues]]", "[[session-resume]]"]
-summary: Sonnet/agy/Codex Terra/Sol-Opus 4계층 명령계통과 v2 Full-Push(FIFO+Outbox) 브리지, Stage 1 Resident TUI, 읽기 전용 대시보드, v1 tmux 브리지 및 폴백 설계.
+summary: 역할 정본을 참조하는 v2 Full-Push(FIFO+Outbox)·resident 훅·격리·대시보드 및 v1 구현 설명.
 ---
 
 # Architecture
@@ -12,20 +12,11 @@ summary: Sonnet/agy/Codex Terra/Sol-Opus 4계층 명령계통과 v2 Full-Push(FI
 
 ---
 
-## 1. 역할 구조 (4계층)
+## 1. 역할과 구현 슬롯
 
-| 계층 | 주체 | 실행 환경 / 윈도우 | 주요 역할 | 특징 |
-|---|---|---|---|---|
-| **0. 사용자** | 사람 | 외부 클라이언트 / RC 웹 UI | 최종 의사결정 및 승인 | `claude --remote-control`을 통해 브라우저에서 개입 |
-| **1. 감독/디스패치** | Claude Sonnet | tmux window `sonnet` | 모니터링, 작업 분배, 감사, 사용자 명령 하달 | 사람과의 상시 소통 창구. 실질 작업은 스스로 하지 않고 agy/codex에 위임 |
-| **2. 라우터 겸 워커 총괄** | agy (Gemini 3.8 Flash) | tmux window `agy` | 난이도 판단 및 워커 서브에이전트 위임·총괄 | v2 단발 실행(oneshot 한 턴) 라우팅 또는 Stage 1 상주 TUI 모드. 직접 작업(Read/Bash/Edit) 금지 및 내장 도구 `invoke_subagent`로 위임. 실패 시 `[[BLOCKED]]` 에스컬레이션. (v1 상주 TUI responsive state는 legacy) |
-| **2-내부 Tier 2** | Codex Terra | tmux window `codex` | 중난도 작업 설계 및 직접 수행 | 단발 어댑터(`adapters/codex-oneshot.sh`) 또는 대화형 TUI 기동. agy가 자동 호출하지 않음 |
-| **2-내부 Tier 3** | Sol / Opus | 상시 창 없음 (필요 시 호출) | 최고난도 문제 및 전체 플래닝 상담 | codex 창의 커맨드를 Sol 계열 최신(`resolve-model.sh sol`)으로 전환하거나, Sonnet 창에서 `--model opus` 일회성 실행 |
+현행 역할은 [SUPERVISOR](../SUPERVISOR.md), 보고 계약은 [ROLES](../ROLES.md)가 정본이다. `sonnet`/`agy`/`codex`는 구현 슬롯 이름이며 고정 모델 계층이나 난이도를 뜻하지 않는다. agy→codex 자동 호출은 없고 감독자가 dispatch한다.
 
-### 핵심 아키텍처 단순화 및 원칙
-- **계층 단순화**: Sonnet은 agy와 codex(Terra) 두 창만 직접 봅니다. eraweb-fork의 "Terra가 agy 보고를 정규화해서 Sol에게만 전달, agy는 Sol에 직접 보고 안 함" 규칙을 계층 구조 자체로 끌어올린 것입니다.
-- **agy → codex 자동 연동이 없는 이유**: eraweb-fork에서 agy가 Terra/Sol을 실제로 호출하는 로직은 `tools/router/src/adapters/*.ts`(Node `child_process.spawn`)에 있었으나, 본 템플릿은 외부 라우터 엔진 하네스를 배제하고 경량화하기 위해 해당 레이어를 의도적으로 제외했습니다. 따라서 codex 창은 agy와 자동으로 연동되지 않으며, Sonnet(또는 사람)이 agy 출력을 보고 필요하다고 판단되면 codex 창에 직접 `send-keys`로 작업을 넘깁니다. (진짜 자동 연동이 필요해지면 eraweb-fork의 라우터 어댑터를 참고하여 별도 구현)
-- **Sol/Opus가 상시 창이 없는 이유**: 사용 빈도가 낮고(최고난도 상담), 상시 프로세스를 켜두는 것보다 필요할 때 `codex` 창 커맨드를 Sol 계열 최신(`resolve-model.sh sol`)으로 바꾸거나 Sonnet 세션에서 `--model opus`로 일회성 실행하는 것이 자원상 훨씬 가볍기 때문입니다.
+구조적 책임 경계와 계약은 [구조·구현 분리 원칙 §2](../docs/PRINCIPLES-structure-vs-implementation.md), 아래 절은 브리지 구현의 설명이다.
 
 ---
 
@@ -144,18 +135,7 @@ bootstrap-v2 재실행   원자적 fail+이벤트   초과 경고/알림 발행 
 
 ### 2.6 Sentinel 통신 프로토콜 및 2층 감사 체계
 
-v2 Full-Push 아키텍처는 기계적 신뢰성(Durable Outbox)과 사람/감독자의 가독성을 결합하기 위해 2계층 통신 및 감사 구조를 채택합니다:
-
-1. **상태 Sentinel 규격 (모니터링용)**:
-   - `[[ACK <id>]]`: 작업 수신 및 착수 확인.
-   - `[[DONE <id>]] result=<요약> | learning=<한줄|none>`: 작업 완료 및 1줄 학습 캡슐.
-   - `[[BLOCKED <id>]] reason=<subagent-unavailable|ambiguous-spec|needs-terra>`: 차단 및 에스컬레이션.
-2. **완료 판정의 단일 진실 공급원 (SSOT)**:
-   - **원칙**: 상기 Sentinel은 사람이 읽고 관찰하기 위한 출력 포맷이다.
-   - **SSOT**: 작업의 실제 성공/실패 및 완료 판정은 반드시 **v2 Durable Outbox 이벤트(`run-task.sh`가 발행하는 `runtime/events/pending/<id>.evt`)**를 기준으로 이루어진다.
-3. **2층 감사 구조 (Two-Tier Audit)**:
-   - **1층 (자기 보고 검토)**: 워커가 최종 보고에 제출한 `refs_loaded`(실제 열람 문서)와 `learning_capsule` 검토.
-   - **2층 (물리 로그 대조)**: `$ACC_RUNTIME/tasks/<task_id>/output.log` 및 Antigravity transcript 상의 실제 도구 호출 내역(`view_file`, `Read` 등)을 교차 검증하여 보고와 실측 간 불일치를 감사.
+보고 형식은 [ROLES](../ROLES.md), 완료 SSOT와 2층 감사의 구조 계약은 [PRINCIPLES §2.3~2.4](../docs/PRINCIPLES-structure-vs-implementation.md)를 참조한다. 아래 §2.8은 resident 훅의 구현 설명이다.
 
 ### 2.7 체인 컨텍스트 헤더 자동 주입 (Brief Context Header)
 
@@ -185,7 +165,7 @@ v2 Full-Push 아키텍처는 기계적 신뢰성(Durable Outbox)과 사람/감�
      - **센티널 부재 시 (서브에이전트 위임 직후 등)**: 작업을 `running` 상태로 유지하고 busy 파일을 보존하여 턴 종료와 작업 완료의 불일치로 인한 조기 완료를 원천 차단합니다.
      - **무한 대기 방지**: 센티널이 없더라도 작업 상태의 `deadline_epoch`를 확인하여 마감 시각이 초과된 경우 `timeout` 에러 이벤트를 발행하고 안전 종료합니다.
      - **에러/중단 즉시 처리**: `terminationReason`이 에러/중단/취소이거나 `error` 메시지가 존재하는 경우 센티널 유무와 무관하게 즉시 `error` 이벤트를 발행합니다.
-   - **지시서 규약 D 자동 주입**: `bin/dispatch.sh`는 agy 작업 디스패치 시 지시서 끝에 [규약 D](서브에이전트 완료 전 턴 종료 금지, 최종 응답 마지막 줄 센티널 출력 강제)를 자동 주입하여 에이전트의 조기 턴 종료를 예방합니다.
+   - **지시서 규약 D 자동 주입**: `bin/dispatch.sh`는 agy 작업 디스패치 시 지시서 끝에 [ROLES의 보고 규약](../ROLES.md)를 자동 주입하여 에이전트의 조기 턴 종료를 예방합니다.
    - `terminal.lock` 기반 멱등성 보장으로 중복 통지를 차단하며, `workers/agy.busy`가 없는 상태의 `/clear`나 수동 입력은 이벤트를 발행하지 않습니다.
    - **Fail-Closed 가드 원칙 (Hook Fail-Closed Rules)**:
      1. `ACC_RUNTIME` 환경변수가 명시적으로 지정되어 있고 디렉토리이며, `workers/agy.resident` 마커 파일이 존재할 때만 진입 (런타임 추측/config.env 폴백 전면 제거).

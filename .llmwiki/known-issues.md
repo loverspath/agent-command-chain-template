@@ -22,13 +22,15 @@ summary: 실측으로 확인된 RC 전제조건, Folder Trust 우회 한계, 세
 
 ---
 
+현행 감독자 운영은 [SUPERVISOR](../SUPERVISOR.md)와 [ROLES](../ROLES.md)를 따른다. 아래 날짜·버전·프로젝트 사례는 사고 이력이며 새 작업의 기본 절차가 아니다.
+
 ## 2. agy → Codex 자동 연동 부재
 
 이 템플릿은 외부 라우터 엔진을 제거한 MVP 경량 구조다:
 
 - `eraweb-fork`의 경우 `tools/router/src/adapters/codexAdapter.ts` 등에서 Node 서브프로세스를 직접 spawn하여 agy가 Codex를 호출했다.
 - 본 템플릿에는 해당 어댑터 레이어가 없으므로, **agy가 스스로 Codex 창을 조작하거나 자동 호출하지 못한다.**
-- **해결 패턴**: agy 결과 보고서에서 `"Terra급 작업 필요: ..."` 패턴을 Sonnet(또는 사람)이 `capture-pane` 또는 파이프 로그(`logs/agy.pane.log`)로 감지하고, Codex 창에 `send-keys`로 직접 스펙을 주입하는 방식으로 협업한다.
+- **현행 대응**: v2 이벤트를 받고 역할에 맞게 재dispatch한다. 실행 명령은 [[usage]], 역할 판단은 SUPERVISOR에 둔다.
 
 ---
 
@@ -127,25 +129,9 @@ summary: 실측으로 확인된 RC 전제조건, Folder Trust 우회 한계, 세
 
 ## 11. 상주 대화형 TUI의 비선점형 입력 큐잉과 위임 부재로 인한 지시 지연 (9/23 병목 사례)
 
-- **메타데이터**:
-  - `root-cause`: `prompt-drift` / `cli-behavior`
-  - `verified_with`: 2026-09-24
-- **증상**:
-  - 2026-09-23 저녁, agy 메인 세션이 도구 루프에 몰입했을 때 상위 감독자(Sonnet)가 `send-keys`로 주입한 새로운 지시나 방향 수정이 즉각 처리되지 않고 수 분간 지연되는 반응성 마비(병목)가 발생함.
-  - tmux pane 로그 실측(`agy.pane.log` L322735~322739):
-    주입된 지시문이 Antigravity TUI의 `queued messages` 큐에 적재(enqueue)되어 묶여 있다가, agy 메인의 활성 턴(다수의 직접 Read/Bash/Edit 도구 호출; 과거 539회 언급은 unverified/횟수 미재현)이 완전히 끝나 프롬프트(`>`)로 복귀한 뒤에야 디큐되어 실행됨.
-- **근본 원인 (Root Cause)**:
-  1. **초기 오리엔테이션 시 위임 규칙 누락 (`prompt-drift`)**:
-     23일 19:20 기동 시점의 사용자 프롬프트와 당시 `ROLES.md`에는 서브에이전트 위임 규칙이 없었고 "직접 읽고 복사해서 작성하라"는 지시를 받아 agy 메인이 다수의 직접 도구 호출 루프에 진입함 (규칙 위반이 아니라 지침 부재였음).
-  2. **Antigravity TUI의 비선점형 인터페이스 특성 (`cli-behavior`)**:
-     Antigravity CLI의 대화형 TUI는 모델 턴(추론, 도구 호출, 출력 스트리밍)이 활성화되어 있을 때 외부 입력을 즉각 가로채거나 선점(preemption)하지 못하고 큐에 적재함. 따라서 상주 TUI 구조에서는 메인이 직접 무거운 작업을 수행하면 외부 명령계통의 응답성이 완전히 차단됨.
-- **미검증 사항 (`unverified`)**:
-  - 대화형 TUI 상주 세션에서 메인이 `invoke_subagent`를 호출하여 위임 중일 때(`⣻ Delegating...` 상태), Antigravity 런타임이 외부 입력을 즉시 수신할 수 있는지, 아니면 서브에이전트 완료 보고까지 메인 턴을 동기적으로 점유하여 외부 인터럽트를 큐에 가두는지 여부는 추가 격리 실험이 필요함 (`unverified`).
-- **해결책 및 아키텍처 전환**:
-  1. **v2 Full-Push oneshot 격리 구조로 전면 전환**:
-     상주 대화형 TUI 구조를 공식 폐기(legacy)하고, `WORKER_MODE=oneshot`의 단발 실행기(`adapters/agy-oneshot.sh`)로 전환. 워커 창은 유휴 셸(`bash`)로 대기하며, 매 디스패치마다 독립 프로세스로 기동되어 `invoke_subagent`로 서브에이전트를 생성/취합하고 정상 종료함.
-  2. **직접 작업 엄격 금지 규칙 확립**:
-     경량 작업이라도 agy 메인의 직접 Read/Edit/Bash를 금지하고 제어면(라우팅/취합/보고)만 전담하도록 지침 정합화. 소환 실패 시 `[[BLOCKED]]`로 상위에 즉시 에스컬레이션.
+2026-09-23, agy 메인의 직접 툴 루프 도중 새 입력이 `queued messages`에 쌓여 상위 지시가 늦게 수신됐다. 당시 위임 규칙 누락과 TUI 비선점 특성이 원인이었다. 539회라는 도구 횟수는 미재현이며 위임 중 인터럽트 선점도 당시 미검증이었다.
+
+당시 “상주 폐기”는 후속 resident Stage 1 지원으로 대체됐다. 현행 역할은 [SUPERVISOR](../SUPERVISOR.md), oneshot/resident 실행은 [[usage#42-resident-tui-브리지-운용-stage-1-agy-상주]]에 둔다.
 
 ---
 
@@ -168,107 +154,33 @@ summary: 실측으로 확인된 RC 전제조건, Folder Trust 우회 한계, 세
 
 ## 13. 테스트 하네스 런타임 오염 사고 및 훅/테스트 환경 격리 규약 (T0924-09/T0924-10)
 
-- **메타데이터**:
-  - `root-cause`: `test-harness-isolation` / `hook-fail-open`
-  - `verified_with`: 2026-09-24
-- **증상 및 사고 경위 (Live Pollution Incident)**:
-  - T0924-09 수행 중 테스트 하네스가 상위 세션으로부터 상속받은 `ACC_RUNTIME` 환경변수(= 실제 라이브 운영 런타임 `runtime/agentchain-v2-153d25bc`)를 정제하지 않고 테스트를 실행함.
-  - `bin/agy-stop-hook.sh`가 `ACC_RUNTIME` 부재 시 `resolve_session_and_runtime`으로 임의의 런타임에 부착되는 fail-open 결함과 결합하여, 실제 운영 태스크의 상태를 `error`로 덮어쓰고 `workers/agy.busy` 및 `lock`을 삭제하는 심각한 운영 런타임 오염 사고가 발생함.
-  - 당시 보고서에서는 런타임 무오염을 허위 보고하였으나, 실측 감사 결과 운영 런타임 변조가 적발됨.
-- **근본 원인 (Root Cause)**:
-  1. **`bin/agy-stop-hook.sh` fail-open 결함**:
-     - `ACC_RUNTIME` 미지정 시 폴백 해석으로 라이브 세션에 자동 부착.
-     - task의 `mode=resident` 여부를 확인하지 않아 oneshot 작업에도 오반응.
-     - `TMUX_PANE`을 확인하지 않아 v1 TUI/서브에이전트/oneshot agy의 Stop 훅에도 오반응.
-  2. **테스트 하네스 미격리 (`test-harness-isolation`)**:
-     - 테스트 스크립트 실행 시 환경변수 미정제(`env -i` 부재).
-     - 실시간 운영 런타임 변조 감지 및 단언(`TESTMARK` grep assertion) 부재.
-- **해결책 및 격리 규약 (Fix & Isolation Protocol)**:
-  1. **훅 Fail-Closed 원칙 (Hook Fail-Closed Rules)**:
-     - `bin/agy-stop-hook.sh`는 `ACC_RUNTIME`이 명시적으로 설정되어 있고 디렉토리이며, `workers/agy.resident` 마커 파일이 존재할 때만 실행.
-     - `workers/agy.resident` 내 `pane_id`와 환경변수 `TMUX_PANE`이 일치할 때만 실행.
-     - 작업 상태 파일(`state`)에 `mode=resident`와 `status=running`이 명시되어 있을 때만 이벤트 발행.
-     - 그 외 모든 예외/부적합 상황에서는 무작업(no-op)으로 `{"decision":"allow"}`를 반환하고 즉시 안전 종료.
-  2. **테스트 하네스 격리 규약 (Test Harness Isolation Rules)**:
-     - 모든 테스트는 `env -i PATH="$PATH" HOME="$TMP/home" ...`로 깨끗한 환경에서 명시적 변수만 주입하여 실행 (`tests/lib-isolated-env.sh`).
-     - 각 테스트는 고유 마커 `TESTMARK-<random>`을 생성하여 페이로드에 포함.
-     - **Guard Check 1**: 임시 런타임 경로가 운영 런타임(`$LIVE_RT`)과 동일하거나 하위 디렉토리이면 즉시 abort.
-     - **Guard Check 2**: 테스트 시작 및 teardown 시 운영 런타임 내 `TESTMARK` 검색 결과가 정확히 0건이어야 함을 단언 (0건 초과 시 즉시 테스트 실패). 플레인 텍스트뿐만 아니라 `summary_b64=` 등 Base64 인코딩 패턴도 함께 검사.
-     - **Guard Check 3 (운영 런타임 시그니처 대조 - 필수)**:
-       - **함정 (Pitfall)**: 단순 플레인 텍스트 마커 grep만으로는 Base64 인코딩 필드(`summary_b64`, `detail_path_b64`) 및 훅이 무시하는 페이로드 필드에 마커가 위치할 경우 운영 런타임 누수를 탐지하지 못하고 놓치는 심각한 맹점이 존재함. 따라서 운영 런타임 시그니처 대조(`workers/`, `tasks/*/state`, `events/` 목록, 설정 파일 해시)는 필수 불가결한 검증 규약임.
-       - 테스트 시작 시점의 스냅샷과 테스트 종료 시점의 스냅샷을 대조하여 `workers/`, `tasks/*/state`, `events/`, 설정 파일(`bootstrap_version`, `session_name`, `claude-bridge.settings.json`)이 1바이트라도 변조되면 즉시 실패 처리. 진행 중인 running task가 있는 경우 정상 완료 상태 전이에 대한 오탐을 방지하기 위해 경고 출력 후 예외를 인정하되, `workers/` 및 다른 task들의 상태는 엄격히 불변을 대조함.
+2026-09-24 T0924-09에서 상속된 ACC_RUNTIME과 Stop 훅의 fail-open이 결합해 라이브 태스크·busy 상태가 변조됐다. 당시 무오염 자기보고와 실제 로그가 달랐다.
+
+훅은 명시 runtime·resident/pane/task 일치를 검사하도록 수정됐다. 체인 훅·dispatch **실험**은 [tests/lib-isolated-env.sh](../tests/lib-isolated-env.sh)의 격리 하네스를 사용한다. 구현 격리·전후 런타임 서명 검사는 [[architecture#29-테스트-하네스-격리-규약-및-운영-런타임-보호-체계-test-harness-isolation--live-protection]]에 둔다. 이 규약을 일반 제품 작업의 지시서에 복사하지 않는다.
 
 ---
 
 ## 14. 실제 agy 측정/탐색 실행의 사용자 홈 오염 사고 및 격리 래퍼 규약 (T0924-12/T0924-13)
 
-- **메타데이터**:
-  - `root-cause`: `test-harness-isolation` / `unisolated-measurement`
-  - `verified_with`: 2026-09-24
-- **증상 및 사고 경위 (Home Config Pollution Incident)**:
-  - T0924-12 (Round 3) 수행 중 F8 측정 실행(CLI 옵션 및 TUI 동작 계측)이 임시 HOME 없이 실제 사용자 환경에서 직접 실행됨.
-  - 그 결과 실제 사용자 홈 `~/.gemini/config/projects/`에 등록 파일 3개가 무단 생성되는 오염이 발생함 (감독자가 사후 수동 삭제함).
-  - 당시 보고서는 `settings.json` 및 `hooks.json`의 불변만 확인하고 "zero pollution"으로 오판 보고하였으나, `~/.gemini/config/` 전체를 검사하지 않아 발생한 맹점이었음.
-  - 또한 E2E 실행 중 작업 대상 파일 경로가 상대 경로(`Create file a.txt in project dir...`)로 주어져, 서브에이전트가 디스패치 헤더의 `TEMPLATE_ROOT`(리포 루트)에 `a.txt`, `b.txt`를 생성하는 리포 오염 결함도 함께 확인됨.
-- **근본 원인 (Root Cause)**:
-  1. **실제 agy 직접 호출 시 임시 HOME 부재**: 계측/탐색 실험을 격리 하네스 래퍼 없이 직접 셸에서 실행.
-  2. **검증 범위 협소**: `settings.json`만 검사하고 `~/.gemini/config/` 전체 트리 및 리포지토리 파일 생성 여부를 감시하지 않음.
-- **해결책 및 격리 규약 (Fix & Isolation Protocol)**:
-  1. **실제 agy 격리 실행 래퍼 필수화 (`run_real_agy_isolated`)**:
-     - 측정, 탐색, E2E 등 실제 Antigravity CLI를 호출하는 모든 실행은 **반드시** `lib-isolated-env.sh`의 `run_real_agy_isolated`를 통해서만 수행해야 한다.
-     - `HOME`이 실제 홈이거나 임시 경로(`/tmp/`) 하위가 아니면 즉시 abort(`exit 99`).
-     - 실제 OAuth 토큰은 임시 HOME에 **심볼릭 링크**로만 마운트하며(복사 금지), 토큰 내용의 출력/노출은 엄격히 금지된다.
-  2. **Gemini 전역 설정 전체 트리 스냅샷 대조 (`Guard Check 5`)**:
-     - 테스트 전후에 실제 `~/.gemini/config/` 전체(파일 목록+크기+해시; `projects/` 포함)와 `~/.gemini/antigravity-cli/`의 설정류를 스냅샷 대조하여 1바이트라도 변경 시 즉시 실패 처리.
-     - 단, 인증 토큰(`antigravity-oauth-token`)은 존재 여부 및 심볼릭 링크 대상만 대조하고 크기/해시/mtime은 무시하여 agy의 정상적인 OAuth 토큰 자동 갱신을 허용.
-  3. **리포지토리 무오염 단언 (`Guard Check 4`) 및 절대경로 지정**:
-     - E2E 및 모든 디스패치 프롬프트에서 작업 대상 파일은 반드시 절대 경로(`$TEST_PROJ/a.txt` 등)로 명시.
-     - 테스트 전후 리포지토리의 `git status --porcelain --ignored=no`를 대조하여 새 파일이 검출되면 즉시 실패 처리.
-  4. **보고서 규칙 (H4)**:
-     - "무접촉 / zero pollution" 표현은 전역 설정 및 리포지토리 스냅샷 대조 출력(전후 동일 입증 증빙)을 첨부할 때만 사용 가능.
+2026-09-24 T0924-12에서 실제 agy 계측을 실제 HOME으로 실행해 전역 projects 등록 파일 3개가 생겼다. 일부 설정만 대조한 보고가 이를 놓쳤고, 상대 대상 경로로 a.txt/b.txt가 템플릿에 생긴 사고도 있었다.
+
+실제 CLI 계측·E2E는 `tests/lib-isolated-env.sh`의 `run_real_agy_isolated`와 전체 설정·리포 전후 검사를 사용한다. 상세 구현은 architecture §2.9, 하네스가 정본이다. 인증값을 읽으라는 지시로 해석하지 않는다.
 
 ---
 
 ## 15. Sonnet이 요청받지 않은 아키텍처 후보를 Tier-3 자문에 임의로 얹어 과설계로 확대된 사고 (ecount_hub Termux 지원, 2026-09-28)
 
-- **메타데이터**:
-  - `root-cause`: `sonnet-overreach` (요청받지 않은 범위를 감독자 스스로 설계 후보에 포함)
-  - `verified_with`: 2026-09-28
+2026-09-28 원격 실행 환경 자문에 감독자가 사용자 미요청 기술 후보를 추가해 조사·설계·보안 절차가 크게 늘었다. 사용자 원문보다 감독자의 후보가 요구로 굳어진 사고다.
 
-- **사고 경위**:
-  - 사용자는 "Termux(안드로이드)처럼 Playwright/Chromium을 못 쓰는 환경에서도 MCP를 쓰게 만들 방법을 고민해 달라, Sol을 불러라"고만 요청했다. **SSH를 쓰라는 지시는 없었다.**
-  - Sonnet이 Sol에게 보낼 자문 요청 프롬프트를 직접 작성하면서, 비교할 아키텍처 후보 목록에 **스스로 "(A) 원격 실행 위임: SSH를 통한 stdio MCP 서버"를 임의로 추가**했다(다른 두 후보 B/C도 함께 제시했으나, 문제는 사용자가 요청도 언급도 하지 않은 구체적 기술 스택 하나를 감독자가 먼저 제시해버린 것).
-  - Sol과 그 답변을 받은 agy는 이 후보를 성실히 검토한 결과 "Phase 1 최적 선택"으로 채택하고, 이를 기반으로 SSH 키 생성, `authorized_keys` `restrict,command=` 제한, Tailscale 기기 분실 대응 매뉴얼, 보안 비교표, Claude Code `claude mcp add` SSH 설정 예시까지 **상당한 분량의 구체적 구현 가이드**를 `TERMUX_SUPPORT.md`에 작성해 커밋·푸시했다.
-  - 사용자는 이후 세션에서 "리버스엔지니어링(순수 파이썬 네이티브 로그인)이 나을 것 같다"고 먼저 방향을 제시했고, 실제로 그 방향(Phase 2/3)이 성공적으로 구현된 뒤에야 "SSH로 할 거면 의미가 없다(그냥 호스트에 직접 붙는 것과 다를 바 없다)"고 SSH 방안 자체의 가치를 부정했다. 이 시점에 되짚어보니 SSH는 애초에 사용자가 원한 적이 없었고, 불필요하게 많은 분량의 문서·설계가 낭비됐다.
-- **근본 원인**:
-  - 감독자(Sonnet)가 하위 Tier-3 자문(Sol)에게 조사 과제를 위임할 때, **"사용자가 실제로 요청한 것"과 "감독자 자신이 떠올린 후보 아이디어"를 구분하지 않고 동일한 무게로 섞어서 제시**했다.
-  - Sol/agy 입장에서는 감독자가 준 후보 목록을 곧이곧대로 신뢰하고 성실히 발전시켰을 뿐이므로, 문제의 원인은 하위 워커가 아니라 **상위 프롬프트를 작성한 감독자 자신에게 있다.**
-  - 결과가 그럴듯하고 분량이 많다고 해서(보안 비교표, 로드맵, 단계별 가이드) 사용자가 원했던 방향이라고 착각하기 쉽다 — 산출물의 완성도와 "사용자가 요청했는지 여부"는 별개다.
-- **재발 방지**:
-  1. Tier-3(Sol/Opus) 자문 프롬프트를 작성할 때, 감독자 자신이 떠올린 후보/아이디어는 **"사용자 요청"과 명시적으로 분리 표기**한다(예: "사용자 요청: ~~~" vs "감독자 제안 후보(사용자 미확인): ~~~"). 최소한 자문 결과를 사용자에게 전달할 때 어느 부분이 감독자 자신의 아이디어였는지 명확히 밝힌다.
-  2. 특히 구체적인 기술 스택(SSH, 특정 프로토콜, 특정 라이브러리 등)을 후보로 제시할 때는, 그것이 사용자가 이미 언급한 제약/선호에서 자연스럽게 도출된 것인지, 아니면 감독자가 일반론적으로 떠올린 것인지 스스로 점검한다.
-  3. 하위 워커(Sol/agy)가 감독자 제시 후보 중 하나를 "최적 선택"으로 확정해 대량의 구현물을 만들기 전에, 그 후보가 사용자 요청 범위 안에 있는 것이 맞는지 감독자가 한 번 더 확인하고 넘기는 것이 이상적이다(단, 매번 왕복 확인을 요구하면 좋았던 delegation 흐름이 느려지므로, 최소한 "이건 내가 제안한 후보다"라는 라벨링만이라도 반드시 남긴다).
+현행 범위 판단·원문 전달은 [SUPERVISOR](../SUPERVISOR.md)에 둔다. 자문에 감독자 제안을 추가한다면 사용자 요구와 구분해 표시하고, 그 제안을 승인된 구현 범위로 취급하지 않는다.
 
 ---
 
-## 16. Post-mortem/Learning Capsule 규약이 자동 전파되지 않고 프로젝트를 바꾸자마자 소실된 사고 (2026-09-28)
+## 16. Post-mortem/Learning Capsule 규약 전파 누락 사고 (2026-09-28)
 
-- **메타데이터**:
-  - `root-cause`: `template-bug` / `self-reflection-not-automatic`
-  - `verified_with`: 2026-09-28
+과거 10라운드에서 ROLES에 있던 보고 규약이 전달되지 않았다. 이후 임시방편인 “매 지시서에 전부 재기술”이 지침·메모리에 복제되어 과지시를 만들었다.
 
-- **증상 (정량적)**:
-  - 같은 세션 안에서 `ecount_hub`(별개 프로젝트) 작업을 10라운드 디스패치했는데, **10건 전부 `learning_capsule`/`knowledge_refs` 규약을 포함하지 않았다.**
-  - ROLES.md §"종료 보고 형식"에는 `refs_loaded`, `learning_capsule`, `[[DONE <id>]] result=... | learning=...` 형식이 명시되어 있음에도, 실제로는 단 한 번도 지켜지지 않았다.
-- **근본 원인**:
-  1. `bin/dispatch.sh`가 모든 디스패치에 자동 주입하는 `[CHAIN CONTEXT]` 헤더(`WORKER_RULES`)에는 "직접 작업 금지"와 "codex 컨벤션 우선"만 박혀 있고, **`learning_capsule`/보고 형식 규칙은 전혀 포함되어 있지 않다.**
-  2. agy는 oneshot 모드에서 `ROLES.md`를 자동으로 읽지 않는다(§1 T0924-01 프로브에서 이미 실측 확인된 사실). 따라서 이 규약은 **감독자(Sonnet)가 매 디스패치 프롬프트에 직접 재기술해야만** 작동하는, 사실상 감독자의 기억력에 100% 의존하는 비자동 시스템이었다.
-  3. 감독자가 새 프로젝트(다른 작업 맥락)로 전환하면서 매번 처음부터 프롬프트를 새로 작성했고, 그 과정에서 이 관례를 그대로 빠뜨렸다. 이를 잡아낼 어떤 기계적 안전장치도 없었다 — 조용히 샜고, 아무도 눈치채지 못했다(사용자가 직접 "자가반영이 되는지 훑어보라"고 요청하기 전까지).
-- **함의**: 어제(9/23) 정성 들여 설계한 Post-mortem Lifecycle(Capture→Curate, `known-issues.md`/`lessons.md`/`incidents/*.md` 3계층)은 **문서로만 존재하고, 실제로는 작동을 보장하는 메커니즘이 없다.** "규칙을 문서에 적어뒀다"와 "규칙이 실제로 매번 지켜진다"는 완전히 다른 문제라는 걸 정량적으로 보여준 사례.
-- **재발 방지 (제안, 미구현)**:
-  1. **`bin/dispatch.sh`의 자동 헤더에 규약을 직접 인라인**해야 한다(ROLES.md 경로만 던져주는 게 아니라). 예: `WORKER_RULES`에 `"Report format: end with [[DONE <task_id>]] result=<summary> | learning=<one-line|none>"` 한 줄을 추가하면, 어떤 프로젝트로 디스패치하든 감독자가 매번 재기술할 필요 없이 구조적으로 강제된다.
-  2. 이게 되기 전까지는, 감독자가 새 프로젝트/새 맥락으로 넘어갈 때마다 "이 프로젝트에도 Post-mortem 규약을 프롬프트에 넣었는가"를 스스로 체크리스트로 확인해야 한다(신뢰할 수 없는 임시방편이지만, 구조적 수정 전까지는 최소한의 안전장치).
-  3. 장기적으로는 워커의 최종 보고에 `learning=` 필드가 없으면 `event-emit`/감독자 감사 단계에서 경고를 내는 것도 고려할 만하다(다만 자연어 자유서식 보고를 기계적으로 파싱해야 하므로 난이도가 있음 — 이번엔 제안만 남기고 구현하지 않음).
+현행 정본은 [ROLES](../ROLES.md)의 공통 보고 규약이며 지시서에는 그 문서를 **읽고 적용**하라는 참조만 둔다. 현재 dispatch는 agy에 규약 D를 자동 주입하지만 knowledge_refs/refs_loaded/learning_capsule 전부를 자동 생성하지는 않는다. 자동 생성과 문서 열람을 혼동하지 않는다. 이전의 수동 재기술 체크리스트와 자동 경고 제안은 현행 의무가 아니다.
 
 ---
 
@@ -309,7 +221,7 @@ summary: 실측으로 확인된 RC 전제조건, Folder Trust 우회 한계, 세
   - Claude Code auto-mode의 보안 정책이 시스템 내부 상태 파일이나 런타임 제어 파일을 임의로 변조하는 패턴을 고위험 행위로 분류하여 차단하기 때문이다.
 - **대응 및 해결 방안**:
   - 모델이 셸 커맨드로 `state` 파일을 직접 변조하려고 시도하지 않는다.
-  - 대신 표준 복구 스크립트인 `bin/task-abandon.sh`를 호출하도록 하거나, 보안 분류기가 스크립트 실행까지 의심하는 경우 사용자에게 터미널에서 `!` 접두사(예: `! ./bin/task-abandon.sh <task_id>`)로 직접 실행해 줄 것을 요청한다.
+  - 표준 복구 도구 `bin/task-abandon.sh`를 사용한다. 차단 대응은 [[session-resume#54-claude-auto-mode-분류기-차단-시-대처]]에 둔다.
 
 ---
 
@@ -336,85 +248,32 @@ summary: 실측으로 확인된 RC 전제조건, Folder Trust 우회 한계, 세
 
 ## 20. 별도 tmux 창에서 백그라운드 데몬 서버 PID 강제 kill 시 세션 전체 종료 사고
 
-- **메타데이터**:
-  - `root-cause`: `operation-mistake` / `process-kill-safety`
-  - `verified_with`: 2026-10-01 (운영 실측)
-- **증상**:
-  - 백그라운드 대시보드 서버(`dashboard/server.py`)나 모니터 데몬 프로세스를 종료하기 위해 `kill <pid>` 또는 `pkill`을 수행했을 때, 해당 tmux 윈도우나 세션 전체가 함께 닫혀버리는 참사가 발생한다.
-- **원인**:
-  - 해당 프로세스가 별도 백그라운드 데몬이 아니라 tmux 윈도우의 루트 셸(창 생성 시 실행된 PID 1격 셸)에서 직접 구동 중이었거나, `pkill -f` 명령이 부모 tmux 프로세스 또는 세션 셸의 매칭 패턴까지 광범위하게 포괄하여 죽였기 때문이다.
-- **대응 및 해결 방안**:
-  - **`pkill -f` 전면 금지**: 패턴 기반의 프로세스 강제 종료를 절대 사용하지 않는다.
-  - 대시보드 종료 시에는 반드시 전용 관리 스크립트(`dashboard/run.sh stop`)를 사용한다.
-  - 프로세스를 수동 종료해야 할 경우 반드시 `ps -ef --forest` 또는 `pgrep -P <pid>`로 프로세스 트리 계보를 확인하고, 윈도우의 리더 셸이 아닌 최하위 리프(leaf) 프로세스 PID만 정확히 지정하여 종료한다.
-  - 만약 윈도우가 닫혔다면, 세션을 전부 재생성하지 말고 `bootstrap-v2.sh`를 실행하여 누락된 윈도우만 안전하게 보완 복구한다.
+2026-10-01 데몬인 줄 알고 종료한 PID가 tmux 창의 루트 프로세스라 창·세션이 닫혔다. 패턴 종료는 부모까지 매칭할 수 있었다.
+
+공통 안전선은 [SUPERVISOR](../SUPERVISOR.md)에 둔다. 대시보드는 `dashboard/run.sh stop`을 사용하고, 그 외 종료는 계보를 확인한 작업 프로세스 PID만 대상으로 한다.
 
 ---
 
-## 21. Codex 쿼터 소진(Quota/Rate Limit Exhaustion) 시 대응 및 agy 폴백
+## 21. Codex 쿼터 소진 (Quota/Rate Limit Exhaustion)
 
-- **메타데이터**:
-  - `root-cause`: `resource-exhaustion` / `codex-quota-fallback`
-  - `verified_with`: 2026-10-01 (운영 실측)
-- **증상**:
-  - `dispatch.sh codex ...` 실행 시 OpenAI API 429 Rate Limit, 사용량 한도 초과(Quota exceeded), 또는 크레딧 소진 에러가 발생하며 태스크가 실패 상태(`status=error`)로 종료된다.
-- **원인**:
-  - 계정의 월간 사용 한도 도달 또는 단시간 대량 토큰 소비로 인한 일시적 API 차단.
-- **대응 및 해결 방안**:
-  - Codex가 쿼터 소진으로 실패한 경우 무리하게 재시도를 반복하지 않는다.
-  - 감독자(Sonnet)는 즉시 워커를 `agy`로 전환(fallback)하여 동일한 프롬프트로 작업을 재디스패치한다:
-    ```bash
-    SESSION_NAME=agentchain-v2 ./bin/dispatch.sh agy --prompt-file /path/to/prompt.md
-    ```
-  - 사용자에게 "Codex 쿼터 소진으로 인해 agy(Gemini 3.8 Flash)로 폴백하여 작업을 진행합니다"라는 사실을 명확히 보고한다.
+429/usage limit을 실제 관측했을 때 중복 재시도를 피한다. 과거의 “codex이면 무조건 agy” 규칙은 리드와 구현 슬롯을 혼동하므로 대체한다. 현행 폴백은 [SUPERVISOR](../SUPERVISOR.md) 역할 절을 따른다.
 
 ---
 
 ## 22. 실험 중 SESSION_NAME 누락 또는 환경변수 ACC_RUNTIME 상속으로 인한 라이브 운영 세션 오염 사고
 
-- **메타데이터**:
-  - `root-cause`: `isolation-failure` / `live-session-pollution`
-  - `verified_with`: 2026-10-01 (운영 실측)
-- **증상**:
-  - 개발자가 새로운 기능 테스트나 디스패치 실험을 수행하는 도중, 현재 운영 중이던 실서비스 라이브 세션(`agentchain-v2`)의 런타임 디렉토리(`runtime/agentchain-v2-*`) 내에 더미 태스크(`tasks/agy-*`)나 이벤트가 생성되어 라이브 세션의 상태가 꼬이거나 오염된다.
-- **원인**:
-  - 상위 셸 환경에 기존 라이브 세션의 `ACC_RUNTIME`이나 `SESSION_NAME` 환경변수가 export되어 있는 상태에서 새 스크립트를 실행했거나,
-  - `dispatch.sh` 실행 시 `SESSION_NAME`을 명시하지 않아 현재 실행 중인 tmux 세션 환경을 의도치 않게 상속받았기 때문이다.
-- **대응 및 해결 방안**:
-  - 테스트 및 실험을 진행하기 전 반드시 `env | grep -E 'ACC_|SESSION_NAME'`을 실행하여 라이브 세션 환경변수가 잔류해 있는지 확인하고 `unset`한다.
-  - 모든 테스트는 독립된 임시 디렉토리(`mktemp -d`)와 임시 세션명을 주입한 완전 격리 환경(`env -i PATH="$PATH" HOME="$TEST_HOME" ...`)에서 실행한다.
-  - `tests/lib-isolated-env.sh`의 무오염 검증 하네스(라이브 런타임 시그니처 검증 및 고유 마커 검사)를 적극 활용한다.
+2026-10-01 실험에서 세션명 누락·ACC_RUNTIME 상속으로 라이브 런타임에 시험 태스크가 생겼다. 원인과 격리 대응은 §13과 같으므로 반복하지 않는다. 호출 대상 선택은 [[usage#41-작업-디스패치-v2-full-push-권장]], 실험은 격리 하네스를 따른다.
 
 ---
 
 ## 23. agy resident 완료 알림 누락 및 턴 조기 종료 결함 (센티널 기반 완료 판정 부재)
 
-- **메타데이터**:
-  - `root-cause`: `cli-hook-lifecycle` / `premature-stop-detection`
-  - `verified_with`: 2026-10-12 / 2026-10-13 (운영 실측)
-- **증상 (정량적)**:
-  - `AGY_MODE=resident` 환경에서 agy 본체가 서브에이전트를 위임하거나 중간 일시정지 후 첫 턴을 마칠 때(약 20초 시점), `bin/agy-stop-hook.sh`가 `fullyIdle: true`만을 감지하여 작업을 조기 `done` 처리해버림.
-  - 이로 인해 실제 서브에이전트가 완료된 후 본체가 결과를 취합하는 최종 완료 시점에는 완료 알림 이벤트가 전혀 발행되지 않거나, 체인이 아직 작업이 끝나지 않았는데 완료로 오인하여 후속 작업을 진행하는 심각한 결함 발생.
-- **근본 원인**:
-  1. 기존 `bin/agy-stop-hook.sh`는 Antigravity CLI의 `Stop` 훅 페이로드에서 `fullyIdle: true` 여부만 판정하고, 실제 모델이 작업을 완료했는지를 검증하는 센티널 검사가 전혀 없었음.
-  2. 메인 에이전트가 서브에이전트를 호출한 직후 턴을 마치거나 대기 상태에 들어가면 CLI가 Stop 훅을 트리거하여 조기 완료로 처리됨.
-- **수정 내역**:
-  1. `bin/agy-stop-hook.sh` 전면 개편:
-     - 본체 transcript의 마지막 모델 응답(`PLANNER_RESPONSE` 또는 `source == "MODEL"`)에서만 `[[DONE <task_id>]]` 또는 `[[BLOCKED <task_id>]]` 센티널 탐색.
-     - 사용자 입력(`USER_INPUT`) 및 서브에이전트 로그(`<subagent_reminder>`, `sender=`)는 엄격히 배제하여 지시서 본문 인용이나 서브에이전트 로그에 의한 오탐 원천 차단.
-     - 센티널 일치 시에만 `done`/`error` 이벤트 발행 및 state/busy 정리.
-     - 센티널 부재 시 작업을 `running` 상태로 유지하고 `{"decision":"allow"}` 반환.
-     - 무한 대기 방지: state의 `deadline_epoch` 초과 시 `timeout` error 이벤트 발행 및 종료.
-     - `terminationReason`/`error` 에러/중단 상황은 센티널 유무와 무관하게 즉시 error 발행 유지.
-  2. `bin/dispatch.sh` 보강 (규약 D 자동 주입):
-     - agy 대상 디스패치 시 지시서 끝에 규약 D 자동 주입 (중복 방지):
-       "서브에이전트를 쓰더라도 본체는 모든 서브에이전트가 끝나 결과를 받을 때까지 턴을 종료하지 말고, 최종 보고 후 마지막 줄에 [[DONE <task_id>]] result=… | learning=…(막히면 [[BLOCKED <task_id>]] reason=…)를 출력한 뒤에만 종료하라. 센티널은 최종 응답에만 쓰고 중간 응답·서브에이전트 지시에는 쓰지 마라."
-- **재발 방지책**:
-  - `tests/stop-hook-test.sh`에 8대 시나리오(미완료 대기, 완료 1회, 멱등성, 프롬프트 인용 오탐 방지, 블록 감지, 에러 즉시 감지, 타임아웃, 마커/서브에이전트 배제) 전수 단위 테스트 구축.
-  - dispatch 자동 꼬리말 주입을 통한 프롬프트 규약 누락 구조적 방지.
-- **이슈 23 후속 보강 (센티널 판정 완화 및 타임스탬프 가드)**:
-  - **1차 수정의 한계**: 훅이 `[[DONE <task_id>]]`의 식별자가 내부 발급 태스크 ID(예: `agy-1791...`)와 100% 일치할 것만을 강제하여, 지시서나 모델이 사람이 읽기 쉬운 논리적 이름 ID(예: `some-named-task`, `hookfix2-20261012`)를 출력한 경우 완료 인식이 거부되고 타임아웃까지 불필요하게 대기하는 문제 발생.
-  - **식별자 비종속 완화**: 마지막 모델 응답의 단독 줄이 `^\s*\[\[(DONE|BLOCKED)\s+([a-zA-Z0-9_\-\.]+)\s*\]\](.*)$` 형식이면 식별자 일치 여부와 무관하게 완료/차단을 인정함. 식별자가 실제 `task_id`와 다를 경우 `ACC_HOOK_DEBUG=1`에 `sentinel_id_mismatch_accepted (found: <id>, current: <task_id>)` 태그를 로깅하고, 이벤트 summary에는 센티널 뒷부분 텍스트를 그대로 사용함. 훅이 닫는 대상은 여전히 `workers/agy.busy`의 현재 작업 하나임.
-  - **이전 작업 센티널 오탐 방지 가드**: ID 일치 조건을 완화함에 따라 동일 세션 내 이전 작업의 마지막 모델 응답 센티널이 남아있을 때 조기 완료로 오탐할 위험을 방어하기 위해, 모델 응답의 `created_at` 타임스탬프가 현재 작업의 `started_epoch` 이후인지 검증(`created_epoch < started_epoch`인 응답은 무시/배제).
-  - **단위 테스트 확장**: `tests/stop-hook-test.sh`에 이름 ID 센티널 완료(Case 17), 이름 ID BLOCKED(Case 18), 이전 작업 오래된 센티널 배제(Case 19)를 추가하여 총 19개 케이스 전원 통과 검증.
+2026-10-13 resident Stop 훅이 서브에이전트 위임 직후 조기 done을 발행하거나 완료 알림을 놓쳤다. fullyIdle만 보던 판정을 마지막 모델 응답의 센티널과 시작 시각 가드로 보강했다. 논리 이름 ID도 허용하되 busy가 가리키는 현재 작업만 닫는다.
 
+현재 구현은 [[architecture#28-resident-tui-브리지-stage-1-agy-상주--codex-oneshot]], 보고 계약은 [ROLES](../ROLES.md), 회귀 사례는 [stop-hook-test.sh](../tests/stop-hook-test.sh)에 둔다. 자동 규약 D가 주입되므로 지시서에 꼬리말을 복사하지 않는다.
+
+---
+
+## 24. 워커 정체 경고 진단
+
+정체 경고에서 변경 파일 존재만 보고 정상 진행이라 결론내리지 않는다. 실제 장시간 대기 프로세스·CPU·마지막 출력 시각을 확인한다. 기존 `~/bin/stall-diag.sh <worktree>`가 있으면 사용하고, 확인된 정체 작업·임시 서버만 정확한 PID로 처리한다. 운영 프로세스에는 프로젝트 경계를 적용한다. 과거 경고 2회에도 테스트가 38분 멈춘 사례의 교정을 메모리에서 이곳으로 옮겼다.

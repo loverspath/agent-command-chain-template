@@ -2,7 +2,7 @@
 title: Session Resume & Environment Reproduction Runbook
 tags: [session-resume, runbook, operation, tmux-bridge, handoff, troubleshooting, supervisor-norms]
 related: ["[[INDEX]]", "[[usage]]", "[[architecture]]", "[[known-issues]]"]
-summary: 신규 Claude CLI 세션에서 agent-command-chain-template 환경을 완벽히 재현하고, 세션 분기 시나리오별 대응, stale lease 복구, 프로젝트 핸드오프 절차 및 감독관 행동 규범을 안내하는 운영 런북.
+summary: 세션 점검·교체·stale lease 복구와 감독자 정본·프로젝트 지침으로 연결하는 재개 런북.
 ---
 
 # Session Resume & Environment Reproduction Runbook
@@ -62,8 +62,7 @@ Codex 작업 디스패치는 Sol 계열 최신 모델을 자동 해석(`bin/reso
 # Sol 모델 해석 정상 여부 검증 (Sol 계열 최신 list 모델 반환 확인)
 ./bin/resolve-model.sh sol
 ```
-- **Codex 쿼터 고갈 점검 및 agy 폴백**:
-  Codex 실행 시 쿼터 고갈(Quota/Rate limit exhaustion) 또는 인증 만료가 발생하면, 무리하게 codex 호출을 반복하지 않는다. 즉시 워커를 `agy`로 폴백(fallback)하여 작업을 위임하고, 사용자에게 쿼터 소진 사실을 명확히 보고한다.
+역할별 한도 소진 대응은 [SUPERVISOR](../SUPERVISOR.md)의 역할 절을 따른다.
 
 ### 1.4 템플릿 복제 및 환경 설정 파일 생성
 새 머신이거나 템플릿이 처음이라면:
@@ -72,43 +71,17 @@ git clone https://github.com/loverspath/agent-command-chain-template.git ~/agent
 cd ~/agent-command-chain-template
 cp config.env.example config.env
 ```
-복사한 `config.env`에서 다음 필수 항목들을 설정한다:
-1. `AGY_MODE=resident`: agy를 상주 TUI 모드로 기동 (Stage 1 지원).
-2. `CODEX_EFFORT=medium`: 상위 티어(Sol 등) 추론 강도를 medium으로 고정 (사용자 결정 반영).
+복사한 `config.env`에서 다음 항목을 인스턴스 용도에 맞게 설정한다:
+1. `AGY_MODE`: oneshot/resident 중 해당 인스턴스 실행 방식을 선택한다.
+2. `CODEX_EFFORT`: 모델 구현 설정이며 프로젝트/사용자 인스턴스 선호를 따른다.
 3. `HANDOFF_FILE`: 세션 재개 시 자동 참조할 인수인계서 경로 지정 (예: `HANDOFF_FILE=docs/RESUME_HANDOFF.md`).
 4. `PROJECT_DIR`: (선택 사항) 특정 프로젝트 디렉토리를 작업 대상으로 영구 고정할 경우 지정 (비워두면 부트스트랩 실행 위치가 기본 작업 대상이 됨).
 
 ---
 
-## 2. 본 머신의 표준 설정값 (Standard Configuration Values)
+## 2. 템플릿 기본값과 인스턴스 설정
 
-본 머신에서 운용되는 표준 설정값과 `config.env.example`의 기본값 비교이다 (비밀값 없음):
-
-| 설정 변수 | 머신 표준 설정 (`config.env`) | 템플릿 기본값 (`config.env.example`) | 설명 |
-|---|---|---|---|
-| `SESSION_NAME` | `agentchain-v2` | `agentchain` | tmux 세션 고유 식별자. v2 운용 시 `agentchain-v2` 권장 |
-| `SONNET_WINDOW` | `sonnet` | `sonnet` | 계층 1 Claude Sonnet 감독자 윈도우 |
-| `AGY_WINDOW` | `agy` | `agy` | 계층 2 agy 라우터/워커 윈도우 |
-| `CODEX_WINDOW` | `codex` | `codex` | 계층 2 Codex 워커 윈도우 |
-| `SONNET_CMD` | `claude --model sonnet --remote-control` | `claude --model sonnet --remote-control` | Sonnet 기동 명령 (RC 자동 활성화) |
-| `AGY_CMD` | `agy --new-project --mode plan` | `agy --new-project --mode plan` | agy 대화형 기동 명령 (v1 레거시용) |
-| `AGY_RESIDENT_CMD` | `agy --dangerously-skip-permissions` | `agy --dangerously-skip-permissions` | agy 상주 TUI 기동 명령 (Stage 1 상주 모드) |
-| `CODEX_CMD` | `codex --model $(bin/resolve-model.sh sol) -s danger-full-access` | `codex --model $(bin/resolve-model.sh sol) -s danger-full-access` | Codex 대화형 기동 명령 (v1 폴백용) |
-| `CODEX_TIER` | `sol` | `sol` | Codex 최상위 모델 티어 (Sol 계열 최신 자동 해석: `bin/resolve-model.sh sol`) |
-| `CODEX_MODEL` | (미지정, 자동 해석) | (미지정) | 명시적 Codex 모델 지정 시 자동 해석 우회 (비상시에만 수동 오버라이드) |
-| `CODEX_EFFORT` | `medium` | `medium` | Codex 추론 강도 (상위 티어는 medium 추론 강도 고정) |
-| `BRIDGE_MODE` | `push` | `push` | Full-Push 이벤트 통지 브리지 모드 (FIFO+asyncRewake) |
-| `WORKER_MODE` | `oneshot` | `oneshot` | 기본 워커 모드 (`oneshot` 또는 `resident`) |
-| `AGY_MODE` | `resident` | (미지정) | agy 상주 TUI 브리지 모드 (Stage 1 활성화) |
-| `CODEX_MODE` | `oneshot` | (미지정) | codex 워커 모드 (Stage 1에서는 oneshot 고정) |
-| `HANDOFF_FILE` | (프로젝트별 지정) | `` (비워둠) | 세션 재개 시 자동 참조할 프로젝트 인계 파일 경로 |
-| `START_WATCHDOG` | `true` | `true` | bootstrap 시 watchdog-v2.sh 백그라운드 자동 기동 |
-| `WATCHDOG_INTERVAL` | `60` | `60` | 워치독 프로세스 생존 검사 주기 (초) |
-| `DEFAULT_TASK_TIMEOUT`| `1800` | `1800` | 작업 기본 타임아웃 (30분) |
-| `NO_OUTPUT_WARN_SECONDS`| `900` | `900` | 출력 정체 경고 기준 시간 (15분) |
-| `AUTO_CONFIRM_TRUST`| `true` | `true` | 디렉토리 신뢰("trust this folder?") 자동 승인 |
-
----
+설정 변수·기본값은 [[usage#2-설정-체계-및-계층화-2-tier-configuration]]와 `config.env.example`이 정본이다. 이 런북에 머신 설정 표를 복제하지 않는다. 사용자 선호·프로젝트 조율은 [문서 3층](../docs/INSTRUCTION-LAYERS.md)을 따른다.
 
 ## 3. 세션 분기 시나리오 (Session Branching Scenarios)
 
@@ -198,44 +171,9 @@ tmux 창 밖의 일반 셸 터미널에서 `claude`를 실행했거나, 브리�
 
 ---
 
-## 4. 기동 후 검증 체크리스트 (Post-Launch Verification Checklist)
+## 4. 기동 후 점검
 
-세션이 기동되거나 재개되었을 때 다음 6가지 항목을 점검한다:
-
-1. **3개 윈도우 확인**:
-   ```bash
-   tmux list-windows -t agentchain-v2
-   # 출력 결과에 sonnet, agy, codex 3개 윈도우가 모두 존재해야 함
-   ```
-2. **agy 상주 TUI 준비 상태 확인 (최초 1회성 상태 점검)**:
-   ```bash
-   tmux capture-pane -t agentchain-v2:agy -p | tail -n 5
-   # 프롬프트 기호(>)가 보이고 유휴 대기 상태여야 함
-   ```
-   *주의:* 이 명령은 세션 기동/재개 시 **최초 1회 상태 점검(sanity check)** 목적에 한하며, 작업 진행 중 주기적 폴링(polling) 용도로 사용하는 것은 전면 엄격 금지된다 (완료 통지는 Full-Push 이벤트 대기).
-3. **watchdog-v2 프로세스 생존 및 로그 확인**:
-   ```bash
-   pgrep -fa "watchdog-v2.sh"
-   # 워치독 PID가 정상 출력되어야 함. 워치독 로그는 런타임 전용 로그에서 확인:
-   tail -n 20 "$RUNTIME_DIR/watchdog.log"
-   ```
-4. **이벤트 FIFO 파이프 존재 확인**:
-   ```bash
-   test -p "$RUNTIME_DIR/event.fifo" && echo "FIFO OK"   # 체인 목록·상태는 bin/chain status
-   ```
-5. **웹 대시보드 상태 확인**:
-   ```bash
-   ./dashboard/run.sh status
-   # 실행 중이지 않다면 `./dashboard/run.sh start` 로 기동
-   ```
-6. **디스패치 드라이런 검증 (`--dry-run`)**:
-   ```bash
-   SESSION_NAME=agentchain-v2 ./bin/dispatch.sh agy --dry-run
-   ```
-   - 정상 출력: `[dry-run] Target window 'agy' in session 'agentchain-v2' is ready ...` (exit code 0)
-   - **exit 75의 의미**: 워커에 활성 리스(`workers/<worker>.busy`)가 걸려 있거나 태스크가 아직 `status=running` 상태여서 새 디스패치가 충돌/거부됨을 의미함 (§5 참조).
-
----
+`bin/session-init.sh --check --session <세션명>`으로 창·워치독·FIFO·단일 리스너·dispatch 대상 상태를 한 번 확인한다. 이미 같은 점검을 마쳤으면 수동 체크리스트를 중복 실행하지 않는다. 이 도구는 `--apply` 없이 기동·교체하지 않는다. 새로 기동할 때와 작업 완료를 기다릴 때의 점검을 구별한다.
 
 ## 5. Stale Lease 복구 절차 (Stale Lease Recovery)
 
@@ -272,63 +210,19 @@ cat "$RUNTIME_DIR/tasks/<task_id>/state"
   - 이후 `dispatch.sh agy --dry-run`이 즉시 성공함.
 
 ### 5.4 Claude auto-mode 분류기 차단 시 대처
-- Claude Code의 auto-mode 환경에서는 모델이 `sed`나 `echo`로 `state` 파일을 직접 수정하려 할 때 보안 분류기(classifier)에 의해 툴 호출이 거절될 수 있다.
-- 해결책: 모델이 스크립트를 직접 편집하려 하지 말고, 사용자에게 터미널에서 `!` 접두사로 스크립트를 실행하도록 안내하라:
-  ```bash
-  ! ./bin/task-abandon.sh <task_id>
-  ```
+거절 문구·기존 허용 설정·직전 성공 명령을 확인하고 승인 범위 안에서 전용 도구의 단순 호출로 해결한다. 원인을 확인하지 않은 채 사용자 설정 추가나 직접 실행을 요구하지 않는다. 해소 불가능한 차단만 실제 결과와 함께 보고한다.
 
 ---
 
-## 6. 프로젝트 핸드오프 재개 절차 (Project Handoff Resume Procedure)
+## 6. 프로젝트 핸드오프 재개 절차
 
-신규 세션에서 특정 프로젝트 작업을 이어받을 때는 다음 순서를 엄격히 준수한다.
+[SUPERVISOR](../SUPERVISOR.md) → [문서 3층](../docs/INSTRUCTION-LAYERS.md) → HANDOFF_FILE → 해당 프로젝트 지침과 현재 상태를 읽는다. HANDOFF가 겸용이면 요청한 프로젝트를 고른다. 과거 운영 HEAD·검사 수·날짜 한정 지시를 현재 사실로 사용하지 않는다.
 
-### 6.1 인계 문서 열람 순서
-프로젝트 내에 지정된 인계 문서(예: `docs/RESUME_HANDOFF.md` 또는 `config.env`의 `HANDOFF_FILE`)가 있다면 아래 순서로 읽는다:
-1. **규칙 및 안전 수칙 (Rules & Live Session Safety)**: 수정 금지 대상 경로, 보호 세션, 격리 규약.
-2. **운영 현황 (Operations)**: 현재 살아있는 tmux 윈도우, 워치독 PID, 대시보드 포트.
-3. **완료 및 진행 중 작업 (Completed / In-flight Tasks)**: 이미 커밋된 내용과 미완료 항목.
-4. **다음 후보 작업 (Next Candidate Plans)**: 대기 중인 설계 및 구현 과제.
+현재 상태 / 다음 작업 / 실제 사용자 결정이 필요한 항목만 한국어로 짧게 보고한다. 기존 실행 위임 범위는 그대로 이어간다.
 
-### 6.2 사용자 보고 형식 (한국어 간략 보고)
-인계 문서를 확인한 직후, 사용자에게 **한국어로 3~5줄 내외의 요약 보고**를 작성한다:
-- **현재 시스템 상태**: 세션 생존 여부, 완료된 최근 커밋, 워커 가용 상태.
-- **다음 작업 후보**: 착수 가능한 후보 과제 2~3개.
-- **사용자 결정 필요 사항 (Pending Decisions)**: 설계 방향, 브랜치 전략 등 사용자 승인이 필요한 사항.
+## 7. 감독자 운영 지침
 
-### 6.3 절대 금지 수칙 (Strict Constraints)
-> [!CAUTION]
-> **사용자의 명시적 승인/지시가 있기 전에는 다음 작업을 절대 수행하지 마라:**
-> 1. `bin/dispatch.sh`를 통한 임의의 워커 작업 디스패치 금지.
-> 2. `bootstrap-v2.sh --restart`를 통한 세션 강제 재시작 금지.
-> 3. git push 또는 메인 브랜치 머지 금지.
-> 4. 사용자와의 대화/논의는 승인이 아니므로, 명시적 승인을 확인한 후 디스패치하라.
-
----
-
-## 7. 감독관 행동 규범 (Supervisor Behavioral Norms)
-
-Claude Sonnet(계층 1 감독자)으로서 지켜야 할 핵심 행동 규범이다:
-
-1. **역할 분담의 철칙 (구현과 테스트는 agy, 감독은 설계·검수·머지)**:
-   - **감독관(Sonnet)**: 사람과의 소통, 상위 아키텍처 설계, 작업 디스패치, 결과 감사(Audit), Git 커밋 및 머지 담당. 감독관은 코드를 직접 수정하지 않으며 문서 정리 작업 역시 agy에게 위임한다.
-   - **구현 워커(agy & codex)**: 실제 코드 파일 편집, 문서 정리, 대량 탐색, 정적 검사 및 **단위/통합 테스트 실행 ("테스트도 agy가 한다" 원칙)**.
-   - Sol 쿼터 한도 소진 시에도 동일하게 agy가 구현과 테스트를 전담한다.
-   - 감독관이 직접 수십 줄 이상의 코드를 작성하거나 툴 루프에 빠져 구현·테스트를 대신하지 않는다.
-2. **화면 폴링 금지, Full-Push 이벤트 대기**:
-   - `tmux capture-pane`이나 루프를 통한 주기적 상태 조회를 전면 금지한다.
-   - 워커가 작업을 마치면 `[ACC_EVENT_BATCH]` 시스템 알림으로 자동 기상하므로, 디스패치 후에는 조용히 대기하라.
-3. **디스패치 프롬프트 3대 필수 요소**:
-   - `knowledge_refs`: 워커가 사전에 반드시 읽어야 할 위키/규약 문서 경로.
-   - `learning_capsule`: 워커 종료 시 예상 밖 상황/원인/재사용 규칙 보고 요구.
-   - `[[DONE <task_id>]]` sentinel: 작업 완료 시 최종 보고 형식.
-4. **실측 상태 직접 검증 (2층 감사 구조)**:
-   - 워커가 제출한 자기보고 텍스트(`refs_loaded`, `learning_capsule`)만 맹신하지 마라.
-   - 반드시 `$ACC_RUNTIME/tasks/<task_id>/output.log`와 실제 `git diff`를 직접 열람하여 교차 검증하라.
-5. **논의는 승인이 아니다 (Discussion != Approval)**:
-   - 사용자가 "어떻게 생각하세요?", "이런 방향은 어떨까요?"라고 질문한 것은 계획 수립을 위한 의견 교환일 뿐, 구현 착수 승인이 아니다.
-   - 반드시 계획을 정리하여 제시한 뒤 사용자의 명시적인 진행 승인을 얻고 디스패치하라.
+[SUPERVISOR](../SUPERVISOR.md)가 단일 정본이다. 이 런북에는 역할·매 지시서 보고 필드·검증 세트를 반복하지 않는다. 지시서는 ROLES와 선택한 프로젝트 지침을 읽으라는 참조 한 줄로 연결한다.
 
 ---
 

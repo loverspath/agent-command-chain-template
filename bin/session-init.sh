@@ -406,14 +406,17 @@ else
   # --- B. 런타임 전용 브리핑 + 첫 프롬프트 + 기동 스크립트 생성 ---
   BRIEF="$RT/supervisor_brief.md"; FIRST="$RT/supervisor_first_prompt.txt"; LAUNCH="$RT/supervisor-launch.sh"
   cat >"$BRIEF" <<EOF
+먼저 $HERE/SUPERVISOR.md 와 $HERE/docs/INSTRUCTION-LAYERS.md 를 읽고 적용한다.
+프로젝트 지침은 $HERE/projects/README.md 에서 요청 대상으로 선택한다. HANDOFF_FILE이 있으면 그 인계 링크를 따른다.
+
 # 감독관 브리핑 (session-init.sh 생성, $(date '+%F %T'))
 너(Claude)는 tmux 세션 \`$SESSION\`의 상위 감독관이다. 워커 창: \`$AGY_WINDOW\`(agy 상주), codex(oneshot).
 작업 프로젝트: \`$PROJECT\`. 런타임: \`$RT\`. 템플릿: \`$HERE\`.
 - 작업 지시는 오직: SESSION_NAME=$SESSION ACC_RUNTIME=$RT $HERE/bin/dispatch.sh <agy|codex> --prompt-file <파일>
-- 디스패치 프롬프트에는 매번 직접 적는다(자동화 안 됨): knowledge_refs / learning_capsule / 마지막 줄 [[DONE <task_id>]] result=… | learning=…
-- 완료 알림은 [ACC_EVENT_BATCH] 로 자동 도착한다. tmux capture-pane 반복 폴링 금지(필요 시 3~5분 이상 간격, 1회성, 자동 재무장 금지).
-- 알림 처리 후 안내된 event-ack.sh 명령으로 ack 한다. 워커 자기보고는 output.log 와 git diff 로 직접 검증한다.
-- 사용자의 명시 지시 전 dispatch / bootstrap-v2.sh --restart / git push 금지. 논의는 승인이 아니다.
+- 지시서 작성·감사 판단은 SUPERVISOR, 워커 보고는 $HERE/ROLES.md 를 읽고 적용한다.
+- 완료 이벤트·보고 규약은 $HERE/ROLES.md, 실행 명령은 $HERE/.llmwiki/usage.md 를 따른다.
+- 알림 처리는 $HERE/.llmwiki/usage.md 의 ACK 명령을 따른다.
+- 위임 범위와 승인 판단은 SUPERVISOR를 따른다. 세션 교체는 기존 실행 위임과 구별한다.
 - tmux 세션 \`${PROTECTED_SESSIONS}\` 와 포트 ${PROTECTED_PORTS} 는 운영 서버 — 지시 없이 절대 건드리지 않는다.
 EOF
   cat >"$FIRST" <<EOF

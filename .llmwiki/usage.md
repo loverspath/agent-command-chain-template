@@ -8,7 +8,7 @@ summary: 설치부터 v2 Full-Push/Stage 1 상주/대시보드/v1 레거시 실�
 # Usage & Operation Guide
 
 `agent-command-chain-template`의 사전 요구사항, 환경 설정, v2/v1 실행법, 관찰 및 제어 명령어, Resident TUI 운용, 대시보드 사용법, 에이전트 간 수동 핸드오프, 그리고 세션 정리 절차를 설명한다.
-신규 세션에서 환경을 재현하고 작업을 이어받는 운영 지침은 [[session-resume]] 런북을 참조한다.
+신규 세션은 [[session-resume]], 감독자 판단은 [SUPERVISOR](../SUPERVISOR.md), 문서 층과 프로젝트 선택은 [참조 경로](../docs/INSTRUCTION-LAYERS.md)를 읽는다.
 
 ---
 
@@ -55,13 +55,16 @@ chmod +x bootstrap.sh watchdog.sh bootstrap-v2.sh watchdog-v2.sh bin/*.sh adapte
 
 ### 2.3 주요 설정 항목
 
+이 표는 템플릿 예제 기본값이다. 사용자 인스턴스 모델 선호와 구별한다. `AGY_TIER`·`AGY_MODEL`은 기본 미지정, `AGY_EFFORT`는 high, `ACC_TERM_BACKEND=tmux`, `ACC_PROACTIVE_MODE=observe`다. 새 예제의 키가 기존 로컬 설정에 자동 병합되지는 않는다. 문서 층과 실제 인스턴스 조율은 [참조 경로](../docs/INSTRUCTION-LAYERS.md)에 둔다.
+
+
 | 변수명 | 기본값 | 설명 |
 |---|---|---|
 | `PROJECT_DIR` | (주석 처리됨) | 채우면 항상 이 프로젝트로 고정. 비워두면 스크립트를 실행한 디렉토리가 작업 대상이 됨 |
 | `SESSION_NAME` | `agentchain` | tmux 세션 기본 이름 (v2 권장 세션명: `agentchain-v2`). 여러 프로젝트 동시 실행 시 고유하게 지정 |
 | `SONNET_WINDOW` | `sonnet` | 계층 1 Claude Sonnet 윈도우 이름 |
 | `AGY_WINDOW` | `agy` | 계층 2 agy (Gemini) 윈도우 이름 |
-| `CODEX_WINDOW` | `codex` | 계층 2-내부 Tier 2 Codex Terra 윈도우 이름 |
+| `CODEX_WINDOW` | `codex` | Codex 워커 슬롯 이름(리드 배정과 별개) |
 | `SONNET_CMD` | `claude --model sonnet --remote-control` | Sonnet 기동 명령. 부트스트랩 시 `--add-dir <템플릿경로>`가 세션 범위로 자동 부가됨 |
 | `AGY_CMD` | `agy --new-project --mode plan` | agy 대화형 기동 명령 (v1 레거시 상주용) |
 | `AGY_RESIDENT_CMD` | `agy --dangerously-skip-permissions` | agy 상주 TUI 기동 명령 (Stage 1 상주 모드) |
@@ -184,13 +187,8 @@ AGY_MODE=resident SESSION_NAME=agentchain-v2 ./bin/dispatch.sh agy --dry-run
 ```
 
 #### 4. 상주 완료 판정 및 규약 D (Sentinel Protocol)
-상주 agy 환경에서는 Antigravity CLI의 Stop 라이프사이클 훅이 메인 에이전트의 중간 턴 종료(예: 서브에이전트 위임 직후 또는 일시 정지) 시점에도 호출될 수 있습니다. 조기 완료 오판정을 방지하기 위해 다음 원칙이 적용됩니다:
-- **완료 센티널 유연 판정 (이름 ID 허용)**: 본체 트랜스크립트의 마지막 모델 응답(`PLANNER_RESPONSE` 또는 `source == "MODEL"`) 단독 행에 `[[DONE <id>]]` 또는 `[[BLOCKED <id>]]`가 존재하면, 지시서가 논리적 이름 ID(예: `[[DONE some-named-task]]`)나 실제 발급된 태스크 ID 중 무엇을 사용했더라도 완료/차단 이벤트가 정상 발행됩니다 (식별자 불일치 시 `ACC_HOOK_DEBUG=1`에 태그 로깅, summary에는 센티널 뒷부분 텍스트 유지).
-- **이전 작업 센티널 오탐 방지 가드**: 동일 세션 내 이전 작업의 잔여 센티널에 의한 오탐을 방어하기 위해, 모델 응답의 `created_at` 타임스탬프가 현재 작업의 `started_epoch` 이후인 응답만 유효한 센티널 후보로 검증합니다(`created_at < started_epoch`인 응답은 무시/배제).
-- **센티널 부재 시 대기**: 센티널이 없으면 작업을 `running` 상태로 유지하며, 작업 마감 시각(`deadline_epoch`) 초과 시 `timeout` 에러 이벤트가 발행됩니다.
-- **규약 D 자동 주입**: `bin/dispatch.sh` 실행 시 agy 지시서 꼬리말에 규약 D가 자동 주입됩니다:
-  > "서브에이전트를 쓰더라도 본체는 모든 서브에이전트가 끝나 결과를 받을 때까지 턴을 종료하지 말고, 최종 보고 후 마지막 줄에 [[DONE <task_id>]] result=… | learning=…(막히면 [[BLOCKED <task_id>]] reason=…)를 출력한 뒤에만 종료하라. 센티널은 최종 응답에만 쓰고 중간 응답·서브에이전트 지시에는 쓰지 마라."
-- **에러 즉시 감지**: CLI 에러 또는 사용자 중단(`terminationReason`) 발생 시 센티널 유무와 무관하게 즉시 `error` 이벤트가 발행됩니다.
+
+판정·훅 구현은 [[architecture#28-resident-tui-브리지-stage-1-agy-상주--codex-oneshot]], 워커 보고는 [ROLES](../ROLES.md)가 정본이다. dispatch는 agy 실행 사본에 규약 D를 자동 주입한다. 필드 전체 자동생성과는 다르다.
 
 #### 5. 유휴 시점 컨텍스트 소거 (/clear) 및 1줄 재무장
 워커가 유휴 상태(`workers/agy.busy` 부재)일 때 대화 맥락을 소거하고 역할을 재장착한다:
@@ -286,55 +284,9 @@ tmux send-keys -t agentchain:codex "Specification 문서를 확인하고 테스�
 
 ---
 
-## 5. agy → Codex 수동 핸드오프 절차
+## 5. 역할·핸드오프
 
-템플릿 자체에는 agy가 Codex를 직접 spawn하는 자동 라우터가 포함되어 있지 않으므로, **Sonnet(또는 사용자)이 중계 역할**을 수행한다.
-
-### 단계 1: agy 초기 지시
-agy 창에 최초 프롬프트를 주입할 때 한계 상황 시의 보고 규칙을 명시한다:
-
-```text
-너는 이 프로젝트의 라우터 에이전트다. 먼저 현재 작업 디렉토리와 프로젝트 정체성을 보고해라.
-스스로 처리하기 벅찬 하위 작업이 있으면 직접 호출하지 말고 결과 보고에
-"Terra급 작업 필요: ..." 라고 명시해서 Sonnet이 codex 창으로 넘길 수 있게 해라.
-
-[v2 핵심 원칙: oneshot 단발 턴 내 invoke_subagent 위임 및 직접 작업 금지]
-- 너의 실행 단위는 WORKER_MODE=oneshot의 단발 실행 한 턴이다.
-- 너 자신(메인 세션)은 직접 Read/Edit/Bash 등의 툴을 호출해 파일 작업에 몰입하지 마라 (경량 작업 예외 없음).
-- 내장 도구 invoke_subagent를 호출해 워커 서브에이전트에게 실작업을 위임하고, 지시/취합/보고만 총괄해라.
-- 서브에이전트 소환이 불가능하거나 실패하면 조용히 직접 처리하지 말고 [[BLOCKED <id>]] reason=subagent-unavailable|needs-terra 로 상위(Sonnet)에 명시 보고해라.
-(참고: v1 상주 TUI의 responsive state 대기는 legacy이며, TUI 비선점형 입력 큐잉 지연 방지를 위해 v2 oneshot으로 전환됨)
-```
-
-### 단계 2: Sonnet의 관찰 및 판단
-Sonnet은 `capture-pane` 또는 `logs/agy.pane.log`를 주기적으로 검사하다가 agy 출력에서 `Terra급 작업 필요: <내용>` 패턴을 감지한다.
-
-### 단계 3: Codex Terra로 작업 전달
-Sonnet(또는 사람)은 아래 규격에 맞추어 `send-keys`로 `codex` 창에 지시를 주입한다:
-
-```bash
-tmux send-keys -t agentchain:codex "Model Role: Codex Terra
-Scope: src/core/auth.py
-
-## Specification
-agy에서 분리된 토큰 검증 로직 구현 및 엣지 케이스 단위 테스트 작성
-
-## Constraints
-- 프로젝트 경계 밖 파일 수정 금지
-- 검증/디버깅 시 파일:줄 번호로 정확히 인용" C-m
-```
-
-> **참고**: `codex`는 대화형 TUI 모드로 지속 기동되어 있으므로 작업이 끝나면 결과가 화면에 유지되며, 추가 지시를 계속해서 `send-keys`로 전달할 수 있다.
-
-### 단계 4: Tier 3 (Sol / Opus) 최고난도 상담 필요 시
-- **Codex Sol 상담**: Codex 창에서 프로세스를 종료하거나 커맨드를 변경하여 일회성으로 호출:
-  ```bash
-  tmux send-keys -t agentchain:codex C-c
-  tmux send-keys -t agentchain:codex 'codex --model "$(bin/resolve-model.sh sol)" -s danger-full-access' C-m
-  ```
-- **Claude Opus 상담**: Sonnet 세션 내에서 일회성 플래닝/상담 명령을 `--model opus`로 실행.
-
----
+현행 역할 배분·경중·폴백 판단은 [SUPERVISOR](../SUPERVISOR.md), 보고는 [ROLES](../ROLES.md)에만 둔다. v2는 위 §4.1의 dispatch와 §4.3의 이벤트 ACK를 사용한다. v1 화면·send-keys 예시는 §4.5의 레거시 참고이며 v2 작업 지시로 사용하지 않는다.
 
 ## 6. 세션 정리 (Clean-up)
 

@@ -144,6 +144,9 @@ fi
 BRIEF_FILE="$HERE/$LOG_DIR/session_brief.md"
 mkdir -p "$(dirname "$BRIEF_FILE")"
 cat > "$BRIEF_FILE" <<EOF
+먼저 $HERE/SUPERVISOR.md 와 $HERE/docs/INSTRUCTION-LAYERS.md 를 읽고 적용한다.
+프로젝트 지침은 $HERE/projects/README.md 에서 요청 대상으로 선택한다. HANDOFF_FILE이 있으면 그 인계 링크를 따른다.
+
 # 이 tmux 세션 실제 작동 방식 (자동 생성, $(date '+%Y-%m-%d %H:%M:%S'))
 
 너(Sonnet)는 tmux 세션 \`$SESSION_NAME\`의 감독자다. 창 셋: \`$SONNET_WINDOW\`(너 자신),
@@ -168,19 +171,9 @@ tmux send-keys -t $SESSION_NAME:$AGY_WINDOW "여기에 지시문" C-m
 tmux send-keys -t $SESSION_NAME:$CODEX_WINDOW "여기에 지시문" C-m
 \`\`\`
 
-## 역할 경계 (중요)
-- agy는 스스로 난이도를 판단해 작업하지만, **codex(Terra)를 자동으로 부르지 않는다.**
-  agy 출력을 보고 "이건 Terra급이다" 싶으면 네가 직접 codex 창에 send-keys 로 넘겨라.
-- **agy(메인 세션) 역시 직접 작업에 몰입하지 않고 서브에이전트(\`--agent\`)를 소환해 위임**해야 한다.
-  agy 메인 세션의 존재 이유는 상위 감독자(너)의 인터럽트를 즉시 수신할 수 있는 대기 상태(responsive state)를
-  유지하며 지시/취합/보고를 총괄하는 데 있다. 서브에이전트 소환 실패를 보고하거나 직접 파일 수정(Read/Bash/Edit)에
-  빠지는지 감시해라.
-- codex는 대화형(one-shot exec 아님)이라 계속 떠 있다. 작업 하나 끝나면 그 결과를
-  읽고 다음 지시를 또 send-keys 하면 된다.
-- Sol/Opus(최고난도 상담)는 상시 창이 없다. 필요하면 codex 창 커맨드를
-  Sol 계열 최신(\`bin/resolve-model.sh sol\`)으로 바꿔서 새로 켜거나, 네 자신을 \`--model opus\`로 일회성
-  실행해서 상담을 구해라.
-- 사람이 새 명령을 내리면 알맞은 창에 전달하고, 진행상황을 요약해서 보고해라.
+## 역할 경계
+현행 역할·경중은 $HERE/SUPERVISOR.md, 보고는 $HERE/ROLES.md 를 읽고 적용한다.
+이 브리프의 pull/send-keys는 v1 레거시 동작 설명이며 v2는 .llmwiki/usage.md 의 dispatch/이벤트를 따른다.
 
 ## 더 자세한 배경
 - $HERE/README.md — 전체 설계 이유와 한계

@@ -2,16 +2,16 @@
 title: agent-command-chain-template Wiki Index
 tags: [index, moc, tmux-bridge, multi-agent-orchestration]
 related: ["[[architecture]]", "[[usage]]", "[[known-issues]]", "[[session-resume]]"]
-summary: Sonnet/agy/Codex 4계층 명령계통 및 v2 Full-Push/Stage 1 상주/대시보드/v1 tmux 브리지/세션 재개 런북 내부 위키 색인.
+summary: 감독자 정본·문서 3층·프로젝트 선택 진입점과 v2/v1 구현·운영 위키 색인.
 ---
 
 # agent-command-chain-template
 
-Claude Sonnet(감독/RC) · agy(Gemini 3.8 Flash, 라우터+워커) · Codex Terra(중난도 설계/직접수행) · Sol/Opus(최고난도 상담, 상시 창 없음) 4계층을 연결하는 범용 멀티 에이전트 명령계통 템플릿이다.
+감독자·리드·워커의 책임을 연결하는 범용 멀티 에이전트 명령계통 템플릿이다. 모델·하네스와 역할을 분리한다.
 무거운 외부 하네스(DB, 하트비트, 리스 등) 없이 순수 셸 스크립트와 tmux 기반으로 시작하여, v2 Full-Push(POSIX FIFO + Durable Outbox) 비동기 통지, Stage 1 agy 상주 TUI 모드, tailnet 전용 읽기 전용 대시보드(`dashboard/`)까지 지원한다.
 어느 디렉토리에서든 스크립트를 호출하면 해당 작업 디렉토리를 대상으로 삼아 즉시 멀티 에이전트 협업 환경을 구축한다.
 
-세션을 처음 시작한다면: [[architecture]] → [[usage]] 순서로 읽으면 충분하다.
+세션 시작: [SUPERVISOR](../SUPERVISOR.md) → [문서 3층](../docs/INSTRUCTION-LAYERS.md) → [프로젝트 선택표](../projects/README.md). 역할·경중·지시서의 규칙은 SUPERVISOR에만 둔다. 구현 설명이 필요할 때 [[architecture]]·[[usage]]를 선별해서 읽는다.
 신규 Claude CLI 세션에서 환경을 재현하거나 중단된 작업을 재개한다면: [[session-resume]] 런북을 따르라.
 작업 중 막히거나 경고가 발생하면 바로 [[known-issues]]를 확인하라 — 이미 실측하고 해결책/우회책을 정리해 두었다.
 

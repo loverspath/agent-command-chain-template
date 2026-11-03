@@ -2,13 +2,12 @@
 
 이 리포지토리에서 작업하는 모든 Claude Code 세션은 아래 지침을 따른다.
 
-## 시작 시 필독 지침
+## 시작 시 참조
 
-1. **내부 위키 색인 먼저 확인**: 세션을 시작하면 가장 먼저 [`.llmwiki/INDEX.md`](.llmwiki/INDEX.md)를 읽어라. 이 리포의 아키텍처, 사용법, 알려진 이슈가 태그/링크로 인덱싱되어 있다.
-2. **선별적 문서 열람**: 위키 내 모든 문서를 한 번에 다 읽지 말고, 현재 수행하려는 작업과 관련된 페이지만 골라서 읽어라 (예: 브리지/프로세스 수정 시 `architecture.md`, 제어 명령 확인 시 `usage.md`, 제약/에러 대응 시 `known-issues.md`).
-3. **위키 수정 및 추가 규칙**: 위키 문서를 수정하거나 새로 작성할 때는 `.llmwiki/` 내부 규칙(YAML frontmatter 필수: `title`, `tags`, `related`, `summary`)을 엄격히 준수해라.
-4. **세션 재개 및 환경 재현**: 신규 세션에서 환경을 재현하거나 프로젝트 작업을 이어받을 때는 [`.llmwiki/session-resume.md`](.llmwiki/session-resume.md)를 먼저 확인하라.
-5. **검증 간소화 규칙**: 리드 지시서·검증 작업 전에 [`ROLES.md`](ROLES.md)의 "검증 간소화 및 역할 분담 규칙"을 따른다 (작게 설계·가볍게 검증, 검증 설계=리드/실행=agy+서브에이전트).
+1. [SUPERVISOR.md](SUPERVISOR.md)를 읽는다. 역할·작업 경중·지시서·검증 판단의 단일 정본이다.
+2. [문서 3층과 참조 경로](docs/INSTRUCTION-LAYERS.md)에 따라 프로젝트 지침과 인계 파일을 선택한다.
+3. [.llmwiki/INDEX.md](.llmwiki/INDEX.md)에서 현재 작업에 필요한 구현·운영 페이지만 읽는다. 재개 작업은 [session-resume](.llmwiki/session-resume.md)를 참조한다.
+4. 위키 편집 시 YAML frontmatter `title`, `tags`, `related`, `summary`를 유지하고 INDEX를 갱신한다.
 
 ## 프로젝트 기본 정보
 
@@ -21,5 +20,5 @@
   - `adapters/`: agy/codex 단발 실행기(`agy-oneshot.sh`, `codex-oneshot.sh`).
   - `dashboard/`: 읽기 전용 상태 웹 대시보드 (`server.py`, `index.html`, `run.sh`).
   - `config.env.example` / `config.env`: 환경 설정 및 CLI 기동 파라미터 (Agy 모델 티어, 터미널 백엔드, 능동성 모드 포함).
-  - `ROLES.md`: 계층별 최초 프롬프트, 수동 핸드오프 및 상태/사유코드 규격.
+  - `SUPERVISOR.md` / `ROLES.md`: 감독자 운영 정본 / 워커 진입점·보고 계약.
   - `docs/`: 구조 계약 및 구현 설계서 (`PRINCIPLES-structure-vs-implementation.md`, `IMPL-DESIGN-20261102.md`).
