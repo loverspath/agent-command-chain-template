@@ -29,6 +29,21 @@ done
   exit 64
 }
 
+# WSL2 자동 휴면(15초 idle 종료) 방지를 위한 KeepAlive 보장
+ensure_wsl_keepalive() {
+  [[ "$DRY" == "true" ]] && return 0
+  if ! pgrep -f "sleep infinity" >/dev/null 2>&1; then
+    if [[ -x "/mnt/c/Windows/System32/schtasks.exe" ]]; then
+      /mnt/c/Windows/System32/schtasks.exe /run /tn WSL-KeepAlive >/dev/null 2>&1 || true
+      sleep 1
+    fi
+    if ! pgrep -f "sleep infinity" >/dev/null 2>&1; then
+      nohup sleep infinity >/dev/null 2>&1 &
+    fi
+  fi
+}
+ensure_wsl_keepalive
+
 # all 지정 시 chain-registry.sh 파이프라인(runtime/registry.json)에서 활성 체인 목록을 받아 각 세션의 recover_script 실행
 if [[ "$want" == "all" ]]; then
   targets=()
@@ -253,7 +268,9 @@ except Exception:
     fi
     if [[ -n "$bridge_id" && "$waiting_for" != "dialog open" ]]; then
       rc_url="https://claude.ai/code/${bridge_id}"
-      break
+      if [[ "$need_launch" != "true" || "$attempt" -ge 3 ]]; then
+        break
+      fi
     fi
   fi
 
@@ -272,6 +289,15 @@ if [[ -n "$rc_url" ]]; then
   printf '%s\n' "$rc_url" > "$RT/remote_control_url" 2>/dev/null || true
 elif [[ -f "$RT/remote_control_url" ]]; then
   rc_url="$(head -n1 "$RT/remote_control_url" 2>/dev/null | tr -d '\r\n' || true)"
+fi
+
+# 6) 워치독(watchdog-v2.sh) 기동 상태 확인 및 자동 복구
+START_WATCHDOG="${START_WATCHDOG:-true}"
+if [[ "$START_WATCHDOG" == "true" && -x "$HERE/watchdog-v2.sh" ]]; then
+  wd_pid="$(cat "$RT/watchdog.pid" 2>/dev/null || true)"
+  if [[ -z "$wd_pid" ]] || ! kill -0 "$wd_pid" 2>/dev/null; then
+    nohup env PROJECT_DIR="$P" ACC_RUNTIME="$RT" SESSION_NAME="$S" "$HERE/watchdog-v2.sh" >/dev/null 2>&1 &
+  fi
 fi
 
 if [[ -n "$claude_pid" ]]; then
