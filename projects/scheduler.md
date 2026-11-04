@@ -12,7 +12,6 @@ RentPlan·이카운트 원천은 읽기 입력이다. 명시 승인 없는 외�
 
 - 개발 확인은 변경 위험에 맞는 한 번으로 묶는다. 화면 국소 변경은 해당 화면 확인, 파서·데이터 변경은 실제 응답/페이로드 대조 등 해당 계약을 확인한다. UI 전체 스모크를 자동 추가하지 않는다.
 - **배포 정본:** [DEPLOY.md](/home/rerun/scheduler/docs/DEPLOY.md). 리드가 `release.sh` 내장 preflight를 그대로 사용한다. 소 작업이라는 이유로 내장 검사·격리를 우회하지 않으며, 같은 전체 검사를 별도로 중복 지시하지 않는다. 격리 포트는 18088이다.
-- **keep-gate 예외:** [RESUME_HANDOFF §0.2](/home/rerun/scheduler/docs/RESUME_HANDOFF.md)의 지정 `RESTART_SCRIPT`를 적용한다. DEPLOY의 기본 재기동 스크립트는 전표 쓰기 게이트를 켜므로 그대로 사용하지 않는다. gate=false/false 유지 여부는 해당 절과 승인된 반영 계획으로 확인한다. 범용 배포 설명보다 이 현재 운영 예외가 우선이다.
 - **상태 백업:** main/staging push 또는 릴리스 직후 리드가 `backup_state.sh`로 private-state를 갱신한다. 격리 사본의 누락된 상태는 `restore_state.sh <대상폴더>`로 복원한다. 명령·대상과 포함 범위는 DEPLOY §1.4 및 해당 도구가 정본이다. 비밀값은 열지 않는다.
 
 ## 편성·현행성
