@@ -223,6 +223,15 @@ if [[ "$need_launch" == "true" ]]; then
   term_run_cmd "$S:$SONNET_WINDOW" "$LAUNCH"
 fi
 
+# resident 모드 마커가 있는 경우 재생성된 agy 창의 최신 pane_id 동기화
+if [[ -f "$RT/workers/agy.resident" ]] || grep -q '^agy_mode=resident' "$RT/bootstrap_version" 2>/dev/null; then
+  mkdir -p "$RT/workers"
+  agy_pane_id="$(tmux display-message -p -t "$S:$AGY_WINDOW" '#{pane_id}' 2>/dev/null || true)"
+  if [[ -n "$agy_pane_id" ]]; then
+    printf 'pane_id=%s\nsession=%s\n' "$agy_pane_id" "$S" > "$RT/workers/agy.resident"
+  fi
+fi
+
 # 5) Claude 기동, "Resume this conversation?" 자동 승인, Remote Control URL 검증
 claude_pid=""
 claude_status="starting"

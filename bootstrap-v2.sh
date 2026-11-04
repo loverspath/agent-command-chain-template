@@ -6,6 +6,21 @@ umask 077
 
 export PATH="$HOME/.local/bin:$PATH"
 
+# WSL2 자동 휴면(15초 idle 종료) 방지를 위한 KeepAlive 보장 (테스트 임시 런타임 제외)
+ensure_wsl_keepalive() {
+  [[ "${ACC_RUNTIME:-}" == /tmp/* ]] && return 0
+  if ! pgrep -f "sleep infinity" >/dev/null 2>&1; then
+    if [[ -x "/mnt/c/Windows/System32/schtasks.exe" ]]; then
+      /mnt/c/Windows/System32/schtasks.exe /run /tn WSL-KeepAlive >/dev/null 2>&1 || true
+      sleep 1
+    fi
+    if ! pgrep -f "sleep infinity" >/dev/null 2>&1; then
+      nohup sleep infinity >/dev/null 2>&1 &
+    fi
+  fi
+}
+ensure_wsl_keepalive
+
 RESTART_SESSION=false
 while [[ $# -gt 0 ]]; do
   case "$1" in

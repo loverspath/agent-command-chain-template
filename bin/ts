@@ -26,6 +26,20 @@ HERE="$(cd "$BIN_DIR/.." && pwd)"
 mkdir -p "$HERE/logs" "$HOME/logs" 2>/dev/null || true
 TS_LOG_FILE="$HERE/logs/ts.log"
 
+# WSL2 자동 휴면(15초 idle 종료) 방지를 위한 KeepAlive 보장
+ensure_wsl_keepalive() {
+  if ! pgrep -f "sleep infinity" >/dev/null 2>&1; then
+    if [[ -x "/mnt/c/Windows/System32/schtasks.exe" ]]; then
+      /mnt/c/Windows/System32/schtasks.exe /run /tn WSL-KeepAlive >/dev/null 2>&1 || true
+      sleep 1
+    fi
+    if ! pgrep -f "sleep infinity" >/dev/null 2>&1; then
+      nohup sleep infinity >/dev/null 2>&1 &
+    fi
+  fi
+}
+ensure_wsl_keepalive
+
 ts_log() {
   local ts_now
   ts_now="$(date '+%Y-%m-%d %H:%M:%S')"
