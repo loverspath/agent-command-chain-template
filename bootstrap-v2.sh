@@ -415,6 +415,11 @@ tmux set-environment -t "$SESSION_NAME" ACC_BOOTSTRAP_VERSION 2 2>/dev/null || t
 tmux set-environment -t "$SESSION_NAME" ACC_RUNTIME "$ACC_RUNTIME" 2>/dev/null || true
 tmux set-environment -t "$SESSION_NAME" SESSION_NAME "$SESSION_NAME" 2>/dev/null || true
 
+# 체인 레지스트리(recovery.json 및 runtime/registry.json) 자동 동기화
+if [[ -x "$HERE/bin/chain-registry.sh" && "$ACC_RUNTIME" != /tmp/* ]]; then
+  "$HERE/bin/chain-registry.sh" sync >/dev/null 2>&1 || true
+fi
+
 echo ""
 echo "완료. Full-Push v2 세션이 가동되었습니다."
 echo "  tmux attach -t $SESSION_NAME"

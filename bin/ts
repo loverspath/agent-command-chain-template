@@ -9,16 +9,120 @@
 #   ts attach <세션|번호>  지정한 tmux 세션에 접속
 #   ts recover [세션]      기존 체인 세션 복구 (Claude 단독 + Remote Control)
 #   ts new [세션]          신규 체인 전체 기동 (Claude + Watchdog + agy + codex)
+#   ts retire [세션]       불필요한 체인 세션 정리 (목록 및 자동복구 제외)
+#   ts unretire <세션>     정리된 체인 세션 복원
+#   ts rc, status          Claude & Remote Control 및 자가 복원 파이프라인 상태
+#   ts log [줄수]          ts 실행/복구/기동 상세 로그 확인
 #   ts list, ls            현재 세션 목록 및 체인 런타임 상태 출력
 #   ts help, -h            도움말 출력
 # ==============================================================================
 
 set -uo pipefail
 
-# 1. 템플릿 루트 디렉토리 결정 (심볼릭 링크 안전 해석)
+# 1. 템플릿 루트 디렉토리 결정 (심볼릭 링크 안전 해석) 및 로그 파일 설정
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 BIN_DIR="$(dirname "$SCRIPT_PATH")"
 HERE="$(cd "$BIN_DIR/.." && pwd)"
+mkdir -p "$HERE/logs" "$HOME/logs" 2>/dev/null || true
+TS_LOG_FILE="$HERE/logs/ts.log"
+
+ts_log() {
+  local ts_now
+  ts_now="$(date '+%Y-%m-%d %H:%M:%S')"
+  printf '[%s] %s\n' "$ts_now" "$*" >> "$TS_LOG_FILE" 2>/dev/null || true
+  printf '[%s] %s\n' "$ts_now" "$*" >> "$HOME/logs/ts.log" 2>/dev/null || true
+}
+
+# 한글 두벌식 입력이 섞여 들어온 경우 영문 QWERTY로 자동 변환 (예: ㅁㅎ둣초먀ㅜ-ㅍ6 -> agentchain-v6, ㅛ -> y)
+normalize_korean_ascii() {
+  python3 -c '
+import sys
+s = sys.argv[1] if len(sys.argv) > 1 else ""
+CHO = ["r","R","s","e","E","f","a","q","Q","t","T","d","w","W","c","z","x","v","g"]
+JUNG = ["k","o","i","O","j","p","u","P","h","hk","ho","hl","y","n","nj","np","nl","b","m","ml","l"]
+JONG = ["","r","R","rt","s","sw","sg","e","f","fr","fa","fq","ft","fx","fv","fg","a","q","qt","t","T","d","w","c","z","x","v","g"]
+COMPAT = {
+    "ㄱ":"r","ㄲ":"R","ㄳ":"rt","ㄴ":"s","ㄵ":"sw","ㄶ":"sg","ㄷ":"e","ㄸ":"E",
+    "ㄹ":"f","ㄺ":"fr","ㄻ":"fa","ㄼ":"fq","ㄽ":"ft","ㄾ":"fx","ㄿ":"fv","ㅀ":"fg",
+    "ㅁ":"a","ㅂ":"q","ㅃ":"Q","ㅄ":"qt","ㅅ":"t","ㅆ":"T","ㅇ":"d","ㅈ":"w","ㅉ":"W",
+    "ㅊ":"c","ㅋ":"z","ㅌ":"x","ㅍ":"v","ㅎ":"g",
+    "ㅏ":"k","ㅐ":"o","ㅑ":"i","ㅒ":"O","ㅓ":"j","ㅔ":"p","ㅕ":"u","ㅖ":"P",
+    "ㅗ":"h","ㅘ":"hk","ㅙ":"ho","ㅚ":"hl","ㅛ":"y","ㅜ":"n","ㅝ":"nj","ㅞ":"np","ㅟ":"nl",
+    "ㅠ":"b","ㅡ":"m","ㅢ":"ml","ㅣ":"l"
+}
+out = []
+for ch in s:
+    code = ord(ch)
+    if 0xAC00 <= code <= 0xD7A3:
+        offset = code - 0xAC00
+        c = offset // 588
+        j = (offset % 588) // 28
+        k = offset % 28
+        out.append(CHO[c] + JUNG[j] + JONG[k])
+    elif ch in COMPAT:
+        out.append(COMPAT[ch])
+    else:
+        out.append(ch)
+print("".join(out))
+' "${1:-}" 2>/dev/null || printf '%s\n' "${1:-}"
+}
+
+# 경로 입력 정규화 (~ 확장, 따옴표 제거, Windows 경로 wslpath 변환)
+normalize_path_input() {
+  local p="${1:-}"
+  p="$(printf '%s' "$p" | sed -e 's/^[[:space:]"'"'"']*//' -e 's/[[:space:]"'"'"']*$//')"
+  [[ -z "$p" ]] && return 0
+  if [[ "$p" == "~" ]]; then
+    p="$HOME"
+  elif [[ "$p" == "~/"* ]]; then
+    p="$HOME/${p#\~/}"
+  elif [[ "$p" =~ ^[A-Za-z]:\\ ]] || [[ "$p" == "\\\\wsl"* ]]; then
+    p="$(wslpath -u "$p" 2>/dev/null || printf '%s' "$p")"
+  fi
+  printf '%s\n' "$p"
+}
+
+# 정확히 일치하는 tmux 세션 존재 여부 확인 (-t 의 prefix 매칭 오작동 방지)
+exact_tmux_session_exists() {
+  local target="${1:-}"
+  [[ -n "$target" ]] || return 1
+  tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -Fxq "$target"
+}
+
+# 다음 사용 가능한 agentchain-vN 번호 자동 추천
+suggest_next_chain_name() {
+  python3 - "$HERE" <<'PY' 2>/dev/null || echo "agentchain-v6"
+import glob, os, re, subprocess, sys
+here = sys.argv[1]
+used = set()
+try:
+    p = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"], capture_output=True, text=True)
+    for line in p.stdout.splitlines():
+        if line.strip():
+            used.add(line.strip())
+except Exception:
+    pass
+for f in glob.glob(os.path.join(here, "instances", "*.env")):
+    used.add(os.path.basename(f)[:-4])
+for sn in glob.glob(os.path.join(here, "runtime", "*", "session_name")):
+    if os.path.isfile(os.path.join(os.path.dirname(sn), "retired")):
+        continue
+    try:
+        with open(sn) as fp:
+            used.add(fp.readline().strip())
+    except Exception:
+        pass
+max_v = 2
+for name in used:
+    m = re.match(r"^agentchain-v(\d+)$", name)
+    if m:
+        max_v = max(max_v, int(m.group(1)))
+n = max_v + 1
+while f"agentchain-v{n}" in used:
+    n += 1
+print(f"agentchain-v{n}")
+PY
+}
 
 # 2. ANSI 컬러 정의
 if [[ -t 1 ]]; then
@@ -60,13 +164,11 @@ get_tmux_sessions() {
     [[ -z "$name" ]] && continue
     ACTIVE_SESSIONS+=("$name")
 
-    # 생성 시각 포맷팅
     local created_fmt=""
     if [[ -n "$created" && "$created" =~ ^[0-9]+$ ]]; then
       created_fmt="$(date -d "@$created" '+%m/%d %H:%M' 2>/dev/null || echo "")"
     fi
 
-    # 윈도우 이름 목록
     local win_list
     win_list="$(tmux list-windows -t "$name" -F '#{window_name}' 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
 
@@ -87,65 +189,193 @@ attach_session() {
     return 1
   fi
 
-  if ! tmux has-session -t "$target" 2>/dev/null; then
+  if ! exact_tmux_session_exists "$target" && ! tmux has-session -t "$target" 2>/dev/null; then
     echo -e "${C_RED}[오류] tmux 세션 '$target'을(를) 찾을 수 없습니다.${C_RESET}" >&2
     return 1
   fi
 
   echo -e "${C_GREEN}[연결] tmux 세션 '$target'에 접속합니다...${C_RESET}"
   if [[ -n "${TMUX:-}" ]]; then
-    # 이미 tmux 세션 내부에서 실행한 경우: switch-client 사용
     tmux switch-client -t "$target"
   else
-    # 일반 터미널에서 실행한 경우: exec attach로 현재 프로세스 전환
     exec tmux attach-session -t "$target"
   fi
 }
 
-# 6. 복구 가능한 체인 인스턴스 탐색 함수
+# 6. 에이전트 체인 레지스트리 파이프라인(bin/chain-registry.sh) 기반 후보 및 상태 조회
 get_chain_instances() {
-  declare -A seen=()
   CHAIN_CANDIDATES=()
-
-  # 1) instances/*.env 검색
-  for f in "$HERE"/instances/*.env; do
-    [[ -f "$f" ]] || continue
-    local s
-    s="$(basename "$f" .env)"
-    if [[ -n "$s" && -z "${seen["$s"]:-}" ]]; then
-      seen["$s"]=1
-      CHAIN_CANDIDATES+=("$s")
-    fi
-  done
-
-  # 2) runtime/*/session_name 검색
-  for sn in "$HERE"/runtime/*/session_name; do
-    [[ -f "$sn" ]] || continue
-    local s
-    s="$(head -n1 "$sn" 2>/dev/null | tr -d '\r\n')"
-    if [[ -n "$s" && -z "${seen["$s"]:-}" ]]; then
-      seen["$s"]=1
-      CHAIN_CANDIDATES+=("$s")
-    fi
-  done
-
-  # 정렬
-  if [[ "${#CHAIN_CANDIDATES[@]}" -gt 0 ]]; then
-    IFS=$'\n' CHAIN_CANDIDATES=($(sort <<<"${CHAIN_CANDIDATES[*]}"))
-    unset IFS
+  if [[ -x "$HERE/bin/chain-registry.sh" ]]; then
+    while IFS= read -r s; do
+      [[ -n "$s" ]] && CHAIN_CANDIDATES+=("$s")
+    done < <("$HERE/bin/chain-registry.sh" json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    for s in d.get("sessions", []):
+        if not s.get("retired") and s.get("session_name"):
+            print(s["session_name"])
+except Exception:
+    pass
+' 2>/dev/null)
   fi
+}
+
+# 특정 체인 세션의 자가 복원 스크립트 경로 반환 ($RT/recover-self.sh)
+get_chain_recover_script() {
+  local sess="$1"
+  local rs=""
+  if [[ -x "$HERE/bin/chain-registry.sh" ]]; then
+    rs="$("$HERE/bin/chain-registry.sh" get "$sess" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print(d.get("recover_script", ""))
+except Exception:
+    pass
+' 2>/dev/null || true)"
+  fi
+  if [[ -n "$rs" && -x "$rs" ]]; then
+    printf '%s\n' "$rs"
+  else
+    printf '%s\n' "$HERE/bin/chain-recover.sh"
+  fi
+}
+
+# 불필요한 체인 세션 정리(Retire) 마법사 / CLI
+retire_chain() {
+  local target="${1:-}"
+  if [[ -z "$target" ]]; then
+    get_chain_instances
+    echo ""
+    echo -e "${C_BOLD}${C_CYAN}============================================================${C_RESET}"
+    echo -e "${C_BOLD}       불필요한 체인 세션 정리 (Retire / 목록 제외)${C_RESET}"
+    echo -e "${C_BOLD}${C_CYAN}============================================================${C_RESET}"
+    if [[ "${#CHAIN_CANDIDATES[@]}" -eq 0 ]]; then
+      echo "  (정리할 활성 체인 인스턴스가 없습니다)"
+      return 0
+    fi
+    for i in "${!CHAIN_CANDIDATES[@]}"; do
+      local c="${CHAIN_CANDIDATES[$i]}"
+      local st="DOWN"
+      exact_tmux_session_exists "$c" && st="UP (실행 중)"
+      printf "  [%d] %-18s [%s]\n" "$((i+1))" "$c" "$st"
+    done
+    echo ""
+    read -rp "정리(retire)할 세션 번호 또는 이름 (취소: Enter): " sel
+    [[ -z "$sel" ]] && return 0
+    if [[ "$sel" =~ ^[0-9]+$ ]]; then
+      local idx=$((sel - 1))
+      if [[ "$idx" -ge 0 && "$idx" -lt "${#CHAIN_CANDIDATES[@]}" ]]; then
+        target="${CHAIN_CANDIDATES[$idx]}"
+      else
+        echo -e "${C_RED}[오류] 잘못된 번호입니다.${C_RESET}" >&2
+        return 1
+      fi
+    else
+      target="$sel"
+    fi
+  fi
+
+  ts_log "[retire_chain] 세션 정리 요청: $target"
+  if exact_tmux_session_exists "$target"; then
+    echo -e "${C_YELLOW}세션 '$target'의 tmux 세션을 함께 종료합니다...${C_RESET}"
+    tmux kill-session -t "$target" 2>/dev/null || true
+  fi
+  "$HERE/bin/chain" retire "$target"
+  echo -e "${C_GREEN}[완료] '$target' 세션이 정리(retired)되어 레지스트리 파이프라인 및 자동복구 대상에서 제외되었습니다.${C_RESET}"
+  echo -e "${C_DIM}(다시 복구 목록에 살리려면: ts unretire $target)${C_RESET}"
+}
+
+# 특정 체인 세션의 Claude 감독자 및 Remote Control 상태 파싱 (레지스트리 파이프라인 우선)
+# 출력 포맷: claude_alive(yes/no)|claude_pid|claude_status|sid|rc_url
+get_claude_rc_info() {
+  local sess="$1"
+  if [[ -x "$HERE/bin/chain-registry.sh" ]]; then
+    local out
+    out="$("$HERE/bin/chain-registry.sh" get "$sess" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    alive = "yes" if d.get("claude_alive") else "no"
+    cpid = str(d.get("claude_pid") or "")
+    st = d.get("claude_status") or "-"
+    sid = d.get("supervisor_session_id") or ""
+    url = d.get("remote_control_url") or ""
+    print(f"{alive}|{cpid}|{st}|{sid}|{url}")
+except Exception:
+    print("no||-||")
+' 2>/dev/null || echo "no||-||")"
+    printf '%s\n' "$out"
+    return 0
+  fi
+  printf 'no||-||\n'
+}
+
+show_rc_status() {
+  echo -e "${C_BOLD}${C_CYAN}=== 에이전트 체인 레지스트리 파이프라인 & Remote Control 상태 ===${C_RESET}"
+  if [[ ! -x "$HERE/bin/chain-registry.sh" ]]; then
+    echo "  (bin/chain-registry.sh 스크립트를 찾을 수 없습니다)"
+    return 0
+  fi
+  local lines=()
+  while IFS= read -r l; do
+    [[ -n "$l" ]] && lines+=("$l")
+  done < <("$HERE/bin/chain-registry.sh" json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    for s in d.get("sessions", []):
+        if s.get("retired"):
+            continue
+        sn = s.get("session_name", "")
+        ta = "1" if s.get("tmux_alive") else "0"
+        ca = "yes" if s.get("claude_alive") else "no"
+        cp = str(s.get("claude_pid") or "")
+        cs = s.get("claude_status") or "-"
+        sid = s.get("supervisor_session_id") or ""
+        url = s.get("remote_control_url") or ""
+        rs = s.get("recover_script") or ""
+        print(f"{sn}|{ta}|{ca}|{cp}|{cs}|{sid}|{url}|{rs}")
+except Exception:
+    pass
+' 2>/dev/null)
+
+  if [[ "${#lines[@]}" -eq 0 ]]; then
+    echo "  (등록된 활성 체인 세션 없음)"
+    return 0
+  fi
+
+  for i in "${!lines[@]}"; do
+    local c ta c_alive c_pid c_status sid rc_url rs
+    IFS='|' read -r c ta c_alive c_pid c_status sid rc_url rs <<< "${lines[$i]}"
+    local st_badge="${C_RED}DOWN${C_RESET}"
+    if [[ "$ta" == "1" ]]; then
+      if [[ "$c_alive" == "yes" ]]; then
+        st_badge="${C_GREEN}UP · Claude(PID:$c_pid,$c_status)${C_RESET}"
+      else
+        st_badge="${C_YELLOW}UP · Claude 미기동${C_RESET}"
+      fi
+    fi
+    printf "  [%d] ${C_BOLD}%-16s${C_RESET} [%b]\n" "$((i+1))" "$c" "$st_badge"
+    printf "      • Resume ID      : %s\n" "${sid:-미확인}"
+    printf "      • Remote RC      : ${C_CYAN}%s${C_RESET}\n" "${rc_url:-미연결}"
+    printf "      • Self-Recovery  : ${C_DIM}%s${C_RESET}\n" "${rs:-기본 복구기}"
+  done
 }
 
 # 7. 체인 세션 복구 마법사 (기능 2)
 recover_chain() {
-  local target="${1:-}"
+  local target=""
   local dry_run=false
-  shift || true
+  local restart_claude=false
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --dry-run) dry_run=true ;;
-      *) ;;
+      --restart-claude|--force-rc) restart_claude=true ;;
+      -*) ;;
+      *) [[ -z "$target" ]] && target="$1" ;;
     esac
     shift
   done
@@ -154,49 +384,47 @@ recover_chain() {
     get_chain_instances
     echo ""
     echo -e "${C_BOLD}${C_CYAN}============================================================${C_RESET}"
-    echo -e "${C_BOLD}           기존 체인 세션 복구 (Claude 단독 + RC)${C_RESET}"
+    echo -e "${C_BOLD}       기존 체인 세션 복구 및 Remote Control 점검${C_RESET}"
     echo -e "${C_BOLD}${C_CYAN}============================================================${C_RESET}"
-    echo -e "${C_DIM}비정상 종료된 세션의 대화 맥락(--resume) 및 Remote Control을 복원합니다.${C_RESET}"
+    echo -e "${C_DIM}비정상 종료된 세션의 대화 맥락(--resume) 및 Remote Control을 복원/점검합니다.${C_RESET}"
     echo ""
 
     if [[ "${#CHAIN_CANDIDATES[@]}" -gt 0 ]]; then
       echo -e "${C_YELLOW}[알려진 체인 인스턴스 목록]${C_RESET}"
       for i in "${!CHAIN_CANDIDATES[@]}"; do
         local c="${CHAIN_CANDIDATES[$i]}"
-        local st_str="${C_GREEN}DOWN (종료됨 - 복구 가능)${C_RESET}"
-        if tmux has-session -t "$c" 2>/dev/null; then
-          st_str="${C_YELLOW}UP (현재 실행 중)${C_RESET}"
+        local info c_alive c_pid c_status sid rc_url
+        info="$(get_claude_rc_info "$c")"
+        IFS='|' read -r c_alive c_pid c_status sid rc_url <<< "$info"
+
+        local st_str="${C_RED}DOWN (복구 가능)${C_RESET}"
+        if exact_tmux_session_exists "$c"; then
+          if [[ "$c_alive" == "yes" ]]; then
+            st_str="${C_GREEN}UP · Claude($c_status)${C_RESET}"
+          else
+            st_str="${C_YELLOW}UP · Claude 미기동(복구 필요)${C_RESET}"
+          fi
         fi
 
-        # 런타임 경로 확인
-        local rt=""
-        if [[ -f "$HERE/instances/$c.env" ]]; then
-          rt="$(grep '^ACC_RUNTIME=' "$HERE/instances/$c.env" | cut -d= -f2- | tr -d '"'"' \r\n")"
-        fi
-        if [[ -z "$rt" ]]; then
-          for d in "$HERE"/runtime/*/; do
-            if [[ "$(head -n1 "$d/session_name" 2>/dev/null | tr -d '\r\n')" == "$c" ]]; then
-              rt="${d%/}"
-              break
-            fi
-          done
-        fi
-        local rt_name="$(basename "$rt")"
-        printf "  ${C_BOLD}[%d]${C_RESET} %-18s [%b] ${C_DIM}(런타임: %s)${C_RESET}\n" \
-          "$((i+1))" "$c" "$st_str" "${rt_name:-미정}"
+        printf "  ${C_BOLD}[%d]${C_RESET} %-16s [%b] ${C_DIM}RC: %s${C_RESET}\n" \
+          "$((i+1))" "$c" "$st_str" "${rc_url:-미확인}"
       done
     else
       echo -e "${C_DIM}  등록된 체인 인스턴스가 없습니다.${C_RESET}"
     fi
 
     echo ""
+    echo -e "  ${C_BOLD}a${C_RESET} : 전체 체인 일괄 복구 및 Remote Control 점검 (${CHAIN_CANDIDATES[*]})"
     echo -e "  ${C_BOLD}m${C_RESET} : 세션명 직접 입력"
     echo -e "  ${C_BOLD}b${C_RESET} : 메인 메뉴로 돌아가기"
     echo -e "${C_BOLD}${C_CYAN}============================================================${C_RESET}"
-    read -rp "복구할 세션 번호 또는 선택 [1-${#CHAIN_CANDIDATES[@]} / m / b]: " sel
-    sel="${sel:-}"
+    read -rp "복구/점검할 세션 선택 [1-${#CHAIN_CANDIDATES[@]} / a(전체) / m / b]: " sel
+    sel="$(normalize_korean_ascii "${sel:-a}")"
 
     case "$sel" in
+      a|A|all)
+        target="all"
+        ;;
       [0-9]*)
         local idx=$((sel - 1))
         if [[ "$idx" -ge 0 && "$idx" -lt "${#CHAIN_CANDIDATES[@]}" ]]; then
@@ -208,7 +436,7 @@ recover_chain() {
         ;;
       m|M)
         read -rp "복구할 세션명을 입력하세요: " manual_target
-        target="$(echo "$manual_target" | tr -d ' ')"
+        target="$(normalize_korean_ascii "$(echo "$manual_target" | tr -d ' ')")"
         [[ -z "$target" ]] && { echo "취소되었습니다."; return 0; }
         ;;
       b|B|q|Q)
@@ -221,63 +449,112 @@ recover_chain() {
     esac
   fi
 
-  # 대상 검증: 이미 살아있는 세션이면 복구 거부 (안전 수칙 준수)
-  if tmux has-session -t "$target" 2>/dev/null; then
-    echo ""
-    echo -e "${C_YELLOW}[경고] 세션 '$target'은(는) 이미 tmux에서 실행 중입니다!${C_RESET}"
-    echo -e "${C_DIM}실행 중인 대화와 워커를 보호하기 위해 중복 복구를 거부합니다.${C_RESET}"
-    read -rp "해당 세션에 지금 바로 접속하시겠습니까? [Y/n]: " ans
-    case "${ans:-y}" in
-      [yY]*) attach_session "$target" ;;
-      *) return 0 ;;
-    esac
-    return 0
-  fi
-
-  echo ""
-  echo -e "${C_CYAN}[복구 진행] 세션 '$target' 복구 절차를 시작합니다...${C_RESET}"
   local recover_script="$HERE/bin/chain-recover.sh"
   if [[ ! -x "$recover_script" ]]; then
+    ts_log "[recover_chain] [오류] 복구 스크립트 없음: $recover_script"
     echo -e "${C_RED}[오류] 복구 스크립트($recover_script)가 없거나 실행 권한이 없습니다.${C_RESET}" >&2
     return 1
   fi
 
-  local dry_opt=""
-  $dry_run && dry_opt="--dry-run"
+  # all 일괄 복구/점검
+  if [[ "$target" == "all" ]]; then
+    echo ""
+    echo -e "${C_CYAN}[일괄 복구/점검] 등록된 모든 에이전트 체인 세션을 복구 및 점검합니다...${C_RESET}"
+    ts_log "[recover_chain] 일괄 복구/점검 실행 (dry_run=$dry_run, restart_claude=$restart_claude)"
+    local opts=()
+    $dry_run && opts+=(--dry-run)
+    $restart_claude && opts+=(--restart-claude)
+    "$recover_script" all "${opts[@]}" 2>&1 | tee -a "$TS_LOG_FILE"
+    local code="${PIPESTATUS[0]}"
+    echo ""
+    show_rc_status
+    return "$code"
+  fi
 
-  if "$recover_script" "$target" $dry_opt; then
+  # 단일 세션 대상: 이미 tmux 세션이 살아있고 Claude도 정상 동작 중일 때의 처리
+  if exact_tmux_session_exists "$target" && ! $restart_claude && ! $dry_run; then
+    local info c_alive c_pid c_status sid rc_url
+    info="$(get_claude_rc_info "$target")"
+    IFS='|' read -r c_alive c_pid c_status sid rc_url <<< "$info"
+    if [[ "$c_alive" == "yes" ]]; then
+      echo ""
+      echo -e "${C_GREEN}[정상 작동 중] 세션 '$target'의 Claude 감독자가 이미 실행 중입니다.${C_RESET}"
+      echo -e "  • Claude PID : $c_pid ($c_status)"
+      echo -e "  • Resume ID  : ${sid:-미확인}"
+      echo -e "  • Remote URL : ${C_CYAN}${rc_url:-미확인}${C_RESET}"
+      echo ""
+      read -rp "동작 선택 — [y] 세션 접속 / [f] Claude만 재기동(RC 재연결) / [n] 취소 [Y/f/n]: " ans
+      ans="$(normalize_korean_ascii "${ans:-y}")"
+      case "${ans:-y}" in
+        [fF]*)
+          restart_claude=true
+          ;;
+        [yY]*)
+          attach_session "$target"
+          return 0
+          ;;
+        *)
+          return 0
+          ;;
+      esac
+    fi
+  fi
+
+  echo ""
+  local self_rec
+  self_rec="$(get_chain_recover_script "$target")"
+  echo -e "${C_CYAN}[복구 진행] 세션 '$target' 자가 복원 스크립트 격발 ($self_rec)...${C_RESET}"
+  ts_log "[recover_chain] 세션 '$target' 복구 격발 (script=$self_rec, dry_run=$dry_run, restart_claude=$restart_claude)"
+  local opts=()
+  $dry_run && opts+=(--dry-run)
+  $restart_claude && opts+=(--restart-claude)
+
+  local cmd_run=("$recover_script" "$target" "${opts[@]}")
+  if [[ "$self_rec" != "$recover_script" && -x "$self_rec" ]]; then
+    cmd_run=("$self_rec" "${opts[@]}")
+  fi
+
+  "${cmd_run[@]}" 2>&1 | tee -a "$TS_LOG_FILE"
+  local code="${PIPESTATUS[0]}"
+
+  if [[ "$code" -eq 0 ]]; then
     if $dry_run; then
       echo -e "${C_CYAN}[dry-run 완료] 실제 세션 생성 없이 명령줄을 확인했습니다.${C_RESET}"
       return 0
     fi
+    ts_log "[recover_chain] [성공] 세션 '$target' 복구 완료"
     echo ""
-    echo -e "${C_GREEN}${C_BOLD}[성공] 세션 '$target' 복구가 완료되었습니다!${C_RESET}"
-    echo -e "${C_DIM}(Sonnet 세션 이어붙이기 및 Remote Control 활성화 완료)${C_RESET}"
-    read -rp "복구된 세션에 지금 바로 접속하시겠습니까? [Y/n]: " ans
-    case "${ans:-y}" in
-      [yY]*) attach_session "$target" ;;
-      *) return 0 ;;
-    esac
+    echo -e "${C_GREEN}${C_BOLD}[성공] 세션 '$target' 복구 및 Remote Control 활성화가 완료되었습니다!${C_RESET}"
+    if [[ -t 0 ]]; then
+      read -rp "복구된 세션에 지금 바로 접속하시겠습니까? [Y/n]: " ans
+      ans="$(normalize_korean_ascii "${ans:-y}")"
+      case "${ans:-y}" in
+        [yY]*) attach_session "$target" ;;
+        *) return 0 ;;
+      esac
+    fi
   else
-    local code=$?
-    echo -e "${C_RED}[오류] 세션 복구 실패 (종료 코드: $code)${C_RESET}" >&2
+    ts_log "[recover_chain] [오류] 세션 '$target' 복구 실패 (종료 코드: $code)"
+    echo -e "${C_RED}[오류] 세션 복구 실패 (종료 코드: $code, 로그: $TS_LOG_FILE)${C_RESET}" >&2
     return "$code"
   fi
 }
 
 # 8. 신규 체인 전체 기동 마법사 (기능 3)
 new_chain() {
-  local target="${1:-}"
+  local target=""
   local dry_run=false
-  shift || true
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --dry-run) dry_run=true ;;
-      *) ;;
+      -*) ;;
+      *) [[ -z "$target" ]] && target="$1" ;;
     esac
     shift
   done
+
+  ts_log "[new_chain] 신규 체인 기동 마법사 시작 (초기 인자: ${target:-없음}, dry_run=$dry_run)"
 
   echo ""
   echo -e "${C_BOLD}${C_CYAN}============================================================${C_RESET}"
@@ -286,40 +563,116 @@ new_chain() {
   echo -e "${C_DIM}Claude(Remote Control) + 워치독 v2 + 통신 브리지 + agy + codex 창을 일괄 생성합니다.${C_RESET}"
   echo ""
 
-  # 1) 세션 이름 입력 및 검증
-  if [[ -z "$target" ]]; then
-    read -rp "새 세션 이름을 입력하세요 (예: agentchain-v4, 취소: Enter): " target
-    target="$(echo "$target" | tr -d ' ')"
-    [[ -z "$target" ]] && { echo "취소되었습니다."; return 0; }
-  fi
+  local suggested_name
+  suggested_name="$(suggest_next_chain_name)"
 
-  if [[ ! "$target" =~ ^[A-Za-z0-9_-]+$ ]]; then
-    echo -e "${C_RED}[오류] 세션 이름은 영문, 숫자, 하이픈(-), 밑줄(_)만 가능합니다: '$target'${C_RESET}" >&2
-    return 1
-  fi
+  # 1) 세션 이름 입력 및 검증 (오류 시 즉시 종료하지 않고 재입력 유도 + 한글 두벌식 자동 변환)
+  while true; do
+    if [[ -z "$target" ]]; then
+      read -rp "새 세션 이름 [기본값(Enter): $suggested_name / 취소: q]: " target
+      target="$(echo "$target" | tr -d ' ')"
+      if [[ -z "$target" ]]; then
+        target="$suggested_name"
+      fi
+    fi
 
-  # 이미 존재하는 tmux 세션인지 확인
-  if tmux has-session -t "$target" 2>/dev/null; then
-    echo -e "${C_RED}[오류] tmux 세션 '$target'이(가) 이미 존재합니다! 다른 이름을 지정하세요.${C_RESET}" >&2
-    return 1
-  fi
+    # 한글 두벌식 타이핑 자동 변환 (예: ㅁㅎ둣초먀ㅜ-ㅍ6 -> agentchain-v6, ㅂ -> q)
+    local norm_target
+    norm_target="$(normalize_korean_ascii "$target")"
+    if [[ "$norm_target" != "$target" ]]; then
+      echo -e "${C_DIM}  (한글 키 입력 감지 -> '$norm_target' 으로 자동 변환)${C_RESET}"
+      ts_log "[new_chain] 한글 입력 '$target' -> '$norm_target' 변환"
+      target="$norm_target"
+    fi
 
-  # 2) 대상 프로젝트 디렉토리 입력
+    case "$target" in
+      q|Q|quit|exit|cancel)
+        ts_log "[new_chain] 사용자 취소 (입력: $target)"
+        echo "취소되었습니다."
+        return 0
+        ;;
+    esac
+
+    # 숫자만 입력했거나 v숫자 형태만 입력한 경우 agentchain-vN 으로 자동 확장
+    if [[ "$target" =~ ^[0-9]+$ ]]; then
+      target="agentchain-v${target}"
+      echo -e "${C_DIM}  (번호 입력 감지 -> '$target' 으로 자동 완성)${C_RESET}"
+    elif [[ "$target" =~ ^[vV][0-9]+$ ]]; then
+      target="agentchain-v${target#[vV]}"
+      echo -e "${C_DIM}  (버전 입력 감지 -> '$target' 으로 자동 완성)${C_RESET}"
+    fi
+
+    if [[ ! "$target" =~ ^[A-Za-z0-9_-]+$ ]]; then
+      ts_log "[new_chain] [오류] 잘못된 세션 이름 형식: '$target'"
+      echo -e "${C_RED}[오류] 세션 이름은 영문, 숫자, 하이픈(-), 밑줄(_)만 가능합니다: '$target'${C_RESET}" >&2
+      if [[ ! -t 0 ]]; then
+        return 1
+      fi
+      target=""
+      continue
+    fi
+
+    # 정확히 일치하는 tmux 세션 존재 여부 확인
+    if exact_tmux_session_exists "$target"; then
+      ts_log "[new_chain] [오류] 이미 실행 중인 tmux 세션 이름: '$target'"
+      echo -e "${C_RED}[오류] tmux 세션 '$target'이(가) 이미 실행 중입니다! 다른 이름을 지정하세요.${C_RESET}" >&2
+      if [[ ! -t 0 ]]; then
+        return 1
+      fi
+      target=""
+      continue
+    fi
+
+    break
+  done
+
+  # 2) 대상 프로젝트 디렉토리 입력 (~ 확장, Windows 경로 변환, 미존재 시 생성/재입력 지원)
   local default_proj="/mnt/c/Users/rerun/llm-wiki"
   [[ -d "$default_proj" ]] || default_proj="$HERE"
-  read -rp "대상 프로젝트 디렉토리 [기본값: $default_proj]: " proj_input
-  local proj_dir="${proj_input:-$default_proj}"
-  if [[ ! -d "$proj_dir" ]]; then
-    echo -e "${C_RED}[오류] 디렉토리가 존재하지 않습니다: $proj_dir${C_RESET}" >&2
-    return 1
-  fi
-  proj_dir="$(cd "$proj_dir" && pwd)"
+  local proj_dir=""
+  while true; do
+    read -rp "대상 프로젝트 디렉토리 [기본값: $default_proj]: " proj_input
+    proj_input="$(normalize_path_input "$proj_input")"
+    proj_dir="${proj_input:-$default_proj}"
+    if [[ -d "$proj_dir" ]]; then
+      proj_dir="$(cd "$proj_dir" && pwd)"
+      break
+    fi
+    ts_log "[new_chain] [경고] 프로젝트 디렉토리 미존재: '$proj_dir'"
+    echo -e "${C_YELLOW}[확인] 디렉토리가 존재하지 않습니다: $proj_dir${C_RESET}"
+    if [[ ! -t 0 ]]; then
+      return 1
+    fi
+    read -rp "디렉토리를 새로 생성할까요? [y: 생성 / r: 다시 입력 / q: 취소]: " d_ans
+    d_ans="$(normalize_korean_ascii "${d_ans:-r}")"
+    case "$d_ans" in
+      [yY]*)
+        if mkdir -p "$proj_dir" 2>/dev/null; then
+          proj_dir="$(cd "$proj_dir" && pwd)"
+          break
+        else
+          echo -e "${C_RED}[오류] 디렉토리 생성 실패: $proj_dir${C_RESET}" >&2
+        fi
+        ;;
+      [qQ]*)
+        ts_log "[new_chain] 디렉토리 입력 단계에서 사용자 취소"
+        echo "취소되었습니다."
+        return 0
+        ;;
+      *)
+        ;;
+    esac
+  done
 
   # 3) 작업 디렉토리(WORK_DIR) 입력
   local default_work="/home/rerun/scheduler"
   [[ -d "$default_work" ]] || default_work="$proj_dir"
   read -rp "작업 디렉토리(WORK_DIR) [기본값: $default_work]: " work_input
+  work_input="$(normalize_path_input "$work_input")"
   local work_dir="${work_input:-$default_work}"
+  if [[ ! -d "$work_dir" ]]; then
+    mkdir -p "$work_dir" 2>/dev/null || true
+  fi
   [[ -d "$work_dir" ]] && work_dir="$(cd "$work_dir" && pwd)"
 
   # 4) agy 모드 선택
@@ -350,19 +703,26 @@ new_chain() {
   echo -e "${C_BOLD}------------------------------------------------------------${C_RESET}"
 
   if $dry_run; then
+    ts_log "[new_chain] dry-run 완료: session=$target runtime=$runtime_dir proj=$proj_dir work=$work_dir"
     echo -e "${C_CYAN}[dry-run] 실제 기동하지 않고 시뮬레이션을 종료합니다.${C_RESET}"
     return 0
   fi
 
   read -rp "위 설정으로 신규 체인을 즉시 기동하시겠습니까? [Y/n]: " confirm
+  confirm="$(normalize_korean_ascii "${confirm:-y}")"
   case "${confirm:-y}" in
     [yY]*) ;;
-    *) echo "기동이 취소되었습니다."; return 0 ;;
+    *)
+      ts_log "[new_chain] 최종 확인 단계에서 취소 (입력: $confirm)"
+      echo "기동이 취소되었습니다."
+      return 0
+      ;;
   esac
 
   # 7) 런타임 디렉토리 및 인스턴스 파일 생성
   echo ""
   echo -e "${C_CYAN}[1/3] 인스턴스 설정 및 런타임 디렉토리 생성 중...${C_RESET}"
+  ts_log "[new_chain] 런타임 생성: session=$target runtime=$runtime_dir proj=$proj_dir work=$work_dir agy=$agy_mode"
   mkdir -p "$runtime_dir" "$HERE/instances"
   printf '%s\n' "$target" > "$runtime_dir/session_name"
   printf '%s\n' "$target" > "$runtime_dir/instance"
@@ -376,36 +736,64 @@ WORK_DIR=$work_dir
 HANDOFF_FILE=docs/RESUME_HANDOFF.md
 EOF
 
-  # 8) bootstrap-v2.sh 실행
+  # 8) bootstrap-v2.sh 실행 (출력 로그를 TS_LOG_FILE 에도 동시 기록)
   echo -e "${C_CYAN}[2/3] bootstrap-v2.sh 기동 실행 중...${C_RESET}"
   local bootstrap_script="$HERE/bootstrap-v2.sh"
   if [[ ! -x "$bootstrap_script" ]]; then
+    ts_log "[new_chain] [오류] 부트스트랩 스크립트 없음 또는 권한 없음: $bootstrap_script"
     echo -e "${C_RED}[오류] 부트스트랩 스크립트($bootstrap_script)가 없거나 실행 권한이 없습니다.${C_RESET}" >&2
     return 1
   fi
 
-  if env ACC_INSTANCE="$target" \
-         SESSION_NAME="$target" \
-         PROJECT_DIR="$proj_dir" \
-         WORK_DIR="$work_dir" \
-         ACC_RUNTIME="$runtime_dir" \
-         AGY_MODE="$agy_mode" \
-         START_WATCHDOG=true \
-         "$bootstrap_script"; then
+  env ACC_INSTANCE="$target" \
+      SESSION_NAME="$target" \
+      PROJECT_DIR="$proj_dir" \
+      WORK_DIR="$work_dir" \
+      ACC_RUNTIME="$runtime_dir" \
+      AGY_MODE="$agy_mode" \
+      START_WATCHDOG=true \
+      "$bootstrap_script" 2>&1 | tee -a "$TS_LOG_FILE"
+  local code="${PIPESTATUS[0]}"
+
+  if [[ "$code" -eq 0 ]]; then
+    echo -e "${C_CYAN}[3/3] Claude Remote Control 및 자가 복원 레지스트리 파이프라인 동기화 중...${C_RESET}"
+    sleep 2
+    [[ -x "$HERE/bin/chain-registry.sh" ]] && "$HERE/bin/chain-registry.sh" sync >/dev/null 2>&1 || true
+    local info c_alive c_pid c_status sid rc_url
+    info="$(get_claude_rc_info "$target")"
+    IFS='|' read -r c_alive c_pid c_status sid rc_url <<< "$info"
+    ts_log "[new_chain] [성공] session=$target claude_pid=$c_pid sid=$sid rc_url=$rc_url"
     echo ""
     echo -e "${C_GREEN}${C_BOLD}[성공] 신규 체인 세션 '$target'이(가) 가동되었습니다!${C_RESET}"
-    echo -e "${C_DIM}  - Claude(Sonnet + Remote Control) 윈도우 기동 완료${C_RESET}"
-    echo -e "${C_DIM}  - 워치독 v2 백그라운드 안전망 가동 완료${C_RESET}"
-    echo -e "${C_DIM}  - agy($agy_mode), codex(oneshot) 윈도우 생성 완료${C_RESET}"
+    echo -e "${C_DIM}  - Claude(Sonnet + Remote Control) 기동 완료 (PID: ${c_pid:-기동중}, RC: ${rc_url:-연결중})${C_RESET}"
+    echo -e "${C_DIM}  - 자가 복원 스크립트 생성 완료: $runtime_dir/recover-self.sh${C_RESET}"
+    echo -e "${C_DIM}  - 워치독 v2 및 agy($agy_mode), codex(oneshot) 윈도우 생성 완료${C_RESET}"
     read -rp "새 세션에 지금 바로 접속하시겠습니까? [Y/n]: " ans
+    ans="$(normalize_korean_ascii "${ans:-y}")"
     case "${ans:-y}" in
       [yY]*) attach_session "$target" ;;
       *) return 0 ;;
     esac
   else
-    local code=$?
-    echo -e "${C_RED}[오류] bootstrap-v2.sh 실행 중 오류가 발생했습니다. (종료 코드: $code)${C_RESET}" >&2
+    ts_log "[new_chain] [오류] bootstrap-v2.sh 실패 (session=$target, 종료 코드: $code)"
+    echo -e "${C_RED}[오류] bootstrap-v2.sh 실행 중 오류가 발생했습니다. (종료 코드: $code, 로그: $TS_LOG_FILE)${C_RESET}" >&2
     return "$code"
+  fi
+}
+
+# ts 로그 조회 함수
+show_ts_logs() {
+  local lines="${1:-40}"
+  echo -e "${C_BOLD}${C_CYAN}=== ts 실행 및 복구 로그 ($TS_LOG_FILE, 최근 ${lines}줄) ===${C_RESET}"
+  if [[ -f "$TS_LOG_FILE" ]]; then
+    tail -n "$lines" "$TS_LOG_FILE"
+  else
+    echo "  (아직 기록된 ts 로그가 없습니다)"
+  fi
+  if [[ -f "$HOME/logs/chain-recover.log" ]]; then
+    echo ""
+    echo -e "${C_BOLD}${C_CYAN}=== 자동 복구 스케줄러 로그 (~/logs/chain-recover.log, 최근 15줄) ===${C_RESET}"
+    tail -n 15 "$HOME/logs/chain-recover.log"
   fi
 }
 
@@ -435,13 +823,12 @@ show_help() {
   echo -e "  ${C_BOLD}ts attach <세션|번호>${C_RESET}   지정한 tmux 세션에 접속 (단축어: ts a)"
   echo -e "  ${C_BOLD}ts recover [세션명]${C_RESET}     기존 체인 세션 복구 (단축어: ts r) (Claude 단독 + RC)"
   echo -e "  ${C_BOLD}ts new [세션명]${C_RESET}         신규 체인 전체 기동 (단축어: ts n) (Claude+Watchdog+agy+codex)"
+  echo -e "  ${C_BOLD}ts retire [세션명]${C_RESET}      불필요한 체인 세션 정리 (목록 및 자동복구 제외)"
+  echo -e "  ${C_BOLD}ts unretire <세션명>${C_RESET}    정리된 체인 세션 복원"
+  echo -e "  ${C_BOLD}ts rc${C_RESET}                   Claude & Remote Control 및 자가 복원 파이프라인 상태"
+  echo -e "  ${C_BOLD}ts log [줄수]${C_RESET}           ts 실행/복구/기동 상세 로그 확인"
   echo -e "  ${C_BOLD}ts list${C_RESET}                 세션 및 체인 런타임 전체 목록 확인 (단축어: ts ls, ts l)"
   echo -e "  ${C_BOLD}ts help${C_RESET}                 도움말 표시 (단축어: ts -h, ts --help)"
-  echo ""
-  echo "안전 수칙:"
-  echo "  - 이미 살아있는 세션(agentchain-v3 등)에 대한 중복 복구/기동은 자동 차단됩니다."
-  echo "  - tmux 세션 내부에서 실행 시 switch-client로 자연스럽게 세션을 전환합니다."
-  echo "  - 일반 쉘에서 실행 시 exec tmux attach로 쉘 프로세스를 낭비 없이 전환합니다."
 }
 
 # 11. 대화형 메인 메뉴 루프
@@ -513,8 +900,7 @@ interactive_menu() {
         exit 0
         ;;
       *)
-        # 입력값이 실행 중인 세션명과 일치하는지 확인
-        if tmux has-session -t "$choice" 2>/dev/null; then
+        if exact_tmux_session_exists "$choice"; then
           attach_session "$choice"
           break
         else
@@ -534,7 +920,6 @@ main() {
   }
 
   if [[ $# -eq 0 ]]; then
-    # 대화형 터미널에서 실행 시 기본적으로 Tokyo Night TUI 매니저 실행
     if [[ -t 0 && -t 1 && -x "$BIN_DIR/ts-tui" ]]; then
       exec "$BIN_DIR/ts-tui"
     fi
@@ -582,10 +967,22 @@ main() {
       attach_session "$target"
       ;;
     r|recover)
-      recover_chain "${1:-}" "$@"
+      recover_chain "$@"
+      ;;
+    retire|clean|rm)
+      retire_chain "${1:-}"
+      ;;
+    unretire)
+      "$HERE/bin/chain" unretire "${1:-}"
+      ;;
+    rc|status)
+      show_rc_status
+      ;;
+    log|logs)
+      show_ts_logs "${1:-40}"
       ;;
     n|new)
-      new_chain "${1:-}" "$@"
+      new_chain "$@"
       ;;
     l|ls|list)
       echo -e "${C_BOLD}${C_CYAN}=== 활성 tmux 세션 목록 ===${C_RESET}"
@@ -601,6 +998,8 @@ main() {
         echo "  (활성 세션 없음)"
       fi
       echo ""
+      show_rc_status
+      echo ""
       echo -e "${C_BOLD}${C_CYAN}=== 체인 런타임 목록 (bin/chain list) ===${C_RESET}"
       if [[ -x "$HERE/bin/chain" ]]; then
         "$HERE/bin/chain" list
@@ -610,11 +1009,9 @@ main() {
       show_help
       ;;
     *)
-      # 활성 tmux 세션 이름인지 확인
-      if tmux has-session -t "$cmd" 2>/dev/null; then
+      if exact_tmux_session_exists "$cmd" || tmux has-session -t "$cmd" 2>/dev/null; then
         attach_session "$cmd"
       else
-        # 알려진 복구 대상 세션인지 확인
         local known=false
         if [[ -f "$HERE/instances/$cmd.env" ]]; then
           known=true

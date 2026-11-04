@@ -518,5 +518,6 @@ fi
 
 say ""; say "== 적용 결과 =="
 nf=0; for r in "${RESULT[@]}"; do IFS='|' read -r s k v <<<"$r"; printf '  %-4s  %-16s %s\n' "$s" "$k" "$v"; [[ $s == FAIL ]] && nf=$((nf+1)); done
+[[ -x "$HERE/bin/chain-registry.sh" ]] && "$HERE/bin/chain-registry.sh" sync >/dev/null 2>&1 || true
 if (( nf == 0 )); then say "결론: 새 감독관이 브리지에 정상 연결됐습니다. tmux attach -t $SESSION 후 $SONNET_WINDOW 창에서 대화하세요."
 else say "결론: ${nf}건 실패 — 위 표를 확인하세요. (옛 대화는 해당 폴더에서 claude --resume 으로 복구 가능)"; exit 1; fi

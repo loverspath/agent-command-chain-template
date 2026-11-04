@@ -428,6 +428,11 @@ class SessionInfo:
         self.busy_workers = []
         self.recent_tasks = []
         self.supervisor_session_id = None
+        self.claude_pid = None
+        self.claude_alive = False
+        self.claude_status = None
+        self.rc_url = None
+        self.recover_script = None
 
 
 class DataCollector:
@@ -448,9 +453,33 @@ class DataCollector:
             return None, False
 
     @classmethod
+    def _load_registry_pipeline(cls):
+        """bin/chain-registry.sh json 파이프라인 호출 (실패 시 runtime/registry.json 폴백)"""
+        import json
+        reg_script = os.path.join(TEMPLATE_ROOT, "bin", "chain-registry.sh")
+        if os.path.isfile(reg_script) and os.access(reg_script, os.X_OK):
+            try:
+                res = subprocess.run([reg_script, "json"], capture_output=True, text=True, timeout=5)
+                if res.returncode == 0 and res.stdout.strip():
+                    data = json.loads(res.stdout)
+                    return {item["session_name"]: item for item in data.get("sessions", []) if item.get("session_name") and not item.get("retired")}
+            except Exception:
+                pass
+        reg_file = os.path.join(TEMPLATE_ROOT, "runtime", "registry.json")
+        if os.path.isfile(reg_file):
+            try:
+                with open(reg_file, "r") as f:
+                    data = json.load(f)
+                return {item["session_name"]: item for item in data.get("sessions", []) if item.get("session_name") and not item.get("retired")}
+            except Exception:
+                pass
+        return {}
+
+    @classmethod
     def get_all_sessions(cls):
-        """실행 중인 tmux 세션 및 디스크 상의 복구 가능한 체인 세션 목록 통합 수집"""
+        """실행 중인 tmux 세션 및 chain-registry.sh 파이프라인 상의 체인 세션 목록 통합 수집"""
         sessions_map = {}
+        registry_map = cls._load_registry_pipeline()
 
         # 1. tmux list-sessions 수집
         t_res = subprocess.run(
@@ -478,37 +507,21 @@ class DataCollector:
                 
                 # 윈도우 상세 정보 수집
                 cls._collect_windows(s)
-                # 체인 런타임 여부 수집
-                cls._collect_chain_details(s)
+                # 체인 레지스트리 파이프라인 및 런타임 상세 정보 결합
+                cls._collect_chain_details(s, registry_map.get(s_name))
 
                 sessions_map[s_name] = s
 
-        # 2. instances/ 및 runtime/ 탐색하여 Inactive (다운) 후보 수집
-        known_instances = set()
-        
-        # instances/*.env
-        for f in glob.glob(os.path.join(TEMPLATE_ROOT, "instances", "*.env")):
-            cand = os.path.basename(f)[:-4]
-            if cand:
-                known_instances.add(cand)
-
-        # runtime/*/session_name
-        for sn_file in glob.glob(os.path.join(TEMPLATE_ROOT, "runtime", "*", "session_name")):
-            try:
-                with open(sn_file, "r") as f:
-                    cand = f.readline().strip()
-                    if cand:
-                        known_instances.add(cand)
-            except Exception:
-                pass
-
-        for cand in sorted(known_instances):
+        # 2. chain-registry.sh 파이프라인에서 현재 tmux에 없는 복구 후보(DOWN) 수집
+        for cand, reg_item in sorted(registry_map.items()):
             if cand not in sessions_map:
+                if reg_item.get("retired"):
+                    continue
                 s = SessionInfo(cand)
                 s.is_active = False
                 s.is_chain = True
                 s.is_down_candidate = True
-                cls._collect_chain_details(s)
+                cls._collect_chain_details(s, reg_item)
                 sessions_map[cand] = s
 
         # 정렬: 살아있는 세션 우선, 그 다음 복구 후보
@@ -546,11 +559,25 @@ class DataCollector:
             s.windows = windows
 
     @classmethod
-    def _collect_chain_details(cls, s):
-        """체인 런타임, 인스턴스 파일, 워치독/리스너, 태스크 상태 조회"""
+    def _collect_chain_details(cls, s, reg_item=None):
+        """체인 레지스트리 파이프라인(recovery.json) 및 런타임 상세 정보 조회"""
+        import json
         rt = None
-        # 1. tmux 환경변수 ACC_RUNTIME 확인
-        if s.is_active:
+        if reg_item:
+            s.is_chain = True
+            rt = reg_item.get("runtime_dir") or None
+            s.project_dir = reg_item.get("project_dir") or None
+            s.work_dir = reg_item.get("work_dir") or None
+            s.handoff_file = reg_item.get("handoff_file") or None
+            s.supervisor_session_id = reg_item.get("supervisor_session_id") or None
+            s.rc_url = reg_item.get("remote_control_url") or None
+            s.claude_pid = reg_item.get("claude_pid")
+            s.claude_alive = bool(reg_item.get("claude_alive"))
+            s.claude_status = reg_item.get("claude_status")
+            s.recover_script = reg_item.get("recover_script") or None
+
+        # 1. tmux 환경변수 ACC_RUNTIME 확인 (파이프라인 미포함 세션 폴백)
+        if s.is_active and not rt:
             env_res = subprocess.run(
                 ["tmux", "show-environment", "-t", s.name, "ACC_RUNTIME"],
                 capture_output=True, text=True
@@ -560,6 +587,7 @@ class DataCollector:
                     val = line.split("=", 1)[1].strip()
                     if os.path.isdir(val):
                         rt = val
+                        s.is_chain = True
                         break
 
         # 2. instances/<name>.env 확인
@@ -1149,11 +1177,38 @@ class TsTuiApp:
                 StrUtil.safe_addstr(self.stdscr, cur_y, cx, "─ [ 체인 아키텍처 & 안전망 데몬 상태 ] ─", self.theme.attr("purple", bold=True))
                 cur_y += 1
 
-                # 런타임 경로
+                # 감독자 Claude & Remote Control 상태 표시
+                if cur_y < y + inner_h - 2:
+                    if s.claude_alive:
+                        c_str = f"● ALIVE (PID {s.claude_pid}, {s.claude_status or 'idle'})"
+                        c_col = "green"
+                    else:
+                        c_str = "○ STOPPED (복구 필요: [r])"
+                        c_col = "red"
+                    StrUtil.safe_addstr(self.stdscr, cur_y, cx, "• 감독자 Claude :", self.theme.attr("muted"))
+                    StrUtil.safe_addstr(self.stdscr, cur_y, cx + 16, StrUtil.truncate(c_str, inner_w - 18), self.theme.attr(c_col, bold=True))
+                    cur_y += 1
+
+                if s.supervisor_session_id and cur_y < y + inner_h - 2:
+                    StrUtil.safe_addstr(self.stdscr, cur_y, cx, "• Resume ID   :", self.theme.attr("muted"))
+                    StrUtil.safe_addstr(self.stdscr, cur_y, cx + 16, StrUtil.truncate(s.supervisor_session_id, inner_w - 18), self.theme.attr("normal"))
+                    cur_y += 1
+
+                if s.rc_url and cur_y < y + inner_h - 2:
+                    StrUtil.safe_addstr(self.stdscr, cur_y, cx, "• Remote URL  :", self.theme.attr("muted"))
+                    StrUtil.safe_addstr(self.stdscr, cur_y, cx + 16, StrUtil.truncate(s.rc_url, inner_w - 18), self.theme.attr("cyan", bold=True))
+                    cur_y += 1
+
+                # 런타임 경로 & 자가 복원 스크립트
                 rt_disp = s.runtime_dir if s.runtime_dir else "(미지정 / 탐색 중)"
                 StrUtil.safe_addstr(self.stdscr, cur_y, cx, "• 런타임 경로 :", self.theme.attr("muted"))
                 StrUtil.safe_addstr(self.stdscr, cur_y, cx + 16, StrUtil.truncate(rt_disp, inner_w - 18), self.theme.attr("cyan"))
                 cur_y += 1
+
+                if s.recover_script and cur_y < y + inner_h - 2:
+                    StrUtil.safe_addstr(self.stdscr, cur_y, cx, "• 자가 복원기 :", self.theme.attr("muted"))
+                    StrUtil.safe_addstr(self.stdscr, cur_y, cx + 16, StrUtil.truncate(s.recover_script, inner_w - 18), self.theme.attr("purple"))
+                    cur_y += 1
 
                 # 프로젝트 / 작업 경로
                 if s.project_dir and cur_y < y + inner_h - 2:
@@ -1409,8 +1464,8 @@ class TsTuiApp:
         StrUtil.safe_addstr(self.stdscr, my + mh - 2, mx + mw - len(close_hint) - 3, close_hint, self.theme.attr("yellow", bold=True))
 
     def _draw_kill_modal(self, max_y, max_x):
-        mh = 10
-        mw = min(66, max_x - 6)
+        mh = 11
+        mw = min(68, max_x - 6)
         my = (max_y - mh) // 2
         mx = (max_x - mw) // 2
 
@@ -1419,21 +1474,45 @@ class TsTuiApp:
 
         s_name = self.modal_target.name if self.modal_target else "세션"
         is_chain = self.modal_target.is_chain if self.modal_target else False
+        is_active = self.modal_target.is_active if self.modal_target else False
 
-        self.draw_box(my, mx, mh, mw, title="⚠️ 세션 종료 확인", is_active=True)
+        self.draw_box(my, mx, mh, mw, title="⚠️ 세션 종료 / 영구 정리(Retire) 확인", is_active=True)
 
-        warn_title = f"정말 세션 '{s_name}'을(를) 종료(kill-session)하시겠습니까?"
-        StrUtil.safe_addstr(self.stdscr, my + 2, mx + 3, StrUtil.truncate(warn_title, mw - 6), self.theme.attr("red", bold=True))
-
-        if is_chain:
-            warn2 = "주의: 에이전트 체인입니다! 실행 중인 Claude 및 워커가 중단됩니다."
-            StrUtil.safe_addstr(self.stdscr, my + 4, mx + 3, StrUtil.truncate(warn2, mw - 6), self.theme.attr("yellow", bold=True))
+        if not is_active and is_chain:
+            warn_title = f"다운된 체인 후보 '{s_name}'을(를) 복구 목록에서 정리(Retire)할까요?"
+            StrUtil.safe_addstr(self.stdscr, my + 2, mx + 3, StrUtil.truncate(warn_title, mw - 6), self.theme.attr("orange", bold=True))
+            warn2 = "정리하면 자동복구 및 후보 목록에서 제외됩니다 (런타임 기록은 보존)."
+            StrUtil.safe_addstr(self.stdscr, my + 4, mx + 3, StrUtil.truncate(warn2, mw - 6), self.theme.attr("normal"))
+            prompt = "[y/p] 목록에서 정리(Retire)   |   [n/Esc] 취소"
+            StrUtil.safe_addstr(self.stdscr, my + 7, mx + 3, prompt, self.theme.attr("purple", bold=True))
         else:
-            warn2 = "주의: 세션 내부에서 실행 중인 모든 프로세스가 강제 종료됩니다."
-            StrUtil.safe_addstr(self.stdscr, my + 4, mx + 3, StrUtil.truncate(warn2, mw - 6), self.theme.attr("muted"))
+            warn_title = f"세션 '{s_name}'에 대해 수행할 작업을 선택하세요:"
+            StrUtil.safe_addstr(self.stdscr, my + 2, mx + 3, StrUtil.truncate(warn_title, mw - 6), self.theme.attr("red", bold=True))
+            if is_chain:
+                opt1 = "• [y] tmux 세션만 종료 (나중에 [r]로 대화 복구 가능)"
+                opt2 = "• [p] 세션 종료 + 영구 정리(Retire, 복구/자동복구 목록에서 제외)"
+                StrUtil.safe_addstr(self.stdscr, my + 4, mx + 3, StrUtil.truncate(opt1, mw - 6), self.theme.attr("yellow", bold=True))
+                StrUtil.safe_addstr(self.stdscr, my + 5, mx + 3, StrUtil.truncate(opt2, mw - 6), self.theme.attr("red", bold=True))
+                prompt = "선택: [y] 단순종료  |  [p] 종료+정리(Retire)  |  [n/Esc] 취소"
+            else:
+                warn2 = "주의: 세션 내부에서 실행 중인 모든 프로세스가 강제 종료됩니다."
+                StrUtil.safe_addstr(self.stdscr, my + 4, mx + 3, StrUtil.truncate(warn2, mw - 6), self.theme.attr("muted"))
+                prompt = "종료하려면 'y' 키를 누르세요. (취소: 'n', Esc, Enter)"
+            StrUtil.safe_addstr(self.stdscr, my + 7, mx + 3, StrUtil.truncate(prompt, mw - 6), self.theme.attr("purple", bold=True))
 
-        prompt = "종료하려면 'y' 키를 누르세요. (취소: 'n', Esc, Enter)"
-        StrUtil.safe_addstr(self.stdscr, my + 6, mx + 3, prompt, self.theme.attr("purple", bold=True))
+    def _last_ts_log_error(self):
+        log_file = os.path.join(TEMPLATE_ROOT, "logs", "ts.log")
+        if not os.path.isfile(log_file):
+            return ""
+        try:
+            with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()[-10:]
+            for line in reversed(lines):
+                if "[오류]" in line:
+                    return line.strip()
+        except Exception:
+            pass
+        return ""
 
     # --------------------------------------------------------------------------
     # 액션 핸들러
@@ -1465,11 +1544,9 @@ class TsTuiApp:
     def action_recover(self):
         """체인 복구 마법사 호출 (curses 임시 중단 후 CLI 실행 후 복귀)"""
         target = self.sessions[self.selected_idx] if self.sessions else None
-        target_name = target.name if (target and target.is_chain) else ""
-
-        if target and target.is_active:
-            self.set_toast(f"세션 '{target.name}'은(는) 이미 실행 중입니다!", "yellow")
-            return
+        target_name = ""
+        if target and target.is_chain and (not target.is_active or not target.claude_alive):
+            target_name = target.name
 
         curses.endwin()
         ret_code = None
@@ -1488,9 +1565,13 @@ class TsTuiApp:
             self.stdscr.refresh()
             self.reload_data()
             if ret_code == 0:
-                self.set_toast("복구 절차가 완료되었습니다.", "purple")
+                self.set_toast("복구/점검 절차가 완료되었습니다.", "purple")
             elif ret_code is not None:
-                self.set_toast(f"복구 절차가 실패했습니다 (종료 코드 {ret_code})", "red")
+                err_detail = self._last_ts_log_error()
+                if err_detail:
+                    self.set_toast(f"실패({ret_code}): {err_detail}", "red", duration=6.0)
+                else:
+                    self.set_toast(f"복구 절차가 실패했습니다 (종료 코드 {ret_code})", "red")
             else:
                 self.set_toast("복구 절차가 취소되었습니다.", "yellow")
 
@@ -1513,7 +1594,11 @@ class TsTuiApp:
             if ret_code == 0:
                 self.set_toast("신규 체인 마법사가 종료되었습니다.", "purple")
             elif ret_code is not None:
-                self.set_toast(f"신규 체인 마법사가 실패했습니다 (종료 코드 {ret_code})", "red")
+                err_detail = self._last_ts_log_error()
+                if err_detail:
+                    self.set_toast(f"실패({ret_code}): {err_detail}", "red", duration=6.0)
+                else:
+                    self.set_toast(f"신규 체인 마법사가 실패했습니다 (종료 코드 {ret_code}, ts log 확인)", "red", duration=5.0)
             else:
                 self.set_toast("신규 체인 마법사가 취소되었습니다.", "yellow")
 
@@ -1534,31 +1619,42 @@ class TsTuiApp:
         self.reload_data()
 
     def action_kill(self):
-        """세션 종료 모달 띄우기"""
+        """세션 종료 또는 체인 정리(Retire) 모달 띄우기"""
         if not self.sessions or self.selected_idx >= len(self.sessions):
             return
         target = self.sessions[self.selected_idx]
-        if not target.is_active:
+        if not target.is_active and not target.is_chain:
             self.set_toast("이미 종료된 세션입니다.", "yellow")
             return
         
         self.modal_mode = "kill_confirm"
         self.modal_target = target
 
-    def confirm_kill(self):
-        """세션 종료 실행"""
+    def confirm_kill(self, retire=False):
+        """세션 종료 및 선택적 영구 정리(Retire) 실행"""
         target = self.modal_target
         self.modal_mode = None
         self.modal_target = None
 
-        if not target or not target.is_active:
+        if not target:
             return
 
-        res = subprocess.run(["tmux", "kill-session", "-t", target.name], capture_output=True, text=True)
-        if res.returncode == 0:
-            self.set_toast(f"세션 '{target.name}'을(를) 정상 종료했습니다.", "red")
+        if not target.is_active and target.is_chain:
+            retire = True
+
+        if target.is_active:
+            res = subprocess.run(["tmux", "kill-session", "-t", target.name], capture_output=True, text=True)
+            if res.returncode != 0 and not retire:
+                self.set_toast(f"세션 종료 실패: {res.stderr.strip()}", "red")
+                self.reload_data()
+                return
+
+        if retire and target.is_chain:
+            chain_bin = os.path.join(TEMPLATE_ROOT, "bin", "chain")
+            subprocess.run([chain_bin, "retire", target.name], capture_output=True, text=True)
+            self.set_toast(f"체인 '{target.name}'을(를) 정리(Retire)하여 목록에서 제외했습니다.", "orange")
         else:
-            self.set_toast(f"세션 종료 실패: {res.stderr.strip()}", "red")
+            self.set_toast(f"세션 '{target.name}'을(를) 종료했습니다 (복구 가능).", "red")
         self.reload_data()
 
     # --------------------------------------------------------------------------
@@ -1595,7 +1691,9 @@ class TsTuiApp:
 
             if self.modal_mode == "kill_confirm":
                 if key in ('y', 'Y', 'ㅛ'):
-                    self.confirm_kill()
+                    self.confirm_kill(retire=False)
+                elif key in ('p', 'P', 'ㅔ'):
+                    self.confirm_kill(retire=True)
                 elif key in ("ESC", "ENTER", 'n', 'N', 'ㅜ', 'q', 'Q', 'ㅂ'):
                     self.modal_mode = None
                     self.modal_target = None

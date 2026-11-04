@@ -28,6 +28,11 @@ else
   runtime="$ACC_RUNTIME"
 fi
 
+# 훅 실행 시점에 체인 레지스트리(recovery.json 및 runtime/registry.json) 백그라운드 동기화
+if [[ -x "$HERE/bin/chain-registry.sh" && "$runtime" != /tmp/* ]]; then
+  "$HERE/bin/chain-registry.sh" sync >/dev/null 2>&1 &
+fi
+
 pending="$runtime/events/pending"
 inflight="$runtime/events/inflight"
 archive="$runtime/events/archive"

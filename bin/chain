@@ -1,33 +1,86 @@
 #!/usr/bin/env bash
-# bin/chain list|status [id]: 체인(런타임) 목록·상태 (읽기 전용)
+# bin/chain list [--all] | status [id] | retire <id> | unretire <id>
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
 source "$HERE/lib/term.sh"
 cmd="${1:-list}"; want="${2:-}"
+show_all=false
+if [[ "$want" == "--all" || "${3:-}" == "--all" ]]; then
+  show_all=true
+  [[ "$want" == "--all" ]] && want=""
+fi
 alive() { [[ -n "${1:-}" ]] && kill -0 "$1" 2>/dev/null && echo "alive($1)" || echo "-"; }
 show() {
-  local rt="$1" id sess pid_w pid_l pend busy ret
+  local rt="$1" id sess pend busy ret
   id="$(head -n1 "$rt/instance" 2>/dev/null | tr -d '\r\n')"; [[ -n "$id" ]] || id="$(basename "$rt")"
   sess="$(head -n1 "$rt/session_name" 2>/dev/null | tr -d '\r\n')"; [[ -n "$sess" ]] || sess="$id"
-  [[ -z "$want" || "$want" == "$id" || "$want" == "$sess" ]] || return 0
+  ret="no"; [[ -f "$rt/retired" ]] && ret="yes"
+  if [[ "$ret" == "yes" && "$show_all" == "false" && -z "$want" ]]; then
+    return 0
+  fi
+  [[ -z "$want" || "$want" == "$id" || "$want" == "$sess" || "$want" == "$(basename "$rt")" ]] || return 0
   local up="down"; term_session_exists "$sess" && up="up"
   local envrt; envrt="$(term_get_env "$sess" ACC_RUNTIME)"
   local envok="n/a"; [[ "$up" == up ]] && { [[ "$envrt" == "$rt" ]] && envok="match" || envok="MISMATCH"; }
   pend="$(ls "$rt/events/pending" 2>/dev/null | wc -l)"
   busy="$(ls "$rt/workers"/*.busy 2>/dev/null | wc -l)"
-  ret="no"; [[ -f "$rt/retired" ]] && ret="yes"
   printf '%-22s session=%-4s tmux-env=%-8s watchdog=%-14s listener=%-14s pending=%s busy=%s retired=%s\n  runtime=%s\n' \
-    "$id" "$up" "$envok" "$(alive "$(cat "$rt/watchdog.pid" 2>/dev/null)")" "$(alive "$(cat "$rt/listener.pid" 2>/dev/null)")" "$pend" "$busy" "$ret" "$rt"
+    "$sess" "$up" "$envok" "$(alive "$(cat "$rt/watchdog.pid" 2>/dev/null)")" "$(alive "$(cat "$rt/listener.pid" 2>/dev/null)")" "$pend" "$busy" "$ret" "$rt"
 }
 case "$cmd" in
-  list|status) for rt in "$HERE"/runtime/*/; do [[ -d "$rt" ]] && show "${rt%/}"; done ;;
+  list|status)
+    for rt in "$HERE"/runtime/*/; do [[ -d "$rt" ]] && show "${rt%/}"; done
+    ;;
   retire)
-    [[ -n "$want" ]] || { echo "Usage: bin/chain retire <id>" >&2; exit 64; }
+    [[ -n "$want" ]] || { echo "Usage: bin/chain retire <session-or-runtime-id>" >&2; exit 64; }
+    matched=0
     for rt in "$HERE"/runtime/*/; do
+      [[ -d "$rt" ]] || continue
       id="$(head -n1 "$rt/instance" 2>/dev/null | tr -d '\r\n')"
-      [[ "$id" == "$want" ]] && { touch "${rt%/}/retired"; echo "retired 표식 기록: ${rt%/} (워치독이 종료됨. tmux 세션은 직접 정리)"; exit 0; }
+      sess="$(head -n1 "$rt/session_name" 2>/dev/null | tr -d '\r\n')"
+      bname="$(basename "$rt")"
+      if [[ "$id" == "$want" || "$sess" == "$want" || "$bname" == "$want" ]]; then
+        touch "${rt%/}/retired"
+        echo "retired 표식 기록: ${rt%/}"
+        matched=1
+      fi
     done
-    echo "Error: 인스턴스 '$want' 없음" >&2; exit 70 ;;
-  *) echo "Usage: bin/chain list|status [id] | retire <id>" >&2; exit 64 ;;
+    if [[ -f "$HERE/instances/$want.env" ]]; then
+      rt_env="$(grep '^ACC_RUNTIME=' "$HERE/instances/$want.env" 2>/dev/null | cut -d= -f2- | tr -d '"'"' \r\n" || true)"
+      if [[ -n "$rt_env" && -d "$rt_env" && ! -f "$rt_env/retired" ]]; then
+        touch "$rt_env/retired"
+        echo "retired 표식 기록: $rt_env"
+        matched=1
+      fi
+    fi
+    if [[ "$matched" -eq 1 ]]; then
+      [[ -x "$HERE/bin/chain-registry.sh" ]] && "$HERE/bin/chain-registry.sh" sync >/dev/null 2>&1 || true
+      exit 0
+    fi
+    echo "Error: 인스턴스 '$want' 없음" >&2; exit 70
+    ;;
+  unretire)
+    [[ -n "$want" ]] || { echo "Usage: bin/chain unretire <session-or-runtime-id>" >&2; exit 64; }
+    matched=0
+    for rt in "$HERE"/runtime/*/; do
+      [[ -d "$rt" ]] || continue
+      id="$(head -n1 "$rt/instance" 2>/dev/null | tr -d '\r\n')"
+      sess="$(head -n1 "$rt/session_name" 2>/dev/null | tr -d '\r\n')"
+      bname="$(basename "$rt")"
+      if [[ "$id" == "$want" || "$sess" == "$want" || "$bname" == "$want" ]]; then
+        rm -f "${rt%/}/retired"
+        echo "retired 표식 해제: ${rt%/}"
+        matched=1
+      fi
+    done
+    if [[ "$matched" -eq 1 ]]; then
+      [[ -x "$HERE/bin/chain-registry.sh" ]] && "$HERE/bin/chain-registry.sh" sync >/dev/null 2>&1 || true
+      exit 0
+    fi
+    echo "Error: 인스턴스 '$want' 없음" >&2; exit 70
+    ;;
+  *)
+    echo "Usage: bin/chain list [--all] | status [id] | retire <id> | unretire <id>" >&2; exit 64
+    ;;
 esac
