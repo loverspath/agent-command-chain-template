@@ -13,7 +13,8 @@ def token():
 
 def ask_claude(prompt):
     r = subprocess.run(["claude", "-p", prompt, "--allowedTools", "Read,Grep,Glob"],
-                       capture_output=True, text=True, timeout=300)
+                       capture_output=True, text=True, timeout=300,
+                       cwd=str(pathlib.Path.home()))  # Termux claude 는 ./.local/share/claude/setdns.js 상대경로 preload 를 쓰므로 항상 홈에서 실행
     return (r.stdout or r.stderr).strip()[:8000]
 
 async def run(a):
