@@ -17,7 +17,7 @@ HOST = os.environ.get("BUS_HOST", "100.87.35.41")
 PORT = int(os.environ.get("BUS_PORT", "8765"))
 MAX_HOP, MAX_TEXT, RATE_PER_MIN = 3, 16384, 20
 QUEUE_TTL, QUEUE_MAX = 86400, 500
-ALIASES = {"pc": "cat-food", "termux": "z-fold8", "phone": "z-fold8"}
+ALIASES = {"pc": "cat-food", "termux": "z-fold8", "phone": "z-fold8", "claw8": "msi"}
 DEFAULT_ALLOW = {"cat-food", "z-fold8"}
 
 PEERS = {}                      # "node/label" -> ws

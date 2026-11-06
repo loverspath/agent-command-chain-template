@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """허브 감사로그(messages.jsonl)를 비공개 agent-docs 의 bus-log/YYYY-MM-DD.md 로 미러링하고 변경 시 커밋·푸시.
-토큰으로 보이는 문자열은 마스킹해서 올린다. 30초 주기."""
+원문 그대로 올린다(마스킹 없음, 사용자 결정). 30초 주기."""
 import datetime
 import json
 import pathlib
@@ -52,7 +52,7 @@ def cycle():
             f.write_text("# Bus log %s\n\n" % d.strftime("%Y-%m-%d"), encoding="utf-8")
         with open(f, "a", encoding="utf-8") as fh:
             fh.write("### %s `%s` -> `%s` (seq %s, hop %s)\n\n%s\n\n" % (
-                d.strftime("%H:%M:%S"), m["from"], m["to"], m["seq"], m["hop"], mask(m["text"])))
+                d.strftime("%H:%M:%S"), m["from"], m["to"], m["seq"], m["hop"], m["text"]))
     git("pull", "--rebase", "-q", "origin", "main")
     git("add", "-A", "bus-log")
     msg = "bus-log: +%d messages (seq %d)" % (len(new), new[-1]["seq"])
