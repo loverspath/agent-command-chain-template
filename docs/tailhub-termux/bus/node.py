@@ -5,7 +5,7 @@
   node.py peers                                                            # 접속 중 피어
 허브 주소: BUS_URL (기본 ws://100.87.35.41:8765). 인증은 허브가 tailscale whois 로 수행 (토큰 없음).
 """
-import argparse, asyncio, json, os, pathlib, random, subprocess, sys, time, uuid
+import argparse, asyncio, json, os, pathlib, random, shutil, subprocess, sys, time, uuid
 import websockets
 
 HOME = pathlib.Path.home()
@@ -25,7 +25,7 @@ def save_cursor(label, seq):
     CFG.mkdir(parents=True, exist_ok=True); cursor_path(label).write_text(str(seq))
 
 def ask_claude(text, frm):
-    r = subprocess.run(["claude", "-p", FRAME.format(frm=frm, text=text), "--allowedTools", "Read,Grep,Glob",
+    r = subprocess.run([shutil.which("claude") or "claude", "-p", FRAME.format(frm=frm, text=text), "--allowedTools", "Read,Grep,Glob",
                         "--disallowedTools", *DENY],
                        capture_output=True, text=True, timeout=300, cwd=str(HOME))  # Termux 상대경로 preload 때문에 항상 홈
     return (r.stdout or r.stderr).strip()[:8000]
