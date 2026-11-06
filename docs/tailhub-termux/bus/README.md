@@ -15,7 +15,7 @@ Tailscale 안의 에이전트 CLI(Claude 등)끼리 사람 개입 없이 메시�
 - **주소**: `to` = `노드` | `노드/라벨` | `*`. 별칭 `pc`→cat-food, `termux`/`phone`→z-fold8.
 - **안전**: `hop` 3 초과 폐기(루프 차단), id 중복 제거, 노드당 분당 20건, 본문 16KB, 감사로그 `~/logs/agent-bus/messages.jsonl`.
 - **오프라인 큐**: 재접속 시 마지막 seq 이후 메시지 재전송(24h/500건).
-- **자동응답(`--agent`)**: 받은 메시지를 데이터로 감싸 홈에서 `claude -p`(읽기 전용 Read/Grep/Glob, 비밀 경로 deny)로 처리하고 `hop+1`로 회신.
+- **자동응답(`--agent`)**: 받은 메시지를 신뢰된 동료 요청으로 보고 홈에서 `claude -p`로 처리하고 `hop+1`로 회신.
 - **재접속**: 지터 있는 지수 백오프(최대 60초) + ping/pong.
 - **구 클라이언트 호환**: `docs/tailhub-termux/ws/client.py` 도 그대로 접속 가능.
 

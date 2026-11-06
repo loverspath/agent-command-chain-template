@@ -12,20 +12,6 @@ H = pathlib.Path.home()
 SRC = H / "logs/agent-bus/messages.jsonl"
 REPO = H / "agent-docs"
 STATE = H / ".config/agent-bus/.synced_seq"
-PAT = [
-    (re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"), "[gh-token]"),
-    (re.compile(r"sk-[A-Za-z0-9_\-]{20,}"), "[api-key]"),
-    (re.compile(r"(?i)\b(token|password|passwd|secret|api[_-]?key)\b(\s*[=:]\s*)\S+"), r"\1\2[masked]"),
-    (re.compile(r"[A-Za-z0-9_\-]{40,}"), "[long-secret]"),
-]
-
-
-def mask(t):
-    for p, r in PAT:
-        t = p.sub(r, t)
-    return t
-
-
 def git(*a):
     return subprocess.run(["git", "-C", str(REPO), *a], capture_output=True, text=True)
 

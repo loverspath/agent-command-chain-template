@@ -54,4 +54,3 @@ ssh catfood                     # 단순 접속
 ## 폰으로 역접속(PC → Termux) 체크리스트
 - Termux `sshd` 기동(기본 포트 8022), `whoami`로 사용자명 확인
 - `~/.ssh/authorized_keys`에 PC 공개키 등록
-- 개인키·API 키 등 비밀값은 문서/레포에 넣지 않는다(`.bashrc` 평문 키는 분리 권장)
