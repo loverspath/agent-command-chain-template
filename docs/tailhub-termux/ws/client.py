@@ -7,7 +7,9 @@ import argparse, asyncio, json, os, pathlib, subprocess, sys
 import websockets
 
 def token():
-    return os.environ.get("WS_TOKEN") or (pathlib.Path.home()/".config/ws-relay/token").read_text().strip()
+    if os.environ.get("WS_TOKEN"): return os.environ["WS_TOKEN"]
+    p = pathlib.Path.home()/".config/ws-relay/token"
+    return p.read_text().strip() if p.exists() else ""  # 신뢰 IP(Tailscale)는 토큰 불필요
 
 def ask_claude(prompt):
     r = subprocess.run(["claude", "-p", prompt, "--allowedTools", "Read,Grep,Glob"],

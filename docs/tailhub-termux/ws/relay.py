@@ -17,13 +17,16 @@ def load_token():
     return p.read_text().strip()
 
 TOKEN = load_token()
+# Tailscale 이 인증한 기기(소스 IP)는 토큰 없이 허용. 그 외는 토큰 필수.
+TRUSTED = set(filter(None, os.environ.get("WS_TRUSTED_IPS", "100.94.216.66").split(",")))
 PEERS = {}  # name -> ws
 
 async def handler(ws):
     name = None
     try:
         hello = json.loads(await asyncio.wait_for(ws.recv(), 5))
-        if not secrets.compare_digest(str(hello.get("auth", "")), TOKEN):
+        peer_ip = (ws.remote_address or ("",))[0]
+        if peer_ip not in TRUSTED and not secrets.compare_digest(str(hello.get("auth", "")), TOKEN):
             await ws.close(4001, "bad token"); return
         name = str(hello.get("name") or "anon")[:32]
         if name in PEERS: await PEERS[name].close(4002, "replaced")
