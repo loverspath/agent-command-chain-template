@@ -321,7 +321,11 @@ def sync_one_session(s_name, rt_dir, env_by_session, tmux_sessions):
     resume_arg = f"--resume {shlex.quote(sid)}" if sid else ""
     settings_path = os.path.join(rt_dir, "claude-bridge.settings.json")
     brief_path = os.path.join(rt_dir, "session_brief.md")
+    lite = (inst_env.get("CHAIN_MODE") == "lite") or os.path.isfile(os.path.join(rt_dir, "lite"))
     resume_cmd = (
+        f"export ACC_RUNTIME={shlex.quote(rt_dir)} SESSION_NAME={shlex.quote(s_name)}; "
+        f"{sonnet_cmd} {resume_arg}".strip()
+    ) if lite else (
         f"export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 "
         f"ACC_RUNTIME={shlex.quote(rt_dir)} "
         f"ACC_TEMPLATE_ROOT={shlex.quote(HERE)} "
@@ -349,6 +353,7 @@ def sync_one_session(s_name, rt_dir, env_by_session, tmux_sessions):
         "project_dir": project_dir,
         "work_dir": work_dir,
         "handoff_file": handoff_file,
+        "mode": "lite" if lite else "full",
         "retired": retired,
         "tmux_alive": tmux_alive,
         "tmux_windows": tmux_info["windows"] if tmux_info else 0,

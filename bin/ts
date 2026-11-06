@@ -9,6 +9,7 @@
 #   ts attach <세션|번호>  지정한 tmux 세션에 접속
 #   ts recover [세션]      기존 체인 세션 복구 (Claude 단독 + Remote Control)
 #   ts new [세션]          신규 체인 전체 기동 (Claude + Watchdog + agy + codex)
+#   ts add <세션> [옵션]   경량 등록: Claude 단독 세션을 복구 목록에 추가 (기존 tmux 세션도 가능)
 #   ts retire [세션]       불필요한 체인 세션 정리 (목록 및 자동복구 제외)
 #   ts unretire <세션>     정리된 체인 세션 복원
 #   ts rc, status          Claude & Remote Control 및 자가 복원 파이프라인 상태
@@ -795,6 +796,99 @@ EOF
   fi
 }
 
+# 경량 체인 등록: Claude 단독(+Remote Control) 세션을 레지스트리/복구 목록에 추가
+#   ts add <세션> [--dir 경로] [--cmd "claude ..."] [--no-start]
+#   - 이미 떠 있는 tmux 세션이면 그대로 편입(claude 창을 sonnet 으로 rename), 없으면 chain-recover 로 기동
+#   - agy/codex 창, 워치독, 브리지 설정 없이 복구(recover)만 지원 (instances/<세션>.env 에 CHAIN_MODE=lite)
+#   - --no-start: 세션이 없을 때 기동하지 않고 등록만 수행
+add_chain() {
+  local target="" dir="" cmd="" start=true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dir) dir="${2:-}"; shift ;;
+      --cmd) cmd="${2:-}"; shift ;;
+      --no-start) start=false ;;
+      -*) echo -e "${C_RED}[오류] 알 수 없는 옵션: $1${C_RESET}" >&2; return 64 ;;
+      *) [[ -z "$target" ]] && target="$1" ;;
+    esac
+    shift
+  done
+  if [[ -z "$target" ]]; then
+    echo -e "${C_RED}사용법: ts add <세션명> [--dir 경로] [--cmd \"claude ...\"] [--no-start]${C_RESET}" >&2
+    return 64
+  fi
+  if [[ ! "$target" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    echo -e "${C_RED}[오류] 세션 이름은 영문, 숫자, -, _ 만 가능합니다: '$target'${C_RESET}" >&2
+    return 64
+  fi
+
+  local inst_file="$HERE/instances/${target}.env"
+  if [[ -f "$inst_file" ]]; then
+    echo -e "${C_YELLOW}[알림] '$target' 은(는) 이미 등록되어 있습니다. 레지스트리만 동기화합니다.${C_RESET}"
+    "$HERE/bin/chain-registry.sh" sync >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  local exists=false
+  exact_tmux_session_exists "$target" && exists=true
+
+  if [[ -z "$dir" ]]; then
+    if $exists; then
+      dir="$(tmux display-message -p -t "=$target:" '#{pane_current_path}' 2>/dev/null || true)"
+    fi
+    [[ -n "$dir" && -d "$dir" ]] || dir="/mnt/c/Users/rerun/llm-wiki"
+    [[ -d "$dir" ]] || dir="$HERE"
+  fi
+  dir="$(normalize_path_input "$dir")"
+  if [[ ! -d "$dir" ]]; then
+    echo -e "${C_RED}[오류] 디렉토리가 없습니다: $dir${C_RESET}" >&2
+    return 1
+  fi
+  dir="$(cd "$dir" && pwd)"
+  [[ -n "$cmd" ]] || cmd="claude --remote-control $target"
+
+  local rt="$HERE/runtime/${target}-$(date +%Y%m%d%H%M%S)"
+  mkdir -p "$rt" "$HERE/instances"
+  printf '%s\n' "$target" > "$rt/session_name"
+  printf '%s\n' "$target" > "$rt/instance"
+  : > "$rt/lite"
+  cat > "$inst_file" <<ENVEOF
+# 경량 체인 인스턴스 (ts add): $target
+SESSION_NAME=$target
+ACC_RUNTIME=$rt
+PROJECT_DIR=$dir
+WORK_DIR=$dir
+CHAIN_MODE=lite
+SONNET_CMD="$cmd"
+ENVEOF
+  ts_log "[add_chain] 경량 등록: session=$target runtime=$rt dir=$dir cmd=$cmd exists=$exists"
+
+  if $exists; then
+    # 복구 스크립트가 기대하는 'sonnet' 창 이름 보장 (claude 가 도는 창 우선, 없으면 첫 창)
+    if ! tmux list-windows -t "=$target" -F '#{window_name}' 2>/dev/null | grep -qx 'sonnet'; then
+      local wid
+      wid="$(tmux list-panes -s -t "=$target" -F '#{window_id} #{pane_current_command}' 2>/dev/null | awk '$2=="claude"{print $1; exit}')"
+      [[ -n "$wid" ]] || wid="$(tmux list-windows -t "=$target" -F '#{window_id}' 2>/dev/null | head -n1)"
+      [[ -n "$wid" ]] && tmux rename-window -t "$wid" sonnet 2>/dev/null || true
+    fi
+    tmux set-environment -t "=$target" ACC_RUNTIME "$rt" 2>/dev/null || true
+  fi
+
+  # 세션이 이미 있으면 점검만(Claude 가 살아 있으면 재기동 안 함), 없으면 --no-start 가 아닐 때만 기동
+  if $exists || $start; then
+    "$HERE/bin/chain-recover.sh" "$target" || true
+  fi
+  "$HERE/bin/chain-registry.sh" sync >/dev/null 2>&1 || true
+
+  local info c_alive c_pid c_status sid rc_url
+  info="$(get_claude_rc_info "$target")"
+  IFS='|' read -r c_alive c_pid c_status sid rc_url <<< "$info"
+  echo -e "${C_GREEN}${C_BOLD}[성공] 경량 체인 '$target' 등록 완료${C_RESET} (dir=$dir)"
+  echo -e "${C_DIM}  - runtime: $rt${C_RESET}"
+  echo -e "${C_DIM}  - Claude PID: ${c_pid:-없음}  RC: ${rc_url:-미확인}${C_RESET}"
+  echo -e "${C_DIM}  - 복구: ts recover $target   /   해제: ts retire $target${C_RESET}"
+}
+
 # ts 로그 조회 함수
 show_ts_logs() {
   local lines="${1:-40}"
@@ -837,6 +931,8 @@ show_help() {
   echo -e "  ${C_BOLD}ts attach <세션|번호>${C_RESET}   지정한 tmux 세션에 접속 (단축어: ts a)"
   echo -e "  ${C_BOLD}ts recover [세션명]${C_RESET}     기존 체인 세션 복구 (단축어: ts r) (Claude 단독 + RC)"
   echo -e "  ${C_BOLD}ts new [세션명]${C_RESET}         신규 체인 전체 기동 (단축어: ts n) (Claude+Watchdog+agy+codex)"
+  echo -e "  ${C_BOLD}ts add <세션명> [--dir 경로] [--cmd \"claude ...\"] [--no-start]${C_RESET}"
+  echo -e "                            경량 등록: Claude 단독(+RC) 세션을 복구 목록에 추가 (이미 떠 있는 tmux 세션도 가능)"
   echo -e "  ${C_BOLD}ts retire [세션명]${C_RESET}      불필요한 체인 세션 정리 (목록 및 자동복구 제외)"
   echo -e "  ${C_BOLD}ts unretire <세션명>${C_RESET}    정리된 체인 세션 복원"
   echo -e "  ${C_BOLD}ts rc${C_RESET}                   Claude & Remote Control 및 자가 복원 파이프라인 상태"
@@ -997,6 +1093,9 @@ main() {
       ;;
     n|new)
       new_chain "$@"
+      ;;
+    add|register)
+      add_chain "$@"
       ;;
     l|ls|list)
       echo -e "${C_BOLD}${C_CYAN}=== 활성 tmux 세션 목록 ===${C_RESET}"

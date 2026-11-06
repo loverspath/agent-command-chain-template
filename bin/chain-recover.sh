@@ -104,6 +104,9 @@ SONNET_WINDOW=sonnet; AGY_WINDOW=agy; CODEX_WINDOW=codex
 [[ -f "$HERE/config.env" ]] && source "$HERE/config.env"
 [[ -f "$HERE/instances/$S.env" ]] && source "$HERE/instances/$S.env"
 P="${PROJECT_DIR:?PROJECT_DIR 미설정}"
+# 경량(lite) 체인: ts add 로 등록된 Claude 단독 세션 (agy/codex 창, 워치독, 브리지 설정 없음)
+LITE=false
+[[ "${CHAIN_MODE:-full}" == "lite" || -f "$RT/lite" ]] && LITE=true
 
 # 3) 감독자 Claude 트랜스크립트 탐색:
 #    1순위: 현재 실행 중인 Claude 세션 메타데이터
@@ -159,7 +162,11 @@ fi
 
 RESUME=""
 [[ -n "$SID" ]] && RESUME="--resume $SID"
+if $LITE; then
+  LAUNCH="export ACC_RUNTIME=\"$RT\" ACC_TEMPLATE_ROOT=\"$HERE\" SESSION_NAME=\"$S\"; $SONNET_CMD $RESUME"
+else
 LAUNCH="export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 ACC_RUNTIME=\"$RT\" ACC_TEMPLATE_ROOT=\"$HERE\" SESSION_NAME=\"$S\"; $SONNET_CMD $RESUME --settings \"$RT/claude-bridge.settings.json\" --add-dir \"$HERE\" --append-system-prompt \"\$(cat '$RT/session_brief.md')\""
+fi
 
 if $DRY; then
   echo "[dry-run] $LAUNCH"
@@ -176,6 +183,7 @@ if ! term_session_exists "$S"; then
   term_set_env "$S" ACC_RUNTIME "$RT"
   term_set_env "$S" ACC_BOOTSTRAP_VERSION 2
   for w in "$AGY_WINDOW" "$CODEX_WINDOW"; do
+    $LITE && break
     term_new_window "$S" "$w" "$P"
     term_run_cmd "$S:$w" "export ACC_RUNTIME=\"$RT\" PROJECT_DIR=\"$P\" HERE=\"$HERE\"; cd \"$P\""
   done
@@ -189,6 +197,7 @@ else
     need_launch=true
   fi
   for w in "$AGY_WINDOW" "$CODEX_WINDOW"; do
+    $LITE && break
     if ! term_has_window "$S" "$w"; then
       term_new_window "$S" "$w" "$P"
       term_run_cmd "$S:$w" "export ACC_RUNTIME=\"$RT\" PROJECT_DIR=\"$P\" HERE=\"$HERE\"; cd \"$P\""
@@ -302,6 +311,7 @@ fi
 
 # 6) 워치독(watchdog-v2.sh) 기동 상태 확인 및 자동 복구
 START_WATCHDOG="${START_WATCHDOG:-true}"
+$LITE && START_WATCHDOG=false
 if [[ "$START_WATCHDOG" == "true" && -x "$HERE/watchdog-v2.sh" ]]; then
   wd_pid="$(cat "$RT/watchdog.pid" 2>/dev/null || true)"
   if [[ -z "$wd_pid" ]] || ! kill -0 "$wd_pid" 2>/dev/null; then
