@@ -3,6 +3,9 @@
 Termux(폰)에서 Tailscale 노드(catfood = WSL2 Ubuntu 등)에 접속하고,
 원격 agent-chain 세션을 조회·복구하는 구조 메모.
 
+
+> **현행**: 에이전트 간 통신은 [`bus/`](bus/README.md) (Tailnet Agent Bus). `ws/` 는 초기 릴레이로 폐기 대상.
+
 ## 구성
 | 항목 | 위치 | 비고 |
 |---|---|---|

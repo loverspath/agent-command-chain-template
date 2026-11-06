@@ -10,6 +10,7 @@
 > - **폴백/레거시 경로**: **v1 기본 브리지** (`bootstrap.sh`, `watchdog.sh`). 순수 tmux 화면 캡처(pull) 방식으로 동작하며, v2 환경 구성이 어렵거나 최소 세션 테스트 시의 폴백으로 완전 보존됩니다. (v1 파일은 절대 삭제되지 않음)
 > - **단일 정본(SSOT)**: 감독자 운영·경중 판단·지시서 작성은 [SUPERVISOR.md](SUPERVISOR.md), 워커 보고 계약은 [ROLES.md](ROLES.md), 지침 3층 구조는 [docs/INSTRUCTION-LAYERS.md](docs/INSTRUCTION-LAYERS.md)를 참조하세요.
 > - **세션 재개 런북**: 신규 Claude 세션에서 환경을 재현하거나 중단된 작업을 이어받을 때는 [`.llmwiki/session-resume.md`](.llmwiki/session-resume.md)를 참조하세요.
+> - **호스트 간 통신(Tailnet Agent Bus)**: 기기가 다른 체인·세션끼리 사람 개입 없이 메시지를 주고받으려면 [`docs/tailhub-termux/bus/README.md`](docs/tailhub-termux/bus/README.md)를 참조하세요.
 
 ## 1. 역할 구조 및 분배 토폴로지
 
