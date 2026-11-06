@@ -57,6 +57,30 @@ def ask_claude(text, frm):
                        input=FRAME.format(frm=frm, text=text), capture_output=True, text=True, encoding="utf-8", timeout=300, cwd=str(HOME))  # Termux 상대경로 preload 때문에 항상 홈
     return (r.stdout or r.stderr).strip()[:8000]
 
+def update_repo():
+    """레포를 git pull --ff-only. HEAD 가 바뀌었으면 True."""
+    here = str(pathlib.Path(__file__).resolve().parent)
+
+    def head():
+        return subprocess.run(["git", "-C", here, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+
+    old = head()
+    try:
+        subprocess.run(["git", "-C", here, "pull", "--ff-only", "-q"], capture_output=True, text=True, timeout=90)
+    except Exception as e:
+        print("[update] pull error", e, flush=True)
+        return False
+    return old != head()
+
+
+def restart_self():
+    print("[update] new commit pulled, restarting", flush=True)
+    if os.name == "nt":
+        subprocess.Popen([sys.executable] + sys.argv, cwd=os.getcwd())
+        os._exit(0)
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
 async def run(a):
     label, delay, jobs = a.label, 1, asyncio.Queue()
     peers = {p.strip().lower() for p in a.peers.split(",") if p.strip()}
@@ -69,6 +93,8 @@ async def run(a):
             if ws: 
                 try: await ws.send(json.dumps({"op": "send", "to": m["from"], "text": ans, "hop": m.get("hop", 0) + 1}))
                 except Exception: pass
+    if update_repo():
+        restart_self()
     ws_ref = {}
     asyncio.ensure_future(worker(ws_ref))
     while True:
@@ -83,6 +109,10 @@ async def run(a):
                         print(f"[{m["from"]}] hop={m.get("hop")} {m["text"]}", flush=True)
                         fresh = not m.get("replay") or time.time() - m["ts"] < 3600
                         node = m["from"].split("/")[0]
+                        if m["text"].strip() == "!update" and fresh and (not peers or node in peers):
+                            if await asyncio.get_running_loop().run_in_executor(None, update_repo):
+                                restart_self()
+                            continue
                         if fresh and m.get("hop", 0) + 1 <= MAX_HOP and (not peers or node in peers) and should_reply(get_mode(a.mode), m["text"]):
                             await jobs.put({**m, "text": strip_ask(m["text"])})
                     else:
@@ -100,7 +130,7 @@ async def oneshot(a):
         if a.cmd == "peers":
             await ws.send(json.dumps({"op": "peers"})); print(json.loads(await ws.recv())["text"]); return
         mid = uuid.uuid4().hex[:12]
-        await ws.send(json.dumps({"op": "send", "id": mid, "to": a.to, "text": (a.text if a.say else "!ask " + a.text), "hop": a.hop}))
+        await ws.send(json.dumps({"op": "send", "id": mid, "to": a.to, "text": ("!update" if a.update else (a.text if a.say else "!ask " + a.text)), "hop": a.hop}))
         end = time.time() + a.wait
         while time.time() < end:
             try: m = json.loads(await asyncio.wait_for(ws.recv(), max(0.1, end - time.time())))
@@ -113,7 +143,7 @@ async def oneshot(a):
 if __name__ == "__main__":
     p = argparse.ArgumentParser(); sp = p.add_subparsers(dest="cmd", required=True)
     r = sp.add_parser("run"); r.add_argument("--label", default="main"); r.add_argument("--agent", action="store_true", help="(호환) --mode agent 와 동일"); r.add_argument("--mode", choices=["agent", "watch", "hybrid"], default=None); r.add_argument("--peers", default="")
-    s = sp.add_parser("send"); s.add_argument("--to", required=True); s.add_argument("text"); s.add_argument("--wait", type=float, default=0); s.add_argument("--hop", type=int, default=0); s.add_argument("--first", dest="wait_first", action="store_true"); s.add_argument("--say", action="store_true", help="!ask 접두 없이 보냄(응답 기대 없는 알림)")
+    s = sp.add_parser("send"); s.add_argument("--to", required=True); s.add_argument("text", nargs="?", default=""); s.add_argument("--wait", type=float, default=0); s.add_argument("--hop", type=int, default=0); s.add_argument("--first", dest="wait_first", action="store_true"); s.add_argument("--update", action="store_true", help="모든 노드에 !update 전파(각 노드가 git pull 후 재시작)"); s.add_argument("--say", action="store_true", help="!ask 접두 없이 보냄(응답 기대 없는 알림)")
     sp.add_parser("peers")
     a = p.parse_args()
     if getattr(a, "agent", False) and not getattr(a, "mode", None):
