@@ -65,6 +65,10 @@ source ~/.bashrc
 | `ts attach <세션\|번호>` | `ts a 1` | 명시적 세션 접속 (tmux 내부 실행 시 `switch-client` 자동 수행) |
 | `ts recover [세션]` | `ts r [세션]` | 비정상 종료된 체인 복구 (Claude 감독자 단독 + Remote Control 재개) |
 | `ts new [세션]` | `ts n [세션]` | 신규 체인 전체 기동 (`bootstrap-v2.sh` 기반 Full-Push 윈도우 일괄 생성) |
+| `ts add <세션> [--dir 경로] [--cmd "claude ..."] [--no-start]` | `ts register` | 경량 등록: Claude 단독(+RC) 세션을 복구 목록에 추가 (이미 떠 있는 tmux 세션도 가능, `CHAIN_MODE=lite`) |
+| `ts retire [세션]` | - | 불필요한 체인 세션 정리 (목록 및 자동복구에서 제외) |
+| `ts unretire <세션>` | - | 정리된 체인 세션 복원 |
+| `ts rc` | `ts status` | Claude & Remote Control 및 자가 복원 파이프라인 상태 |
 | `ts list` | `ts ls`, `ts l` | 현재 활성 tmux 세션 및 에이전트 체인 런타임 상태 텍스트 출력 |
 | `ts help` | `ts -h`, `ts --help` | CLI 사용법 및 단축키 안내 출력 |
 | `ts --no-tui` | - | TUI 그래픽을 건너뛰고 가벼운 텍스트 기반 대화형 번호 선택 메뉴 강제 실행 |
