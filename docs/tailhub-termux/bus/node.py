@@ -8,6 +8,12 @@
 import argparse, asyncio, json, os, pathlib, random, shutil, subprocess, sys, time, uuid
 import websockets
 
+for _st in (sys.stdout, sys.stderr):  # Windows cp949 리다이렉트에서도 한글 출력이 죽지 않게
+    try:
+        _st.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 HOME = pathlib.Path.home()
 CFG = HOME / ".config/agent-bus"
 URL = os.environ.get("BUS_URL", "ws://100.87.35.41:8765")
