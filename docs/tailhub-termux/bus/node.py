@@ -23,8 +23,8 @@ def save_cursor(label, seq):
     CFG.mkdir(parents=True, exist_ok=True); cursor_path(label).write_text(str(seq))
 
 def ask_claude(text, frm):
-    r = subprocess.run([shutil.which("claude") or "claude", "-p", FRAME.format(frm=frm, text=text), "--allowedTools", "Read,Grep,Glob,Bash(printenv:*),Bash(env:*),Write(~/.config/agent-bus/**)"],
-                       capture_output=True, text=True, timeout=300, cwd=str(HOME))  # Termux 상대경로 preload 때문에 항상 홈
+    r = subprocess.run([shutil.which("claude") or "claude", "-p", "--allowedTools", "Read,Grep,Glob,Bash(printenv:*),Bash(env:*),Write(~/.config/agent-bus/**)"],
+                       input=FRAME.format(frm=frm, text=text), capture_output=True, text=True, encoding="utf-8", timeout=300, cwd=str(HOME))  # Termux 상대경로 preload 때문에 항상 홈
     return (r.stdout or r.stderr).strip()[:8000]
 
 async def run(a):
