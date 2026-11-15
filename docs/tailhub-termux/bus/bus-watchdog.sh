@@ -3,7 +3,7 @@
 # ~/.config/agent-bus/mode (agent|watch|hybrid, 기본 hybrid) 는 node.py 가 메시지마다 읽는다(재시작 불필요).
 #   bus-watchdog.sh [--hub] [--sync] [--peers a,b,c]
 HERE="$(cd "$(dirname "$0")" && pwd)"; CFG="$HOME/.config/agent-bus"; mkdir -p "$CFG" "$HOME/logs"
-HUB=false; SYNC=false; PEERS="cat-food,msi,mother-goose,claw8,z-fold8"
+HUB=false; SYNC=false; PEERS="cat-food,msi,mother-goose,claw8,z-fold8,codex-environment"
 while [[ $# -gt 0 ]]; do case "$1" in --hub) HUB=true;; --sync) SYNC=true;; --peers) PEERS="$2"; shift;; esac; shift; done
 [[ -f "$CFG/mode" ]] || echo hybrid > "$CFG/mode"
 applied="$CFG/.applied_mode"

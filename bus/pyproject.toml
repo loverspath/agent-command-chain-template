@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-bus"
+version = "0.2.0"
+description = "Durable sync/async cross-environment agent communication bus with Dual-Auth Tailscale Funnel gateway"
+readme = "../docs/tailhub-termux/bus/README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "websockets>=12.0",
+]
+
+[project.optional-dependencies]
+hub = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+]
+
+[project.scripts]
+abus = "agent_bus.cli:main"
+
+[tool.setuptools]
+packages = ["agent_bus"]
