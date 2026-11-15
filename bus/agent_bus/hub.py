@@ -540,7 +540,7 @@ async def serve_all(
             ws_port,
             max_size=1 << 20,
             ping_interval=20,
-            ping_timeout=20,
+            ping_timeout=60,
         ):
             print(
                 f"agent-bus hub ws://{ws_host}:{ws_port} allow={sorted(allowed_nodes(hub.cfg_dir))} seq={hub.store.get_max_seq()}",

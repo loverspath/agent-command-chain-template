@@ -439,7 +439,7 @@ async def run_node(a: argparse.Namespace) -> None:
     try:
         while True:
             try:
-                async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+                async with websockets.connect(url, ping_interval=20, ping_timeout=60) as ws:
                     await ws.send(json.dumps(build_ws_hello(label, load_cursor(label, cdir), accept_inbox=(label == "main"))))
                     ws_ref["ws"] = ws
                     delay = 1.0
@@ -544,7 +544,7 @@ async def oneshot(a: argparse.Namespace) -> int:
         else:
             ws_url = to_ws_url(url)
             cli_label = f"cli-{uuid.uuid4().hex[:6]}"
-            async with websockets.connect(ws_url, ping_interval=20, ping_timeout=20) as ws:
+            async with websockets.connect(ws_url, ping_interval=20, ping_timeout=60) as ws:
                 await ws.send(json.dumps(build_ws_hello(cli_label, 10**9, accept_inbox=False)))
                 await ws.recv()
                 while True:
@@ -617,7 +617,7 @@ async def oneshot(a: argparse.Namespace) -> int:
     ws_url = to_ws_url(url)
     cli_label = f"cli-{uuid.uuid4().hex[:6]}"
     try:
-        async with websockets.connect(ws_url, ping_interval=20, ping_timeout=20) as ws:
+        async with websockets.connect(ws_url, ping_interval=20, ping_timeout=60) as ws:
             await ws.send(json.dumps(build_ws_hello(cli_label, 10**9, accept_inbox=False)))
             await ws.recv()  # connected banner
 
