@@ -10,6 +10,7 @@ import logging.handlers
 import os
 import pathlib
 import random
+import shlex
 import shutil
 import subprocess
 import sys
@@ -245,8 +246,15 @@ def detect_claude_status(returncode: int, stdout: str, stderr: str) -> str:
 def ask_claude(text: str, frm: str, cwd: pathlib.Path | None = None) -> tuple[str, str]:
     cmd = os.environ.get("BUS_CLAUDE_CMD") or shutil.which("claude") or "claude"
     work_dir = str(cwd or home_dir())
+    allowed = os.environ.get("BUS_CLAUDE_ALLOWED_TOOLS") or "Read,Grep,Glob,Bash,Edit,Write,WebFetch,mcp__*"
+    claude_args = [cmd, "-p"]
+    if allowed and allowed.strip() != "*":
+        claude_args.extend(["--allowedTools", allowed])
+    extra_args = os.environ.get("BUS_CLAUDE_EXTRA_ARGS")
+    if extra_args:
+        claude_args.extend(shlex.split(extra_args))
     r = subprocess.run(
-        [cmd, "-p", "--allowedTools", "Read,Grep,Glob,Bash,Edit,Write"],
+        claude_args,
         input=FRAME.format(frm=frm, text=text),
         capture_output=True,
         text=True,

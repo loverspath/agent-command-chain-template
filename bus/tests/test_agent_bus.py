@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 
@@ -301,6 +302,34 @@ class AgentBusTests(unittest.TestCase):
             "auth_error",
         )
         self.assertEqual(client.detect_claude_status(2, "", "command crashed"), "exec_error")
+
+    def test_ask_claude_allowed_tools_and_extra_args(self) -> None:
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(list(args))
+            res = mock.Mock()
+            res.returncode = 0
+            res.stdout = "mocked response"
+            res.stderr = ""
+            return res
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("BUS_CLAUDE_ALLOWED_TOOLS", None)
+                os.environ.pop("BUS_CLAUDE_EXTRA_ARGS", None)
+                out, st = client.ask_claude("hi", "test_from", cwd=self.root)
+                self.assertEqual(st, "ok")
+                self.assertIn("--allowedTools", calls[-1])
+                self.assertIn("Read,Grep,Glob,Bash,Edit,Write,WebFetch,mcp__*", calls[-1])
+
+                # Custom tools & extra args
+                os.environ["BUS_CLAUDE_ALLOWED_TOOLS"] = "Read,Bash,mcp__custom"
+                os.environ["BUS_CLAUDE_EXTRA_ARGS"] = "--dangerously-skip-permissions"
+                out, st = client.ask_claude("hi2", "test_from", cwd=self.root)
+                self.assertEqual(st, "ok")
+                self.assertIn("Read,Bash,mcp__custom", calls[-1])
+                self.assertIn("--dangerously-skip-permissions", calls[-1])
 
     def test_acc_bridge_event_emit(self) -> None:
         acc_repo = self.root / "acc"
