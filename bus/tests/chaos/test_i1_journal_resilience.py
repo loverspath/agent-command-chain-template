@@ -1021,7 +1021,7 @@ async def test_x12_concurrent_outbox_600_backlog_rate_hook_migration_and_cli(
     assert not legacy_file.exists(), "outbox.jsonl must be renamed on open"
     assert (mig_cfg / "outbox.jsonl.migrated").is_file(), "outbox.jsonl.migrated must exist"
     mig_status = json.loads(st_proc.stdout)
-    assert mig_status["outbox"] == {"pending": 3, "done": 0, "expired": 0}
+    assert mig_status["outbox"] == {"pending": 3, "done": 0, "expired": 0, "rejected": 0}
 
     # ----------------------------------------------------------------------
     # Part 3: Multi-process + multi-thread concurrent `outbox` append (`600` items)
@@ -1085,7 +1085,7 @@ async def test_x12_concurrent_outbox_600_backlog_rate_hook_migration_and_cli(
             timeout=10,
         ).stdout
     )
-    assert pre_drain_status["outbox"] == {"pending": 600, "done": 0, "expired": 0}
+    assert pre_drain_status["outbox"] == {"pending": 600, "done": 0, "expired": 0, "rejected": 0}
 
     # Drain all 600 pending items via `abus journal drain` CLI
     drain_proc = subprocess.run(
@@ -1108,7 +1108,7 @@ async def test_x12_concurrent_outbox_600_backlog_rate_hook_migration_and_cli(
     )
     assert drain_proc.returncode == 0, f"drain failed: {drain_proc.stderr} {drain_proc.stdout}"
     drain_res = json.loads(drain_proc.stdout)
-    assert drain_res == {"ok": True, "drained": 600, "expired": 0, "remaining": 0}
+    assert drain_res == {"ok": True, "drained": 600, "expired": 0, "rejected": 0, "remaining": 0}
 
     post_drain_status = json.loads(
         subprocess.run(
@@ -1120,7 +1120,7 @@ async def test_x12_concurrent_outbox_600_backlog_rate_hook_migration_and_cli(
             timeout=10,
         ).stdout
     )
-    assert post_drain_status["outbox"] == {"pending": 0, "done": 600, "expired": 0}
+    assert post_drain_status["outbox"] == {"pending": 0, "done": 600, "expired": 0, "rejected": 0}
     assert len(hub_fast.inspect_db()["messages"]) == 600
 
     # Now start offline receiver `cat-food/rx` AFTER all 600 items are queued on Hub (>500 replay limit!)

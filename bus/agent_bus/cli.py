@@ -18,7 +18,7 @@ from .client import (
     run_supervise,
     update_repo,
 )
-from .config import cfg_dir, load_config, save_config
+from .config import cfg_dir, load_config, parse_url_list, save_config
 from .hub import serve_all
 from .journal import NodeJournal
 
@@ -27,6 +27,10 @@ def _cmd_init(a: argparse.Namespace) -> int:
     cfg = load_config()
     if a.url:
         cfg["url"] = a.url
+    if getattr(a, "urls", None):
+        parsed_urls = parse_url_list(a.urls)
+        if parsed_urls:
+            cfg["urls"] = parsed_urls
     if a.token_id:
         cfg["token_id"] = a.token_id
     if a.secret:
@@ -109,7 +113,10 @@ def _cmd_journal(a: argparse.Namespace) -> int:
         ib = summary["inbox"]
         unc = summary["uncertain_items"]
         print(f"journal_db={summary['db_path']}")
-        print(f"outbox: pending={ob['pending']} done={ob['done']} expired={ob['expired']}")
+        print(
+            f"outbox: pending={ob['pending']} done={ob['done']} "
+            f"expired={ob['expired']} rejected={ob.get('rejected', 0)}"
+        )
         print(
             f"inbox: queued={ib['queued']} skipped={ib['skipped']} running={ib['running']} "
             f"done={ib['done']} uncertain={ib['uncertain']} expired={ib['expired']}"
@@ -137,9 +144,26 @@ def _cmd_journal(a: argparse.Namespace) -> int:
             print(json.dumps(res, indent=2, ensure_ascii=False))
         else:
             print(
-                f"drained={res['drained']} expired={res['expired']} remaining={res['remaining']}"
+                f"drained={res['drained']} expired={res['expired']} "
+                f"rejected={res.get('rejected', 0)} remaining={res['remaining']}"
             )
         return 0 if res.get("ok") else 1
+
+    if a.jcmd == "reconcile":
+        hub_keys = parse_url_list(getattr(a, "hubs", None))
+        if not hub_keys:
+            print("[error] --hubs requires at least one non-empty hub key", file=sys.stderr)
+            return 1
+        with NodeJournal(cdir) as journal:
+            res = journal.reconcile_outbox(hub_keys)
+        if getattr(a, "json", False):
+            print(json.dumps(res, indent=2, ensure_ascii=False))
+        else:
+            print(
+                f"reconciled={res['reconciled']} remaining_pending={res['remaining_pending']} "
+                f"expired={res['expired']} done_total={res['done_total']} hubs={','.join(res['hubs'])}"
+            )
+        return 0
 
     return 1
 
@@ -150,6 +174,7 @@ def main(argv: list[str] | None = None) -> None:
 
     init_p = sp.add_parser("init", help="Write ~/.config/agent-bus/config.json")
     init_p.add_argument("--url", default=None)
+    init_p.add_argument("--urls", default=None, help="Comma-separated hub URLs")
     init_p.add_argument("--token-id", default=None)
     init_p.add_argument("--secret", default=None)
     init_p.add_argument("--label", default=None)
@@ -234,6 +259,9 @@ def main(argv: list[str] | None = None) -> None:
     jd_p.add_argument("--url", default=None)
     jd_p.add_argument("--timeout", type=float, default=30.0)
     jd_p.add_argument("--json", action="store_true")
+    jr_p = jrn_sp.add_parser("reconcile", help="Recompute pending outbox completion against active hub keys")
+    jr_p.add_argument("--hubs", required=True, help="Comma-separated hub keys (hub_id or URL)")
+    jr_p.add_argument("--json", action="store_true")
 
     sp.add_parser("update", help="Pull latest repo commits via git pull --ff-only")
 

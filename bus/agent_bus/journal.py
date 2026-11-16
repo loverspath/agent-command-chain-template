@@ -18,10 +18,12 @@ import os
 import pathlib
 import random
 import sqlite3
+import sys
 import threading
 import time
+import urllib.parse
 import uuid
-from typing import Any, Callable, Iterator, TypeVar
+from typing import Any, Callable, Iterable, Iterator, TypeVar
 
 try:
     import fcntl
@@ -38,7 +40,7 @@ from .config import (
 
 T = TypeVar("T")
 
-OUTBOX_STATES = ("pending", "done", "expired")
+OUTBOX_STATES = ("pending", "done", "expired", "rejected")
 INBOX_STATES = ("queued", "skipped", "running", "done", "uncertain", "expired")
 
 _JOURNAL_SCHEMA = """
@@ -49,7 +51,7 @@ CREATE TABLE IF NOT EXISTS outbox (
     deadline REAL NOT NULL,
     acked_hubs TEXT NOT NULL DEFAULT '[]',
     state TEXT NOT NULL DEFAULT 'pending'
-        CHECK (state IN ('pending', 'done', 'expired'))
+        CHECK (state IN ('pending', 'done', 'expired', 'rejected'))
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_state_created ON outbox(state, created);
 CREATE INDEX IF NOT EXISTS idx_outbox_state_deadline ON outbox(state, deadline);
@@ -114,6 +116,31 @@ def cursor_hub_key(base_hub_key: str, label: str = "main") -> str:
     clean_hub = str(base_hub_key or "").strip() or "default"
     clean_label = str(label or "main").strip() or "main"
     return clean_hub if clean_label == "main" else f"{clean_hub}#{clean_label}"
+
+
+def canonical_hub_url(url: str) -> str:
+    """Normalize WS/HTTP hub endpoint URLs to a single canonical WS endpoint key."""
+    clean = str(url or "").strip()
+    if not clean:
+        return ""
+    parsed = urllib.parse.urlsplit(clean)
+    scheme = parsed.scheme.lower()
+    if scheme in ("ws", "wss"):
+        path = parsed.path.rstrip("/")
+        return urllib.parse.urlunsplit((scheme, parsed.netloc, path, parsed.query, ""))
+    if scheme in ("http", "https"):
+        ws_scheme = "wss" if scheme == "https" else "ws"
+        path = parsed.path.rstrip("/")
+        if path.endswith("/v1/ws"):
+            ws_path = path
+        elif path.endswith("/bus"):
+            ws_path = path + "/v1/ws"
+        elif path:
+            ws_path = path + "/bus/v1/ws"
+        else:
+            ws_path = "/bus/v1/ws"
+        return urllib.parse.urlunsplit((ws_scheme, parsed.netloc, ws_path, parsed.query, ""))
+    return clean
 
 
 def _is_sqlite_busy_error(exc: BaseException) -> bool:
@@ -283,22 +310,27 @@ def _build_reply_payload(
     status: str,
     text: str,
     reply_id: str | None = None,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     rid = reply_id or new_message_id()
     corr_id = str(row["corr_id"] or row["id"] or "")
     orig_kind = str(row["kind"] or "task").strip().lower()
-    return {
+    out_kind = "rpc" if orig_kind == "rpc" else "task"
+    payload: dict[str, Any] = {
         "v": 2,
         "op": "send",
         "id": rid,
         "corr_id": corr_id or None,
-        "kind": "rpc" if orig_kind == "rpc" else "task",
+        "kind": out_kind,
         "rkind": "result",
         "status": status,
         "to": str(row["from"]),
         "text": text,
         "hop": int(row["hop"] or 0) + 1,
     }
+    if deadline is not None:
+        payload["deadline"] = float(deadline)
+    return payload
 
 
 class NodeJournal:
@@ -350,6 +382,39 @@ class NodeJournal:
                     self._conn.execute("ROLLBACK")
                 raise
 
+    def _ensure_outbox_rejected_schema(self, conn: sqlite3.Connection) -> None:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'outbox'"
+        ).fetchone()
+        if row is None:
+            return
+        table_sql = str(row["sql"] or "")
+        if "'rejected'" in table_sql:
+            return
+        conn.execute(
+            """
+            CREATE TABLE outbox_v2_new (
+                id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                created REAL NOT NULL,
+                deadline REAL NOT NULL,
+                acked_hubs TEXT NOT NULL DEFAULT '[]',
+                state TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (state IN ('pending', 'done', 'expired', 'rejected'))
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO outbox_v2_new (id, payload, created, deadline, acked_hubs, state)
+            SELECT id, payload, created, deadline, acked_hubs, state FROM outbox
+            """
+        )
+        conn.execute("DROP TABLE outbox")
+        conn.execute("ALTER TABLE outbox_v2_new RENAME TO outbox")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_outbox_state_created ON outbox(state, created)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_outbox_state_deadline ON outbox(state, deadline)")
+
     def _ensure_extra_inbox_columns(self, conn: sqlite3.Connection) -> None:
         cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(inbox)").fetchall()}
         if "hop" not in cols:
@@ -371,6 +436,7 @@ class NodeJournal:
                         s = stmt.strip()
                         if s:
                             self._conn.execute(s)
+                    self._ensure_outbox_rejected_schema(self._conn)
                     self._ensure_extra_inbox_columns(self._conn)
                     self._migrate_legacy_outbox_in_tx(self._conn)
                     self._conn.execute("COMMIT")
@@ -541,15 +607,58 @@ class NodeJournal:
 
         return _with_sqlite_retry(_op)
 
+    @staticmethod
+    def _is_required_hub_acked_in_tx(
+        conn: sqlite3.Connection,
+        req_target: str,
+        acked_set: set[str],
+        *,
+        allow_url_alias_when_mapped: bool = False,
+    ) -> bool:
+        clean_req = str(req_target or "").strip()
+        if not clean_req:
+            return True
+        canon_req = canonical_hub_url(clean_req)
+        candidates = [clean_req] if canon_req == clean_req else [clean_req, canon_req]
+        placeholders = ",".join("?" for _ in candidates)
+        ep_row = conn.execute(
+            f"SELECT hub_id FROM hub_endpoints WHERE url IN ({placeholders}) ORDER BY updated_at DESC LIMIT 1",
+            tuple(candidates),
+        ).fetchone()
+        if ep_row is not None and ep_row["hub_id"]:
+            mapped_id = str(ep_row["hub_id"])
+            if mapped_id in acked_set:
+                return True
+            if allow_url_alias_when_mapped and (clean_req in acked_set or canon_req in acked_set):
+                return True
+            return False
+
+        if clean_req in acked_set or canon_req in acked_set:
+            return True
+
+        # Support passing a `hub_id` directly (e.g. `reconcile --hubs <hub_id>`) when an earlier
+        # ACK was recorded under its endpoint URL before banner `hub_id` resolution.
+        if allow_url_alias_when_mapped:
+            url_rows = conn.execute(
+                "SELECT url FROM hub_endpoints WHERE hub_id = ?",
+                (clean_req,),
+            ).fetchall()
+            for r in url_rows:
+                u = str(r["url"] or "")
+                if u and (u in acked_set or canonical_hub_url(u) in acked_set):
+                    return True
+        return False
+
     def mark_outbox_acked(
         self,
         mid: str,
         hub_key: str = "default",
         *,
-        required_hubs: list[str] | None = None,
+        required_hubs: Iterable[str] | None = None,
     ) -> bool:
-        """Record storage ACK from `hub_key`; in single-hub mode (I1) transitions to `done`."""
-        clean_hub = str(hub_key or "default")
+        """Record storage ACK from `hub_key`; transitions to `done` iff all `required_hubs` ACKed."""
+        clean_hub = str(hub_key or "default").strip() or "default"
+        req_list = [str(h).strip() for h in (required_hubs or ()) if str(h).strip()]
 
         def _op() -> bool:
             with self._immediate_tx() as conn:
@@ -568,14 +677,22 @@ class NodeJournal:
                 if clean_hub not in acked:
                     acked.append(clean_hub)
 
-                if required_hubs:
-                    all_acked = all(h in acked for h in required_hubs)
+                acked_set = {str(x) for x in acked}
+                if req_list:
+                    all_acked = all(
+                        self._is_required_hub_acked_in_tx(conn, h, acked_set)
+                        for h in req_list
+                    )
                 else:
-                    all_acked = len(acked) >= 1
+                    all_acked = len(acked_set) >= 1
 
-                new_state = "done" if all_acked else str(row["state"])
-                if row["state"] == "done":
+                cur_state = str(row["state"])
+                if cur_state == "done":
                     new_state = "done"
+                elif cur_state == "pending" and all_acked:
+                    new_state = "done"
+                else:
+                    new_state = cur_state
                 conn.execute(
                     "UPDATE outbox SET acked_hubs = ?, state = ? WHERE id = ?",
                     (json.dumps(acked, ensure_ascii=False), new_state, mid),
@@ -602,6 +719,106 @@ class NodeJournal:
                 return bool(cur.rowcount)
 
         return _with_sqlite_retry(_op)
+
+    def mark_outbox_rejected(
+        self,
+        mid: str,
+        *,
+        hub_key: str = "",
+        error: str = "rejected",
+    ) -> bool:
+        """Permanently transition a `pending` outbox item to `rejected` (no further retries)."""
+        clean_err = str(error or "rejected").strip()
+        clean_hub = str(hub_key or "").strip()
+
+        def _op() -> bool:
+            with self._immediate_tx() as conn:
+                cur = conn.execute(
+                    "UPDATE outbox SET state = 'rejected' WHERE id = ? AND state = 'pending'",
+                    (mid,),
+                )
+                return bool(cur.rowcount)
+
+        changed = _with_sqlite_retry(_op)
+        if changed:
+            print(
+                f"[outbox-rejected] id={mid} hub={clean_hub or 'unknown'} error={clean_err}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return changed
+
+    def reconcile_outbox(
+        self,
+        hub_keys: Iterable[str],
+        *,
+        expire_now: bool = True,
+    ) -> dict[str, Any]:
+        """Recompute completion of `pending` outbox items against `hub_keys` (`reconcile --hubs`)."""
+        seen: set[str] = set()
+        normalized_hubs: list[str] = []
+        for raw in hub_keys:
+            for part in str(raw or "").split(","):
+                clean = part.strip()
+                if clean and clean not in seen:
+                    seen.add(clean)
+                    normalized_hubs.append(clean)
+        if not normalized_hubs:
+            raise ValueError("reconcile_outbox requires at least one non-empty hub key")
+
+        expired_cnt = self.expire_outbox() if expire_now else 0
+
+        def _op() -> tuple[int, int, int]:
+            reconciled_cnt = 0
+            with self._immediate_tx() as conn:
+                rows = conn.execute(
+                    "SELECT id, acked_hubs FROM outbox WHERE state = 'pending' ORDER BY created ASC, rowid ASC"
+                ).fetchall()
+                for r in rows:
+                    try:
+                        acked = json.loads(r["acked_hubs"] or "[]")
+                        if not isinstance(acked, list):
+                            acked = []
+                    except Exception:
+                        acked = []
+                    acked_set = {str(x) for x in acked}
+                    if all(
+                        self._is_required_hub_acked_in_tx(
+                            conn,
+                            h,
+                            acked_set,
+                            allow_url_alias_when_mapped=True,
+                        )
+                        for h in normalized_hubs
+                    ):
+                        upd = conn.execute(
+                            "UPDATE outbox SET state = 'done' WHERE id = ? AND state = 'pending'",
+                            (str(r["id"]),),
+                        )
+                        if upd.rowcount:
+                            reconciled_cnt += 1
+
+                rem_row = conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM outbox WHERE state = 'pending'"
+                ).fetchone()
+                done_row = conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM outbox WHERE state = 'done'"
+                ).fetchone()
+                return (
+                    reconciled_cnt,
+                    int(rem_row["cnt"]) if rem_row is not None else 0,
+                    int(done_row["cnt"]) if done_row is not None else 0,
+                )
+
+        reconciled_cnt, remaining_pending, done_total = _with_sqlite_retry(_op)
+        return {
+            "ok": True,
+            "hubs": normalized_hubs,
+            "reconciled": reconciled_cnt,
+            "expired": expired_cnt,
+            "remaining_pending": remaining_pending,
+            "done_total": done_total,
+        }
 
     def get_outbox_row(self, mid: str) -> dict[str, Any] | None:
         with self._lock:
@@ -722,8 +939,14 @@ class NodeJournal:
                     if not upd.rowcount:
                         continue
                     if _needs_terminal_reply(row):
-                        rep = _build_reply_payload(row, status="expired", text=err_text)
-                        rep_deadline = compute_deadline(kind=rep["kind"], base_ts=ts)
+                        orig_k = "rpc" if str(row["kind"] or "task").strip().lower() == "rpc" else "task"
+                        rep_deadline = compute_deadline(kind=orig_k, base_ts=ts)
+                        rep = _build_reply_payload(
+                            row,
+                            status="expired",
+                            text=err_text,
+                            deadline=rep_deadline,
+                        )
                         conn.execute(
                             """
                             INSERT OR IGNORE INTO outbox (id, payload, created, deadline, acked_hubs, state)
@@ -811,13 +1034,15 @@ class NodeJournal:
                 )
                 if not _needs_terminal_reply(row):
                     return None
+                orig_k = "rpc" if str(row["kind"] or "task").strip().lower() == "rpc" else "task"
+                rep_deadline = compute_deadline(kind=orig_k, base_ts=ts)
                 rep = _build_reply_payload(
                     row,
                     status=result_status,
                     text=result_text,
                     reply_id=reply_id,
+                    deadline=rep_deadline,
                 )
-                rep_deadline = compute_deadline(kind=rep["kind"], base_ts=ts)
                 conn.execute(
                     """
                     INSERT OR IGNORE INTO outbox (id, payload, created, deadline, acked_hubs, state)
@@ -864,8 +1089,14 @@ class NodeJournal:
                     if not upd.rowcount:
                         continue
                     if _needs_terminal_reply(row):
-                        rep = _build_reply_payload(row, status="exec_uncertain", text=err_text)
-                        rep_deadline = compute_deadline(kind=rep["kind"], base_ts=ts)
+                        orig_k = "rpc" if str(row["kind"] or "task").strip().lower() == "rpc" else "task"
+                        rep_deadline = compute_deadline(kind=orig_k, base_ts=ts)
+                        rep = _build_reply_payload(
+                            row,
+                            status="exec_uncertain",
+                            text=err_text,
+                            deadline=rep_deadline,
+                        )
                         conn.execute(
                             """
                             INSERT OR IGNORE INTO outbox (id, payload, created, deadline, acked_hubs, state)
@@ -886,10 +1117,13 @@ class NodeJournal:
         clean_url = str(url or "").strip()
         if not clean_url:
             return None
+        canon_url = canonical_hub_url(clean_url)
+        candidates = [clean_url] if canon_url == clean_url else [clean_url, canon_url]
+        placeholders = ",".join("?" for _ in candidates)
         with self._lock:
             row = self._conn.execute(
-                "SELECT hub_id FROM hub_endpoints WHERE url = ?",
-                (clean_url,),
+                f"SELECT hub_id FROM hub_endpoints WHERE url IN ({placeholders}) ORDER BY updated_at DESC LIMIT 1",
+                tuple(candidates),
             ).fetchone()
             return str(row["hub_id"]) if row is not None and row["hub_id"] else None
 
@@ -898,24 +1132,62 @@ class NodeJournal:
         clean_id = str(hub_id or "").strip()
         if not clean_url or not clean_id:
             return
+        canon_url = canonical_hub_url(clean_url)
+        urls_to_save = [clean_url] if (not canon_url or canon_url == clean_url) else [clean_url, canon_url]
         now = time.time()
 
         def _op() -> None:
             with self._immediate_tx() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO hub_endpoints (url, hub_id, updated_at)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(url) DO UPDATE SET
-                        hub_id = excluded.hub_id,
-                        updated_at = excluded.updated_at
-                    """,
-                    (clean_url, clean_id, now),
-                )
+                for u in urls_to_save:
+                    conn.execute(
+                        """
+                        INSERT INTO hub_endpoints (url, hub_id, updated_at)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(url) DO UPDATE SET
+                            hub_id = excluded.hub_id,
+                            updated_at = excluded.updated_at
+                        """,
+                        (u, clean_id, now),
+                    )
 
         _with_sqlite_retry(_op)
 
-    def get_cursor(self, hub_key: str, *, label: str = "main", fallback_seq: int = 0) -> int:
+    def clear_hub_id(self, url: str) -> None:
+        clean_url = str(url or "").strip()
+        if not clean_url:
+            return
+        canon_url = canonical_hub_url(clean_url)
+        urls_to_del = [clean_url] if (not canon_url or canon_url == clean_url) else [clean_url, canon_url]
+
+        def _op() -> None:
+            with self._immediate_tx() as conn:
+                for u in urls_to_del:
+                    conn.execute("DELETE FROM hub_endpoints WHERE url = ?", (u,))
+
+        _with_sqlite_retry(_op)
+
+    def has_any_cursor(self, *, label: str = "main") -> bool:
+        clean_label = str(label or "main").strip() or "main"
+        with self._lock:
+            if clean_label == "main":
+                row = self._conn.execute(
+                    "SELECT 1 FROM cursors WHERE instr(hub_key, '#') = 0 LIMIT 1"
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT 1 FROM cursors WHERE hub_key LIKE ? LIMIT 1",
+                    (f"%#{clean_label}",),
+                ).fetchone()
+            return row is not None
+
+    def get_cursor(
+        self,
+        hub_key: str,
+        *,
+        label: str = "main",
+        fallback_seq: int = 0,
+        use_fallback_when_missing: bool = False,
+    ) -> int:
         scoped_key = cursor_hub_key(hub_key, label=label)
         clean_label = str(label or "main").strip() or "main"
         with self._lock:
@@ -925,6 +1197,8 @@ class NodeJournal:
             ).fetchone()
             if row is not None:
                 return int(row["seq"] or 0)
+            if use_fallback_when_missing:
+                return max(0, int(fallback_seq))
             # Only seed from legacy `cursor-<label>` on first upgrade when no journal cursor
             # exists yet for this label; any subsequent new hub_key/hub_id starts at since=0 (H10).
             if clean_label == "main":

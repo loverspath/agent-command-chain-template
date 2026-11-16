@@ -349,6 +349,7 @@ class BusHub:
             return {
                 "ok": True,
                 "duplicate": True,
+                "hub_id": self.hub_id,
                 "ack": mid,
                 "seq": msg["seq"],
                 "corr_id": msg.get("corr_id"),
@@ -374,6 +375,7 @@ class BusHub:
         return {
             "ok": True,
             "duplicate": False,
+            "hub_id": self.hub_id,
             "ack": mid,
             "seq": msg["seq"],
             "corr_id": msg.get("corr_id"),

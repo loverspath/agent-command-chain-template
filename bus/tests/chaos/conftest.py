@@ -166,13 +166,19 @@ class NodeRunner:
     def start(
         self,
         *,
-        url: str,
+        url: str | None = None,
         label: str = "main",
         mode: str = "hybrid",
         peers: str = "cat-food",
         cwd: pathlib.Path | None = None,
         cfg_dir_override: pathlib.Path | None = None,
+        dial_timeout: float | None = None,
+        hello_timeout: float | None = None,
+        banner_timeout: float | None = None,
+        ack_timeout: float | None = None,
     ) -> asyncio.Task[None]:
+        if cfg_dir_override is not None:
+            cfg_dir_override.mkdir(parents=True, exist_ok=True)
         args = argparse.Namespace(
             cmd="run",
             label=label,
@@ -180,23 +186,18 @@ class NodeRunner:
             peers=peers,
             url=url,
             cwd=str(cwd or self.default_cwd),
+            config_dir=str(cfg_dir_override) if cfg_dir_override is not None else None,
+            dial_timeout=dial_timeout,
+            hello_timeout=hello_timeout,
+            banner_timeout=banner_timeout,
+            ack_timeout=ack_timeout,
             no_auto_update=True,
         )
-        prev_cfg = os.environ.get("BUS_CONFIG_DIR")
-        if cfg_dir_override is not None:
-            cfg_dir_override.mkdir(parents=True, exist_ok=True)
-            os.environ["BUS_CONFIG_DIR"] = str(cfg_dir_override)
 
         async def _entry() -> None:
             await bus_client.run_node(args)
 
-        try:
-            task = self.loop.create_task(_entry())
-        finally:
-            if cfg_dir_override is not None and prev_cfg is not None:
-                # Wait one tick in caller so `run_node` captures `cdir = cfg_dir()` on entry if needed,
-                # or caller keeps BUS_CONFIG_DIR when running single node.
-                pass
+        task = self.loop.create_task(_entry())
         self._tasks.append(task)
         return task
 

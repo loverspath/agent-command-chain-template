@@ -2,8 +2,8 @@
 
 Each test reproduces Sol's adversarial counterexample while asserting the **v2 target
 acceptance criteria** (`design.md` §2, §6, §7).
-Current WBS status after `I2`:
-- `R05` -> `strict xfail` (resolved in `I3`: client dual-home + multi-hub ACK outbox retention)
+Current WBS status after `I3` (`0` remaining `xfail`s):
+- `R05` -> **PASSING** in `I3` (client dual-home + all-hub storage ACK outbox retention)
 - `R07` -> **PASSING** in `I2` (hub/store independent RPC result upsert + external query)
 - `R08` -> **PASSING** in `I1` (node durable inbox journal + monotonic cursor watermark)
 - `R16` -> **PASSING** in `I1` (node durable inbox/execution deduplication across reconnects)
@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import pathlib
+import shutil
 import time
 import urllib.error
 import urllib.request
@@ -91,11 +92,6 @@ def _signed_http_json(
 
 
 @pytest.mark.chaos
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="R05: 허브A 단독 저장ACK 직후 발신 outbox 비움으로 빈 허브B 복구 불가 — 후속 I3(듀얼홈·전 허브 저장ACK 보존)에서 해소",
-)
 async def test_r05_acked_outbox_cleared_before_hub_b_loses_message(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -110,6 +106,8 @@ async def test_r05_acked_outbox_cleared_before_hub_b_loses_message(
     ACKs, so when Hub A dies permanently (`SIGKILL` + DB loss) and empty Hub B starts, sender
     republishes `r05-msg-1` to Hub B and receiver executes it (`loss == 0`).
     """
+    from agent_bus.journal import NodeJournal
+
     hub_a = hub_factory.start_hub_a(port=HUB_A_PORT, local_node="cat-food")
     hub_b_url = f"ws://127.0.0.1:{HUB_B_PORT}"
 
@@ -118,10 +116,13 @@ async def test_r05_acked_outbox_cleared_before_hub_b_loses_message(
     sender_cfg.mkdir(parents=True, exist_ok=True)
     receiver_cfg.mkdir(parents=True, exist_ok=True)
 
-    # Configure dual-home URLs on sender (`url` for legacy + `urls` / `BUS_URLS` for v2 I3).
+    # Configure dual-home URLs on sender & receiver (`urls` + `BUS_URLS` for v2 I3).
     monkeypatch.setenv("BUS_CONFIG_DIR", str(sender_cfg))
     monkeypatch.setenv("BUS_URLS", f"{hub_a.ws_url},{hub_b_url}")
     bus_config.save_config({"url": hub_a.ws_url, "urls": [hub_a.ws_url, hub_b_url]})
+    monkeypatch.setenv("BUS_CONFIG_DIR", str(receiver_cfg))
+    bus_config.save_config({"url": hub_a.ws_url, "urls": [hub_a.ws_url, hub_b_url]})
+    monkeypatch.setenv("BUS_CONFIG_DIR", str(sender_cfg))
 
     req_id = "r05-msg-1"
     payload = {
@@ -140,8 +141,11 @@ async def test_r05_acked_outbox_cleared_before_hub_b_loses_message(
 
     # Step 1: Receiver `cat-food/rx` and Hub B are offline. Sender flushes outbox to Hub A.
     async with websockets.connect(hub_a.ws_url) as tx_ws:
-        await tx_ws.send(json.dumps(bus_client.build_ws_hello("cli-tx", 10**9, accept_inbox=False)))
-        await asyncio.wait_for(tx_ws.recv(), 2.0)  # banner
+        await tx_ws.send(json.dumps(bus_client.build_ws_hello("cli-tx", 10**9, accept_inbox=False, no_replay=True)))
+        banner_a = json.loads(await asyncio.wait_for(tx_ws.recv(), 2.0))
+        if banner_a.get("hub_id"):
+            with NodeJournal(sender_cfg) as j_init:
+                j_init.remember_hub_id(hub_a.ws_url, str(banner_a["hub_id"]))
 
         ack_events: dict[str, asyncio.Event] = {}
 
@@ -162,18 +166,30 @@ async def test_r05_acked_outbox_cleared_before_hub_b_loses_message(
             await asyncio.gather(ack_task, return_exceptions=True)
 
     hub_a_snapshot = hub_a.inspect_db(consumer="cat-food/rx")
+    assert [m["id"] for m in hub_a_snapshot["messages"]] == [req_id]
     outbox_after_hub_a_ack = bus_client.load_outbox(sender_cfg)
+    assert [m["id"] for m in outbox_after_hub_a_ack] == [req_id], (
+        "Outbox must stay pending after Hub A ACK while Hub B has not ACKed yet"
+    )
 
-    # Step 2: Hub A crashes catastrophically (SIGKILL) before receiver ever connects.
+    # Step 2: Hub A crashes catastrophically (SIGKILL) + Hub A DB is permanently wiped!
     hub_a.sigkill()
+    shutil.rmtree(hub_a.data_dir)
+    assert not hub_a.db_path.exists()
 
-    # Step 3: Empty-DB Hub B comes online. Sender daemon + Receiver connect to Hub B.
+    # Step 3: Empty-DB Hub B comes online. Dual-home sender + receiver daemons run with `urls=[A, B]`.
     hub_b = hub_factory.start_hub_b(port=HUB_B_PORT, local_node="cat-food")
-    bus_config.save_config({"url": hub_b.ws_url, "urls": [hub_a.ws_url, hub_b.ws_url]})
+    monkeypatch.setenv("BUS_URLS", f"{hub_a.ws_url},{hub_b.ws_url}")
+    monkeypatch.setenv("BUS_CONFIG_DIR", str(sender_cfg))
+    bus_config.save_config({"url": hub_a.ws_url, "urls": [hub_a.ws_url, hub_b.ws_url]})
+    monkeypatch.setenv("BUS_CONFIG_DIR", str(receiver_cfg))
+    bus_config.save_config({"url": hub_a.ws_url, "urls": [hub_a.ws_url, hub_b.ws_url]})
 
     barrier_id = "r05-hub-b-barrier"
     async with websockets.connect(hub_b.ws_url) as probe_ws:
-        await probe_ws.send(json.dumps({"v": 2, "label": "cli-probe", "since": 10**9, "accept_inbox": False}))
+        await probe_ws.send(
+            json.dumps({"v": 2, "label": "cli-probe", "since": 10**9, "accept_inbox": False, "no_replay": True})
+        )
         await asyncio.wait_for(probe_ws.recv(), 4.0)
 
         async def _peers_on_hub_b() -> set[str]:
@@ -187,17 +203,30 @@ async def test_r05_acked_outbox_cleared_before_hub_b_loses_message(
         async def _both_daemons_online() -> bool:
             return {"cat-food/txdaemon", "cat-food/rx"}.issubset(await _peers_on_hub_b())
 
-        # Start sender node daemon (so outbox pump flushes any retained items to Hub B)
-        monkeypatch.setenv("BUS_CONFIG_DIR", str(sender_cfg))
-        tx_daemon = node_runner.start(url=hub_b.ws_url, label="txdaemon", mode="watch", peers="cat-food")
+        # Start dual-home sender daemon (`url=None` -> resolves `BUS_URLS` `[hub_a, hub_b]`)
+        tx_daemon = node_runner.start(
+            url=None,
+            label="txdaemon",
+            mode="watch",
+            peers="cat-food",
+            cfg_dir_override=sender_cfg,
+        )
         await _wait_until(_tx_online, timeout=8.0)
 
-        # Start receiver worker `cat-food/rx` on Hub B
-        monkeypatch.setenv("BUS_CONFIG_DIR", str(receiver_cfg))
-        rx_daemon = node_runner.start(url=hub_b.ws_url, label="rx", mode="hybrid", peers="cat-food")
+        # Start dual-home receiver worker `cat-food/rx` (`url=None` -> `[hub_a, hub_b]`)
+        rx_daemon = node_runner.start(
+            url=None,
+            label="rx",
+            mode="hybrid",
+            peers="cat-food",
+            cfg_dir_override=receiver_cfg,
+        )
         await _wait_until(_both_daemons_online, timeout=8.0)
 
-        await asyncio.sleep(0.1)  # allow txdaemon outbox pump to flush any retained entries
+        await _wait_until(
+            lambda: any(m["id"] == req_id for m in hub_b.inspect_db(consumer="cat-food/rx")["messages"]),
+            timeout=6.0,
+        )
         hub_b_before_barrier = hub_b.inspect_db(consumer="cat-food/rx")
 
         await probe_ws.send(
@@ -214,7 +243,12 @@ async def test_r05_acked_outbox_cleared_before_hub_b_loses_message(
         )
         await _recv_hub_ack(probe_ws, barrier_id, timeout=5.0)
 
+    await _wait_until(lambda: oracle.counter.count(req_id) == 1, timeout=8.0)
     await _wait_until(lambda: oracle.counter.count(barrier_id) == 1, timeout=8.0)
+
+    with NodeJournal(sender_cfg) as j_end:
+        final_row = j_end.get_outbox_row(req_id)
+        assert final_row is not None and final_row["state"] == "done"
 
     await node_runner.stop_task(tx_daemon)
     await node_runner.stop_task(rx_daemon)
@@ -226,7 +260,7 @@ async def test_r05_acked_outbox_cleared_before_hub_b_loses_message(
     # so Hub B received it and `cat-food/rx` executed `r05-msg-1` exactly once (loss == 0).
     assert executed_count == 1, (
         f"R05 message loss reproduced: Hub A stored {len(hub_a_snapshot['messages'])} msg(s) and ACKed, "
-        f"sender_outbox_after_hub_a_ack={outbox_after_hub_a_ack} (prematurely emptied before Hub B ACK), "
+        f"sender_outbox_after_hub_a_ack={outbox_after_hub_a_ack}, "
         f"hub_b_republished_ids={hub_b_req_ids} (missing {req_id!r}), "
         f"receiver_executed_count={executed_count} (expected 1)"
     )
