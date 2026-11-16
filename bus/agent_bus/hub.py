@@ -6,6 +6,7 @@ import asyncio
 import collections
 import dataclasses
 import json
+import os
 import pathlib
 import sys
 import time
@@ -131,6 +132,12 @@ class BusHub:
                 return True
         return False
 
+    def _effective_rate_per_min(self) -> int:
+        raw = os.environ.get("BUS_TEST_RATE_PER_MIN")
+        if raw is not None and raw.strip() != "":
+            return int(raw.strip())
+        return RATE_PER_MIN
+
     def _check_rate_and_limits(
         self,
         *,
@@ -141,7 +148,7 @@ class BusHub:
         now = time.time()
         window = [t for t in self.rate[node] if now - t < 60.0]
         self.rate[node] = window
-        if len(window) >= RATE_PER_MIN:
+        if len(window) >= self._effective_rate_per_min():
             return "rate"
         if len(text) > MAX_TEXT:
             return "size"

@@ -11,6 +11,7 @@ from typing import Any
 from .auth import create_token, load_tokens, revoke_token
 from .bridge import ack_inbox, read_inbox
 from .client import (
+    drain_outbox,
     oneshot,
     run_doctor,
     run_node,
@@ -19,6 +20,7 @@ from .client import (
 )
 from .config import cfg_dir, load_config, save_config
 from .hub import serve_all
+from .journal import NodeJournal
 
 
 def _cmd_init(a: argparse.Namespace) -> int:
@@ -92,6 +94,53 @@ def _cmd_token(a: argparse.Namespace) -> int:
         ok = revoke_token(cdir, a.token_id)
         print("revoked" if ok else "not found")
         return 0 if ok else 1
+    return 1
+
+
+def _cmd_journal(a: argparse.Namespace) -> int:
+    cdir = cfg_dir()
+    if a.jcmd == "status":
+        with NodeJournal(cdir) as journal:
+            summary = journal.status_summary()
+        if getattr(a, "json", False):
+            print(json.dumps(summary, indent=2, ensure_ascii=False))
+            return 0
+        ob = summary["outbox"]
+        ib = summary["inbox"]
+        unc = summary["uncertain_items"]
+        print(f"journal_db={summary['db_path']}")
+        print(f"outbox: pending={ob['pending']} done={ob['done']} expired={ob['expired']}")
+        print(
+            f"inbox: queued={ib['queued']} skipped={ib['skipped']} running={ib['running']} "
+            f"done={ib['done']} uncertain={ib['uncertain']} expired={ib['expired']}"
+        )
+        if not unc:
+            print("uncertain (0): none")
+        else:
+            print(f"uncertain ({len(unc)}):")
+            for item in unc:
+                print(
+                    f"  - id={item['id']} from={item['from']} "
+                    f"corr_id={item.get('corr_id') or ''} updated_at={item['updated_at']:.3f}"
+                )
+        return 0
+
+    if a.jcmd == "drain":
+        res = asyncio.run(
+            drain_outbox(
+                config_dir=cdir,
+                url=getattr(a, "url", None),
+                timeout=float(getattr(a, "timeout", 30.0)),
+            )
+        )
+        if getattr(a, "json", False):
+            print(json.dumps(res, indent=2, ensure_ascii=False))
+        else:
+            print(
+                f"drained={res['drained']} expired={res['expired']} remaining={res['remaining']}"
+            )
+        return 0 if res.get("ok") else 1
+
     return 1
 
 
@@ -175,6 +224,15 @@ def main(argv: list[str] | None = None) -> None:
     tr = tok_sp.add_parser("revoke")
     tr.add_argument("token_id")
 
+    jrn_p = sp.add_parser("journal", help="Inspect or drain local SQLite node journal (journal.db)")
+    jrn_sp = jrn_p.add_subparsers(dest="jcmd", required=True)
+    js_p = jrn_sp.add_parser("status", help="Show outbox/inbox counts and uncertain executions")
+    js_p.add_argument("--json", action="store_true")
+    jd_p = jrn_sp.add_parser("drain", help="Drain pending outbox items to hub")
+    jd_p.add_argument("--url", default=None)
+    jd_p.add_argument("--timeout", type=float, default=30.0)
+    jd_p.add_argument("--json", action="store_true")
+
     sp.add_parser("update", help="Pull latest repo commits via git pull --ff-only")
 
     a = p.parse_args(argv)
@@ -190,6 +248,8 @@ def main(argv: list[str] | None = None) -> None:
             sys.exit(_cmd_ack(a))
         elif a.cmd == "token":
             sys.exit(_cmd_token(a))
+        elif a.cmd == "journal":
+            sys.exit(_cmd_journal(a))
         elif a.cmd == "update":
             changed = update_repo()
             print("updated" if changed else "already up to date")

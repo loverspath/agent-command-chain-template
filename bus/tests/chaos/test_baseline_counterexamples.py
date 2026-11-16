@@ -1,13 +1,12 @@
-"""Baseline counterexample tests (`R05`, `R07`, `R08`, `R16`) for `abus` resilience v2 (I0).
+"""Baseline counterexample tests (`R05`, `R07`, `R08`, `R16`) for `abus` resilience v2.
 
-Each test reproduces Sol's adversarial counterexample on the current baseline codebase
-while asserting the **v2 target acceptance criteria** (`design.md` §2, §6, §7).
-All 4 tests are marked `@pytest.mark.xfail(strict=True, ...)` in I0 and will transition
-to passing as their corresponding WBS milestones (`I1`, `I2`, `I3`) land:
-- `R05` -> resolved in `I3` (client dual-home + multi-hub ACK outbox retention)
-- `R07` -> resolved in `I2` (hub/store independent RPC result upsert + external query)
-- `R08` -> resolved in `I1` (node durable inbox journal + contiguous cursor watermark)
-- `R16` -> resolved in `I1` (node durable inbox/execution deduplication across reconnects)
+Each test reproduces Sol's adversarial counterexample while asserting the **v2 target
+acceptance criteria** (`design.md` §2, §6, §7).
+Current WBS status after `I1`:
+- `R05` -> `strict xfail` (resolved in `I3`: client dual-home + multi-hub ACK outbox retention)
+- `R07` -> `strict xfail` (resolved in `I2`: hub/store independent RPC result upsert + external query)
+- `R08` -> **PASSING** in `I1` (node durable inbox journal + monotonic cursor watermark)
+- `R16` -> **PASSING** in `I1` (node durable inbox/execution deduplication across reconnects)
 """
 
 from __future__ import annotations
@@ -349,11 +348,6 @@ async def test_r07_reply_first_on_hub_b_sticks_pending_and_ext_403(
 
 
 @pytest.mark.chaos
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="R08: 높은 seq 커서 선행 저장이 미실행 낮은 seq 작업을 암묵 ACK 처리하여 유실 — 후속 I1(노드 저널·연속 커서 watermark)에서 해소",
-)
 async def test_r08_higher_seq_cursor_implicitly_acks_unexecuted_lower_seq(
     sandbox_env: dict[str, pathlib.Path],
     hub_factory: HubController,
@@ -494,11 +488,6 @@ async def test_r08_higher_seq_cursor_implicitly_acks_unexecuted_lower_seq(
 
 
 @pytest.mark.chaos
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="R16: 실행 중 WS 단절·재접속 시 reclaim_on_reconnect 재전달로 동일 요청 2회 실행 — 후속 I1(노드 수신·실행 저널 중복제거)에서 해소",
-)
 async def test_r16_reconnect_reclaim_causes_duplicate_execution(
     hub_factory: HubController,
     proxy_factory: ProxyController,
@@ -565,10 +554,18 @@ async def test_r16_reconnect_reclaim_causes_duplicate_execution(
         severed = await proxy.cut()
         assert severed >= 1
 
-        # Wait until `run_node` reconnects and Hub A re-leases `seq=1` (`attempts >= 2`)
-        def _reclaimed_on_reconnect() -> bool:
+        # Wait until `run_node` reconnects after `proxy.cut()`:
+        # - On pre-I1 baseline, Hub A re-leases `seq=1` (`attempts >= 2`).
+        # - On v2 I1 (G3 inbox-commit-then-ACK), `seq=1` was already ACKed on disk commit
+        #   before `proxy.cut()`, so `run_node` opens session #2 (`proxy.accepted_count >= 2`)
+        #   and re-registers `cat-food/main` without duplicate replay.
+        async def _reclaimed_on_reconnect() -> bool:
             dels = hub_a.inspect_db(consumer="cat-food/main")["deliveries"]
-            return bool(dels and int(dels[0]["attempts"]) >= 2)
+            if dels and int(dels[0]["attempts"]) >= 2:
+                return True
+            if proxy.accepted_count >= 2 and dels and dels[0]["state"] == "acked":
+                return await _worker_online()
+            return False
 
         await _wait_until(_reclaimed_on_reconnect, timeout=4.0)
 

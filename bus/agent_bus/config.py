@@ -19,6 +19,8 @@ RATE_PER_MIN = 20
 QUEUE_TTL = 86400
 LEASE_TTL = 330
 MAX_DELIVERY_ATTEMPTS = 3
+DEFAULT_TASK_DEADLINE = 3600
+DEFAULT_EVENT_DEADLINE = 86400
 
 ALIASES = {
     "pc": "cat-food",
@@ -53,6 +55,14 @@ def home_dir() -> pathlib.Path:
 def cfg_dir() -> pathlib.Path:
     raw = os.environ.get("BUS_CONFIG_DIR")
     return pathlib.Path(raw).expanduser() if raw else (home_dir() / ".config" / "agent-bus")
+
+
+get_config_dir = cfg_dir
+
+
+def journal_db_path(config_dir: pathlib.Path | None = None) -> pathlib.Path:
+    base = pathlib.Path(config_dir).expanduser() if config_dir is not None else cfg_dir()
+    return base / "journal.db"
 
 
 def data_dir() -> pathlib.Path:
