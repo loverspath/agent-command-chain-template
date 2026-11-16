@@ -1311,9 +1311,14 @@ async def test_periodic_prune_expired_and_ws_http_health_metrics(
         assert abs(float(h_http0["wall_clock"]) - time.time()) < 5.0
         assert float(h_http0["uptime_s"]) >= 0.0
         assert h_http0["uptime"] == h_http0["uptime_s"]
-        assert h_http0["auth_generation"] is None
-        assert h_http0["auth_age_s"] is None
-        assert h_http0["auth"] == {"generation": None, "age_s": None}
+        assert h_http0["auth_mode"] == "source"
+        assert isinstance(h_http0["auth_generation"], int) and h_http0["auth_generation"] >= 1
+        assert isinstance(h_http0["auth_age_s"], (int, float)) and float(h_http0["auth_age_s"]) >= 0.0
+        assert h_http0["auth"] == {
+            "mode": "source",
+            "generation": h_http0["auth_generation"],
+            "age_s": h_http0["auth_age_s"],
+        }
         # Ensure no sensitive fields are exposed on unauthenticated health
         for forbidden_key in ("tokens", "secret", "allow", "peers"):
             assert forbidden_key not in h_http0
@@ -1327,6 +1332,9 @@ async def test_periodic_prune_expired_and_ws_http_health_metrics(
             assert h_ws0["op"] == "health"
             assert h_ws0["hub_id"] == h.hub_id
             assert h_ws0["oldest_pending_age"] is None
+            assert h_ws0["auth_mode"] == "source"
+            assert h_ws0["auth_generation"] == h_http0["auth_generation"]
+            assert isinstance(h_ws0["auth_age_s"], (int, float)) and float(h_ws0["auth_age_s"]) >= 0.0
 
         # (b) Enqueue 1 message to offline `mother-goose/main` -> `pending == 1`, `oldest_pending_age >= 0`
         t_msg = time.time() - 2.5

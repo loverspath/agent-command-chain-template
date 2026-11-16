@@ -8,7 +8,7 @@ import json
 import sys
 from typing import Any
 
-from .auth import create_token, load_tokens, revoke_token
+from .auth import ReplicaReadOnlyError, create_token, load_tokens, revoke_token
 from .bridge import ack_inbox, read_inbox
 from .client import (
     drain_outbox,
@@ -18,7 +18,7 @@ from .client import (
     run_supervise,
     update_repo,
 )
-from .config import cfg_dir, load_config, parse_url_list, save_config
+from .config import cfg_dir, load_config, parse_peer_list, parse_url_list, save_config
 from .hub import serve_all
 from .journal import NodeJournal
 
@@ -41,6 +41,14 @@ def _cmd_init(a: argparse.Namespace) -> int:
         cfg["peers"] = a.peers
     if a.acc_repo:
         cfg["acc_repo"] = a.acc_repo
+    if getattr(a, "auth_source", None) is not None:
+        cfg["auth_source"] = a.auth_source
+    if getattr(a, "hub_peers", None):
+        cfg["hub_peers"] = parse_peer_list(a.hub_peers)
+    if getattr(a, "auth_sync_interval", None) is not None:
+        cfg["auth_sync_interval"] = float(a.auth_sync_interval)
+    if getattr(a, "auth_max_stale", None) is not None:
+        cfg["auth_max_stale"] = float(a.auth_max_stale)
     path = save_config(cfg)
     redacted = {k: ("***" if k == "secret" and v else v) for k, v in cfg.items()}
     print(f"saved config to {path}: {json.dumps(redacted, ensure_ascii=False)}")
@@ -69,35 +77,39 @@ def _cmd_ack(a: argparse.Namespace) -> int:
 
 def _cmd_token(a: argparse.Namespace) -> int:
     cdir = cfg_dir()
-    if a.tcmd == "create":
-        scopes = a.scope if a.scope else None
-        entry = create_token(cdir, a.node, scopes=scopes, allow_exec=bool(a.allow_exec))
-        if a.json:
-            print(json.dumps(entry, indent=2, ensure_ascii=False))
-        else:
-            print(f"token_id={entry['id']}")
-            print(f"secret={entry['secret']}")
-            print(f"node={entry['node']}")
-            print(f"scopes={entry['scopes']}")
-            print(f"allow_exec={entry['allow_exec']}")
-        return 0
-    if a.tcmd == "list":
-        toks = load_tokens(cdir)
-        out = [
-            {
-                "id": k,
-                "node": v.get("node"),
-                "scopes": v.get("scopes"),
-                "allow_exec": v.get("allow_exec", False),
-            }
-            for k, v in toks.items()
-        ]
-        print(json.dumps(out, indent=2, ensure_ascii=False))
-        return 0
-    if a.tcmd == "revoke":
-        ok = revoke_token(cdir, a.token_id)
-        print("revoked" if ok else "not found")
-        return 0 if ok else 1
+    try:
+        if a.tcmd == "create":
+            scopes = a.scope if a.scope else None
+            entry = create_token(cdir, a.node, scopes=scopes, allow_exec=bool(a.allow_exec))
+            if a.json:
+                print(json.dumps(entry, indent=2, ensure_ascii=False))
+            else:
+                print(f"token_id={entry['id']}")
+                print(f"secret={entry['secret']}")
+                print(f"node={entry['node']}")
+                print(f"scopes={entry['scopes']}")
+                print(f"allow_exec={entry['allow_exec']}")
+            return 0
+        if a.tcmd == "list":
+            toks = load_tokens(cdir)
+            out = [
+                {
+                    "id": k,
+                    "node": v.get("node"),
+                    "scopes": v.get("scopes"),
+                    "allow_exec": v.get("allow_exec", False),
+                }
+                for k, v in toks.items()
+            ]
+            print(json.dumps(out, indent=2, ensure_ascii=False))
+            return 0
+        if a.tcmd == "revoke":
+            ok = revoke_token(cdir, a.token_id)
+            print("revoked" if ok else "not found")
+            return 0 if ok else 1
+    except ReplicaReadOnlyError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return 1
     return 1
 
 
@@ -180,6 +192,10 @@ def main(argv: list[str] | None = None) -> None:
     init_p.add_argument("--label", default=None)
     init_p.add_argument("--peers", default=None)
     init_p.add_argument("--acc-repo", default=None)
+    init_p.add_argument("--auth-source", default=None, help="Source hub WS URL for replica mode")
+    init_p.add_argument("--hub-peers", default=None, help="Comma-separated peer node names for auth_sync")
+    init_p.add_argument("--auth-sync-interval", type=float, default=None)
+    init_p.add_argument("--auth-max-stale", type=float, default=None)
 
     send_p = sp.add_parser("send", help="Send a sync RPC or async task/event")
     send_p.add_argument("--to", required=True)
@@ -235,6 +251,10 @@ def main(argv: list[str] | None = None) -> None:
     hub_p.add_argument("--port", type=int, default=None)
     hub_p.add_argument("--gateway-host", default=None)
     hub_p.add_argument("--gateway-port", type=int, default=None)
+    hub_p.add_argument("--auth-source", default=None)
+    hub_p.add_argument("--hub-peers", default=None)
+    hub_p.add_argument("--auth-sync-interval", type=float, default=None)
+    hub_p.add_argument("--auth-max-stale", type=float, default=None)
 
     doc_p = sp.add_parser("doctor", help="Diagnose bus connectivity, cursors, and auth")
     doc_p.add_argument("--json", action="store_true")
@@ -297,6 +317,10 @@ def main(argv: list[str] | None = None) -> None:
                     port=a.port,
                     gateway_host=a.gateway_host,
                     gateway_port=a.gateway_port,
+                    auth_source=a.auth_source,
+                    hub_peers=a.hub_peers,
+                    auth_sync_interval=a.auth_sync_interval,
+                    auth_max_stale=a.auth_max_stale,
                 )
             )
         elif a.cmd == "run":

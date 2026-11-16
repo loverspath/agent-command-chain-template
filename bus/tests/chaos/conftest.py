@@ -100,11 +100,17 @@ def sandbox_env(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> Iter
     monkeypatch.delenv("BUS_AUTH_SECRET", raising=False)
     monkeypatch.delenv("BUS_URL", raising=False)
     monkeypatch.delenv("BUS_URLS", raising=False)
+    monkeypatch.delenv("BUS_AUTH_SOURCE", raising=False)
+    monkeypatch.delenv("BUS_HUB_PEERS", raising=False)
+    monkeypatch.delenv("BUS_AUTH_SYNC_INTERVAL", raising=False)
+    monkeypatch.delenv("BUS_AUTH_MAX_STALE", raising=False)
+    monkeypatch.delenv("BUS_TEST_CRASH_BEFORE_AUTH_POINTER", raising=False)
 
     # Layer 1 in-process guard: fail closed if `oracle` fixture was not installed.
     monkeypatch.setattr(bus_client, "ask_claude", _blocked_ask_claude)
     monkeypatch.setattr(bus_client, "update_repo", lambda: False)
     bus_auth.clear_whois_cache()
+    bus_auth.set_auth_pointer_crash_hook(None)
 
     try:
         yield {
@@ -116,6 +122,7 @@ def sandbox_env(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> Iter
             "guard_claude": guard_claude,
         }
     finally:
+        bus_auth.set_auth_pointer_crash_hook(None)
         bus_auth.clear_whois_cache()
 
 

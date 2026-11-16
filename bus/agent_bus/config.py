@@ -27,6 +27,9 @@ DEFAULT_HELLO_TIMEOUT = 5.0
 DEFAULT_BANNER_TIMEOUT = 10.0
 DEFAULT_ACK_TIMEOUT = 10.0
 MAX_RECONNECT_BACKOFF = 30.0
+DEFAULT_AUTH_SYNC_INTERVAL = 60.0
+DEFAULT_AUTH_MAX_STALE = 86400.0
+DEFAULT_AUTH_WATCH_INTERVAL = 0.25
 HUB_CAPS: tuple[str, ...] = ("v2", "journal", "rkind", "no_replay", "deadline")
 
 ALIASES = {
@@ -132,8 +135,32 @@ def parse_url_list(raw: Any) -> list[str]:
     return out
 
 
-def save_config(cfg: dict[str, Any]) -> pathlib.Path:
-    p = config_file_path()
+def parse_peer_list(raw: Any) -> list[str]:
+    """Parse a comma-separated peer name string or iterable into an ordered lowercased list."""
+    if raw is None:
+        return []
+    tokens: list[str] = []
+    if isinstance(raw, str):
+        tokens.extend(raw.split(","))
+    elif isinstance(raw, (list, tuple, set, frozenset)):
+        for item in raw:
+            if item is None:
+                continue
+            tokens.extend(str(item).split(","))
+    else:
+        tokens.extend(str(raw).split(","))
+    seen: set[str] = set()
+    out: list[str] = []
+    for tok in tokens:
+        clean = tok.strip().lower()
+        if clean and clean not in seen:
+            seen.add(clean)
+            out.append(clean)
+    return out
+
+
+def save_config(cfg: dict[str, Any], config_dir: pathlib.Path | None = None) -> pathlib.Path:
+    p = config_file_path(config_dir)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     try:
@@ -286,3 +313,95 @@ def get_auth_credentials(cfg: dict[str, Any] | None = None) -> tuple[str, str]:
     token_id = os.environ.get("BUS_AUTH_TOKEN") or str(cfg.get("token_id") or "")
     secret = os.environ.get("BUS_AUTH_SECRET") or str(cfg.get("secret") or "")
     return token_id, secret
+
+
+def get_hub_peers(
+    cfg: dict[str, Any] | None = None,
+    *,
+    config_dir: pathlib.Path | None = None,
+    explicit: Any = None,
+) -> set[str]:
+    """Resolve allowed replica peer node names for `op: 'auth_sync'` on a source hub."""
+    if explicit is not None:
+        return set(parse_peer_list(explicit))
+    eff_cfg = cfg if cfg is not None else load_config(config_dir)
+    if config_dir is not None and "hub_peers" in eff_cfg:
+        return set(parse_peer_list(eff_cfg.get("hub_peers")))
+    raw_env = os.environ.get("BUS_HUB_PEERS")
+    if raw_env is not None and raw_env.strip() != "":
+        return set(parse_peer_list(raw_env))
+    return set(parse_peer_list(eff_cfg.get("hub_peers")))
+
+
+def get_auth_source(
+    cfg: dict[str, Any] | None = None,
+    *,
+    config_dir: pathlib.Path | None = None,
+    explicit: str | None = None,
+) -> str:
+    """Resolve source hub WS URL for replica mode (`''` means source/authoritative mode)."""
+    if explicit is not None:
+        return str(explicit).strip()
+    eff_cfg = cfg if cfg is not None else load_config(config_dir)
+    if "auth_source" in eff_cfg:
+        return str(eff_cfg.get("auth_source") or "").strip()
+    raw_env = os.environ.get("BUS_AUTH_SOURCE")
+    if raw_env is not None and raw_env.strip() != "":
+        return raw_env.strip()
+    return ""
+
+
+def get_auth_sync_interval(
+    explicit: float | None = None,
+    cfg: dict[str, Any] | None = None,
+    *,
+    config_dir: pathlib.Path | None = None,
+) -> float:
+    """Resolve replica `auth_sync` pull interval in seconds (default 60s)."""
+    if explicit is not None:
+        return max(0.02, float(explicit))
+    for env_key in ("BUS_AUTH_SYNC_INTERVAL", "BUS_AUTH_SYNC_INTERVAL_SEC"):
+        raw = os.environ.get(env_key)
+        if raw is not None and raw.strip() != "":
+            return max(0.02, float(raw.strip()))
+    eff_cfg = cfg if cfg is not None else load_config(config_dir)
+    if eff_cfg.get("auth_sync_interval") is not None:
+        return max(0.02, float(eff_cfg["auth_sync_interval"]))
+    return float(DEFAULT_AUTH_SYNC_INTERVAL)
+
+
+def get_auth_max_stale(
+    explicit: float | None = None,
+    cfg: dict[str, Any] | None = None,
+    *,
+    config_dir: pathlib.Path | None = None,
+) -> float:
+    """Resolve replica maximum staleness in seconds for `ext` auth (default 86400s)."""
+    if explicit is not None:
+        return max(0.0, float(explicit))
+    for env_key in ("BUS_AUTH_MAX_STALE", "BUS_AUTH_MAX_STALE_SEC"):
+        raw = os.environ.get(env_key)
+        if raw is not None and raw.strip() != "":
+            return max(0.0, float(raw.strip()))
+    eff_cfg = cfg if cfg is not None else load_config(config_dir)
+    if eff_cfg.get("auth_max_stale") is not None:
+        return max(0.0, float(eff_cfg["auth_max_stale"]))
+    return float(DEFAULT_AUTH_MAX_STALE)
+
+
+def get_auth_watch_interval(
+    explicit: float | None = None,
+    cfg: dict[str, Any] | None = None,
+    *,
+    config_dir: pathlib.Path | None = None,
+) -> float:
+    """Resolve source hub local `allow.txt`/`tokens.json` change check interval (default 0.25s)."""
+    if explicit is not None:
+        return max(0.02, float(explicit))
+    raw = os.environ.get("BUS_AUTH_WATCH_INTERVAL")
+    if raw is not None and raw.strip() != "":
+        return max(0.02, float(raw.strip()))
+    eff_cfg = cfg if cfg is not None else load_config(config_dir)
+    if eff_cfg.get("auth_watch_interval") is not None:
+        return max(0.02, float(eff_cfg["auth_watch_interval"]))
+    return float(DEFAULT_AUTH_WATCH_INTERVAL)

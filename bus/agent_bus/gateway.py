@@ -58,6 +58,9 @@ async def handle_gateway_http(
     path, params = _normalize_path(raw_path)
     method = method.upper()
 
+    if hub.auth_mode == "source" and hub.refresh_source_auth():
+        await hub.enforce_active_sessions()
+
     if method == "GET" and path == "/v1/health":
         return 200, hub.health_snapshot()
 
@@ -67,6 +70,8 @@ async def handle_gateway_http(
         raw_body=raw_body,
         store=hub.store,
         cfg_dir=hub.cfg_dir,
+        explicit_auth_source=hub.auth_source,
+        auth_stale=hub.is_auth_stale(),
     )
     if not auth.ok:
         _log_http_auth_reject(remote_ip, path, auth)
@@ -257,6 +262,10 @@ async def _serve_ws_over_stream(
         try:
             proto.send_close(code, reason)
             await flush_writes()
+        except Exception:
+            pass
+        try:
+            msg_queue.put_nowait(None)
         except Exception:
             pass
         try:
