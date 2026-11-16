@@ -105,6 +105,7 @@ def sandbox_env(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> Iter
     monkeypatch.delenv("BUS_AUTH_SYNC_INTERVAL", raising=False)
     monkeypatch.delenv("BUS_AUTH_MAX_STALE", raising=False)
     monkeypatch.delenv("BUS_TEST_CRASH_BEFORE_AUTH_POINTER", raising=False)
+    monkeypatch.delenv("BUS_TEST_CLOCK_OFFSET_S", raising=False)
 
     # Layer 1 in-process guard: fail closed if `oracle` fixture was not installed.
     monkeypatch.setattr(bus_client, "ask_claude", _blocked_ask_claude)

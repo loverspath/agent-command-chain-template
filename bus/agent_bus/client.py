@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import logging.handlers
@@ -13,6 +14,7 @@ import pathlib
 import random
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -24,7 +26,7 @@ from typing import Any, Callable
 
 import websockets
 
-from .auth import build_hmac_headers
+from .auth import build_hmac_headers, get_test_local_node_header
 from .bridge import ack_inbox, deliver_to_inbox, read_inbox
 from .config import (
     FRAME,
@@ -135,6 +137,8 @@ def http_request_json(
     token_id, secret = get_auth_credentials()
     if token_id and secret:
         headers.update(build_hmac_headers(token_id, secret, raw_body))
+    else:
+        headers.update(get_test_local_node_header())
 
     req = urllib.request.Request(
         endpoint,
@@ -358,11 +362,36 @@ def _is_inbox_delivery(msg: dict[str, Any], my_label: str) -> tuple[bool, str]:
     return False, ""
 
 
+def _is_http_auth_error(code: int, data: dict[str, Any]) -> tuple[bool, str]:
+    err_str = str(data.get("error") or "").strip()
+    if code == 401 or (code == 403 and err_str == "invalid hmac signature"):
+        detail = err_str or f"http_{code}"
+        return True, f"auth_error(http_{code}): {detail}"
+    return False, err_str or str(code)
+
+
+def _extract_ws_auth_error(exc: BaseException) -> tuple[bool, str]:
+    if isinstance(exc, websockets.exceptions.ConnectionClosed):
+        rcvd = getattr(exc, "rcvd", None)
+        code = getattr(rcvd, "code", None)
+        reason = str(getattr(rcvd, "reason", "") or "").strip()
+        if code == 4003:
+            return True, f"auth_error(ws_4003): {reason or 'authentication rejected'}"
+    return False, ""
+
+
 def _is_permanent_http_reject(code: int, data: dict[str, Any]) -> tuple[bool, str]:
     err_str = str(data.get("error") or code)
     if err_str in _PERMANENT_REJECT_ERRORS or code in (400, 409, 413):
         return True, err_str
     return False, err_str
+
+
+_WS_HEADERS_KWARG: str = (
+    "additional_headers"
+    if "additional_headers" in inspect.signature(websockets.connect).parameters
+    else "extra_headers"
+)
 
 
 def _resolve_quorum_urls(config_dir: pathlib.Path, target_urls: list[str]) -> list[str]:
@@ -394,14 +423,18 @@ async def _open_ws_with_deadlines(
     banner_timeout: float,
 ) -> tuple[Any, dict[str, Any]]:
     """Connect WS (`dial_timeout`), send `hello` (`hello_timeout`), and read banner (`banner_timeout`)."""
+    connect_kw: dict[str, Any] = {
+        "open_timeout": dial_timeout,
+        "close_timeout": 2.0,
+        "ping_interval": 20,
+        "ping_timeout": 60,
+    }
+    if "auth" not in hello:
+        test_hdrs = get_test_local_node_header()
+        if test_hdrs:
+            connect_kw[_WS_HEADERS_KWARG] = test_hdrs
     ws = await asyncio.wait_for(
-        websockets.connect(
-            ws_url,
-            open_timeout=dial_timeout,
-            close_timeout=2.0,
-            ping_interval=20,
-            ping_timeout=60,
-        ),
+        websockets.connect(ws_url, **connect_kw),
         timeout=dial_timeout + 0.5,
     )
     try:
@@ -755,7 +788,18 @@ async def run_node(a: argparse.Namespace) -> None:
             try:
                 await asyncio.wait_for(ws.send(json.dumps(payload, ensure_ascii=False)), timeout=hello_timeout)
                 sys_frame = await asyncio.wait_for(fut, timeout=ack_timeout)
+            except asyncio.CancelledError:
+                raise
             except Exception:
+                # Hub failed to ACK within deadline (e.g., SIGSTOP freeze / H2 hang) or socket died:
+                # abort/close `ws` so `_run_hub_loop` exits `async for raw in ws:` and reconnects
+                # cleanly instead of leaving an open socket with a dead `_outbox_pump`.
+                with contextlib.suppress(Exception):
+                    transport = getattr(ws, "transport", None)
+                    if transport is not None:
+                        transport.abort()
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(ws.close(), timeout=0.3)
                 return "disconnected"
             finally:
                 inflight.pop(mid, None)
@@ -998,6 +1042,8 @@ async def run_node(a: argparse.Namespace) -> None:
                             fut = inflight.get(ack_id)
                             if fut is not None and not fut.done():
                                 fut.set_result(m)
+                            elif not m.get("error"):
+                                journal.mark_outbox_acked(ack_id, active_hub_key, required_hubs=quorum_urls)
                         elif m.get("error") and current_mid_slot:
                             cur_id = current_mid_slot[0]
                             fut = inflight.get(cur_id)
@@ -1183,10 +1229,18 @@ async def run_node(a: argparse.Namespace) -> None:
             except Exception as exc:
                 if getattr(exc, "_fatal_node_crash", False):
                     raise
-                print(
-                    f"[disconnected:{ws_url}: {type(exc).__name__}] retry in {delay:.1f}s",
-                    flush=True,
-                )
+                is_auth_err, auth_detail = _extract_ws_auth_error(exc)
+                if is_auth_err:
+                    print(
+                        f"[auth-error:{ws_url}: {auth_detail}] retry in {delay:.1f}s",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[disconnected:{ws_url}: {type(exc).__name__}] retry in {delay:.1f}s",
+                        flush=True,
+                    )
             finally:
                 h_state.pop("ws", None)
                 h_state.pop("send_lock", None)
@@ -1230,13 +1284,28 @@ async def run_node(a: argparse.Namespace) -> None:
         ht.add_done_callback(_on_child_done)
         hub_tasks.append(ht)
 
+    sigterm_stop_flag: list[bool] = [False]
+    sigterm_installed = False
+
+    def _on_sigterm() -> None:
+        sigterm_stop_flag[0] = True
+        _cancel_all_siblings(None)
+
+    with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+        loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
+        sigterm_installed = True
+
     try:
         await asyncio.gather(worker_task, *hub_tasks)
     except asyncio.CancelledError:
         if fatal_exc_slot[0] is not None:
             raise fatal_exc_slot[0]
-        raise
+        if not sigterm_stop_flag[0]:
+            raise
     finally:
+        if sigterm_installed:
+            with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+                loop.remove_signal_handler(signal.SIGTERM)
         for bt in list(bg_tasks):
             bt.cancel()
         for pt in list(pump_tasks):
@@ -1283,17 +1352,30 @@ async def oneshot(a: argparse.Namespace) -> int:
                     timeout=max(1.0, dial_t + banner_t),
                 )
                 if code >= 400 or not data.get("ok"):
+                    is_auth, auth_msg = _is_http_auth_error(code, data)
+                    if is_auth:
+                        err_exc = PermissionError(auth_msg)
+                        err_exc._is_bus_auth_error = True  # type: ignore[attr-defined]
+                        raise err_exc
                     raise RuntimeError(str(data.get("error") or code))
                 return [str(p) for p in (data.get("peers") or []) if str(p)]
             ws_url = to_ws_url(u)
             cli_label = f"cli-{uuid.uuid4().hex[:6]}"
-            ws, _banner = await _open_ws_with_deadlines(
-                ws_url,
-                build_ws_hello(cli_label, 10**9, accept_inbox=False, no_replay=True),
-                dial_timeout=dial_t,
-                hello_timeout=hello_t,
-                banner_timeout=banner_t,
-            )
+            try:
+                ws, _banner = await _open_ws_with_deadlines(
+                    ws_url,
+                    build_ws_hello(cli_label, 10**9, accept_inbox=False, no_replay=True),
+                    dial_timeout=dial_t,
+                    hello_timeout=hello_t,
+                    banner_timeout=banner_t,
+                )
+            except Exception as exc:
+                is_auth, auth_msg = _extract_ws_auth_error(exc)
+                if is_auth:
+                    err_exc = PermissionError(auth_msg)
+                    err_exc._is_bus_auth_error = True  # type: ignore[attr-defined]
+                    raise err_exc from exc
+                raise
             try:
                 await asyncio.wait_for(ws.send(json.dumps({"op": "peers"})), timeout=hello_t)
                 resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=ack_t))
@@ -1309,16 +1391,24 @@ async def oneshot(a: argparse.Namespace) -> int:
 
         outcomes = await asyncio.gather(*(_query_peers_one(u) for u in target_urls), return_exceptions=True)
         merged_peers: set[str] = set()
+        auth_errors: list[str] = []
         errors: list[str] = []
         any_ok = False
         for out in outcomes:
             if isinstance(out, BaseException):
-                errors.append(str(out))
+                if getattr(out, "_is_bus_auth_error", False):
+                    auth_errors.append(str(out))
+                else:
+                    errors.append(str(out))
             else:
                 any_ok = True
                 merged_peers.update(out)
         if not any_ok:
-            print(f"[error] {'; '.join(errors) or 'no reachable hub'}", file=sys.stderr)
+            if auth_errors and not errors:
+                print(f"[auth-error] {'; '.join(auth_errors)}", file=sys.stderr)
+                return 3
+            all_errs = [*auth_errors, *errors]
+            print(f"[error] {'; '.join(all_errs) or 'no reachable hub'}", file=sys.stderr)
             return 1
         print("peers=" + ",".join(sorted(merged_peers)))
         return 0
@@ -1341,6 +1431,9 @@ async def oneshot(a: argparse.Namespace) -> int:
                     timeout=max(1.0, dial_t + ack_t),
                 )
                 if code >= 400:
+                    is_auth, auth_msg = _is_http_auth_error(code, data)
+                    if is_auth:
+                        return ("auth_error", {"error": auth_msg, "code": code})
                     return ("http_error", {"error": data.get("error", code), "code": code})
                 if data.get("found"):
                     st = str(data.get("status") or "")
@@ -1351,13 +1444,19 @@ async def oneshot(a: argparse.Namespace) -> int:
 
             ws_url = to_ws_url(u)
             cli_label = f"cli-{uuid.uuid4().hex[:6]}"
-            ws, _banner = await _open_ws_with_deadlines(
-                ws_url,
-                build_ws_hello(cli_label, 10**9, accept_inbox=False, no_replay=True),
-                dial_timeout=dial_t,
-                hello_timeout=hello_t,
-                banner_timeout=banner_t,
-            )
+            try:
+                ws, _banner = await _open_ws_with_deadlines(
+                    ws_url,
+                    build_ws_hello(cli_label, 10**9, accept_inbox=False, no_replay=True),
+                    dial_timeout=dial_t,
+                    hello_timeout=hello_t,
+                    banner_timeout=banner_t,
+                )
+            except Exception as exc:
+                is_auth, auth_msg = _extract_ws_auth_error(exc)
+                if is_auth:
+                    return ("auth_error", {"error": auth_msg, "code": 4003})
+                raise
             try:
                 await asyncio.wait_for(
                     ws.send(json.dumps({"op": "rpc_result", "corr_id": cid})),
@@ -1382,6 +1481,8 @@ async def oneshot(a: argparse.Namespace) -> int:
         while True:
             tasks = {asyncio.create_task(_query_result_once(u)) for u in target_urls}
             terminal_hit: dict[str, Any] | None = None
+            iter_auth_errs: list[str] = []
+            iter_non_auth = False
             try:
                 pending_tasks = set(tasks)
                 while pending_tasks:
@@ -1393,11 +1494,17 @@ async def oneshot(a: argparse.Namespace) -> int:
                         try:
                             tag, payload = t.result()
                         except BaseException as exc:
+                            iter_non_auth = True
                             last_err = str(exc)
                             continue
                         if tag == "terminal":
                             terminal_hit = payload
                             break
+                        if tag == "auth_error":
+                            iter_auth_errs.append(str(payload.get("error") or "auth_error"))
+                            last_err = iter_auth_errs[-1]
+                            continue
+                        iter_non_auth = True
                         if tag == "pending":
                             saw_pending = payload
                         elif tag == "not_found":
@@ -1420,6 +1527,10 @@ async def oneshot(a: argparse.Namespace) -> int:
                     else f"[{terminal_hit.get('sender')}] ({terminal_hit.get('status')}) {terminal_hit.get('text')}"
                 )
                 return _exit_code_for_rpc_status(str(terminal_hit.get("status") or "ok"))
+
+            if iter_auth_errs and not iter_non_auth and saw_pending is None and not saw_not_found:
+                print(f"[auth-error] {'; '.join(iter_auth_errs)}", file=sys.stderr)
+                return 3
 
             if time.monotonic() >= deadline_mono:
                 if saw_pending is not None:
@@ -1534,6 +1645,9 @@ async def oneshot(a: argparse.Namespace) -> int:
                 if code >= 400 or not data.get("ok"):
                     if code == 429 or data.get("error") == "rate":
                         return ("rate", "rate")
+                    is_auth, auth_msg = _is_http_auth_error(code, data)
+                    if is_auth:
+                        return ("auth_error", auth_msg)
                     perm, err_str = _is_permanent_http_reject(code, data)
                     if perm:
                         with NodeJournal(cdir) as journal:
@@ -1598,6 +1712,9 @@ async def oneshot(a: argparse.Namespace) -> int:
                             journal.mark_outbox_acked(mid, hub_key, required_hubs=quorum_urls)
                         return ("acked", "")
             except Exception as exc:
+                is_auth, auth_msg = _extract_ws_auth_error(exc)
+                if is_auth:
+                    return ("auth_error", auth_msg)
                 return ("error", str(exc))
             finally:
                 if ws is not None:
@@ -1607,6 +1724,7 @@ async def oneshot(a: argparse.Namespace) -> int:
         results = await asyncio.gather(*(_send_no_wait_one(u) for u in target_urls))
         acked_cnt = sum(1 for st, _ in results if st == "acked")
         rejected_errs = [msg for st, msg in results if st == "rejected"]
+        auth_errs = [msg for st, msg in results if st == "auth_error" and msg]
         other_errs = [msg for st, msg in results if st in ("rate", "error") and msg]
 
         if acked_cnt >= 1 and not rejected_errs:
@@ -1616,7 +1734,10 @@ async def oneshot(a: argparse.Namespace) -> int:
             return 1
         if acked_cnt >= 1:
             return 0
-        err_summary = "; ".join(other_errs) or "send failed"
+        if auth_errs and not other_errs:
+            print(f"[auth-error] {'; '.join(auth_errs)}", file=sys.stderr)
+            return 3
+        err_summary = "; ".join([*auth_errs, *other_errs]) or "send failed"
         if getattr(a, "offline_queue", False):
             print(f"[queued-offline] id={mid} err={err_summary}", file=sys.stderr)
             return 0
@@ -1631,6 +1752,7 @@ async def oneshot(a: argparse.Namespace) -> int:
     terminal_fut: asyncio.Future[tuple[str, str, str]] = loop.create_future()
     acked_hubs_count = [0]
     rejected_errors: list[str] = []
+    auth_errors_wait: list[str] = []
     transient_errors: list[str] = []
 
     def _extend_wait_on_progress() -> None:
@@ -1652,6 +1774,10 @@ async def oneshot(a: argparse.Namespace) -> int:
                 if code >= 400 or not data.get("ok"):
                     if code == 429 or data.get("error") == "rate":
                         transient_errors.append("rate")
+                        return
+                    is_auth, auth_msg = _is_http_auth_error(code, data)
+                    if is_auth:
+                        auth_errors_wait.append(auth_msg)
                         return
                     perm, err_str = _is_permanent_http_reject(code, data)
                     if perm:
@@ -1809,7 +1935,11 @@ async def oneshot(a: argparse.Namespace) -> int:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            transient_errors.append(str(exc))
+            is_auth, auth_msg = _extract_ws_auth_error(exc)
+            if is_auth:
+                auth_errors_wait.append(auth_msg)
+            else:
+                transient_errors.append(str(exc))
         finally:
             send_phase_done.set()
             if ws is not None:
@@ -1850,7 +1980,10 @@ async def oneshot(a: argparse.Namespace) -> int:
         print(f"[error] {rejected_errors[0]}", file=sys.stderr)
         return 1
     if acked_hubs_count[0] == 0:
-        err_msg = "; ".join(transient_errors) or "no reachable hub"
+        if auth_errors_wait and not transient_errors:
+            print(f"[auth-error] {'; '.join(auth_errors_wait)}", file=sys.stderr)
+            return 3
+        err_msg = "; ".join([*auth_errors_wait, *transient_errors]) or "no reachable hub"
         if getattr(a, "offline_queue", False):
             print(f"[queued-offline] id={mid} err={err_msg}", file=sys.stderr)
             return 0

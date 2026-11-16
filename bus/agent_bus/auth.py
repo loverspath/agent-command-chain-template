@@ -960,6 +960,34 @@ def revoke_token(
         return changed
 
 
+def _test_clock_offset_seconds() -> float:
+    raw = os.environ.get("BUS_TEST_CLOCK_OFFSET_S")
+    if raw is None or not raw.strip():
+        return 0.0
+    try:
+        val = float(raw.strip())
+    except ValueError:
+        return 0.0
+    return val if math.isfinite(val) else 0.0
+
+
+def _sanitize_test_local_node(raw: str | None) -> str:
+    if not raw:
+        return ""
+    cleaned = "".join(c for c in raw.strip().lower() if c.isalnum() or c in "-_")[:64]
+    return cleaned
+
+
+def get_test_local_node_header() -> dict[str, str]:
+    """Return `{'X-Bus-Test-Local-Node': <node>}` strictly when `BUS_TEST_ALLOW_LOCALHOST=1`."""
+    if os.environ.get("BUS_TEST_ALLOW_LOCALHOST") != "1":
+        return {}
+    node = _sanitize_test_local_node(os.environ.get("BUS_TEST_LOCAL_NODE"))
+    if not node:
+        return {}
+    return {"X-Bus-Test-Local-Node": node}
+
+
 def compute_hmac_signature(secret: str, ts: str | int, body: bytes | str, nonce: str = "") -> str:
     body_bytes = body.encode("utf-8") if isinstance(body, str) else body
     prefix = f"{ts}.{nonce}.".encode("utf-8") if nonce else f"{ts}.".encode("utf-8")
@@ -968,7 +996,7 @@ def compute_hmac_signature(secret: str, ts: str | int, body: bytes | str, nonce:
 
 
 def build_hmac_headers(token_id: str, secret: str, body: bytes | str = b"") -> dict[str, str]:
-    ts = str(int(time.time()))
+    ts = str(int(time.time() + _test_clock_offset_seconds()))
     nonce = secrets.token_hex(12)
     sig = compute_hmac_signature(secret, ts, body, nonce=nonce)
     return {
@@ -1128,7 +1156,12 @@ async def authenticate_ws_peer(
     # Note: Even when `auth_stale=True` on a replica, internal `whois` `allow` keeps the
     # last known good synced generation (`design.md` §3.4); unsynced initial replicas fail closed.
     if is_loopback_ip(remote_ip) and os.environ.get("BUS_TEST_ALLOW_LOCALHOST") == "1":
-        node = os.environ.get("BUS_TEST_LOCAL_NODE") or _local_node_name()
+        hdr_node = _sanitize_test_local_node(h.get("x-bus-test-local-node"))
+        node = (
+            hdr_node
+            or _sanitize_test_local_node(os.environ.get("BUS_TEST_LOCAL_NODE"))
+            or _local_node_name()
+        )
     else:
         node = await whois_async(remote_ip)
 

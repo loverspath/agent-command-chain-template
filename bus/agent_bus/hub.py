@@ -6,6 +6,7 @@ import asyncio
 import collections
 import contextlib
 import dataclasses
+import inspect
 import json
 import math
 import os
@@ -27,6 +28,7 @@ from .auth import (
     authenticate_ws_peer,
     build_auth_sync_manifest,
     check_external_send_permission,
+    get_test_local_node_header,
     is_loopback_ip,
     load_tokens,
     load_tombstones,
@@ -374,6 +376,14 @@ class BusHub:
             local_addr = self._resolve_auth_sync_local_addr(ws_url)
             if local_addr is not None:
                 connect_kw["local_addr"] = local_addr
+            test_hdrs = get_test_local_node_header()
+            if test_hdrs:
+                hdr_kw = (
+                    "additional_headers"
+                    if "additional_headers" in inspect.signature(websockets.connect).parameters
+                    else "extra_headers"
+                )
+                connect_kw[hdr_kw] = test_hdrs
 
             ws = await asyncio.wait_for(websockets.connect(ws_url, **connect_kw), timeout=dial_t + 1.0)
             try:

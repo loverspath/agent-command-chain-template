@@ -41,7 +41,23 @@ HUB_HOST = "127.0.0.1"
 HUB_A_PORT = 18765
 HUB_B_PORT = 18775
 FORBIDDEN_PORTS = frozenset({8765, 8766, 18769})
-_RESERVED_SANDBOX_PORTS = frozenset({HUB_A_PORT, HUB_B_PORT, 18785, 18786, 18799})
+_RESERVED_SANDBOX_PORTS = frozenset(
+    {
+        HUB_A_PORT,
+        18766,
+        HUB_B_PORT,
+        18776,
+        18785,
+        18786,
+        18787,
+        18788,
+        18789,
+        18790,
+        18791,
+        18792,
+        18799,
+    }
+)
 _RECENT_PICKED_PORTS: list[int] = []
 
 
