@@ -460,8 +460,12 @@ class AgentBusTests(unittest.TestCase):
 
                 worker_task = asyncio.create_task(mock_worker())
 
-                # Give worker a moment to register
-                await asyncio.sleep(0.1)
+                # Wait for worker to register deterministically
+                for _ in range(40):
+                    if "cat-food/main" in h.peers:
+                        break
+                    await asyncio.sleep(0.02)
+                self.assertIn("cat-food/main", h.peers)
 
                 # 2. Two concurrent internal WS RPC callers (no 4002 collision!)
                 async def rpc_call(idx: int) -> str:
@@ -718,10 +722,24 @@ class AgentBusTests(unittest.TestCase):
                     await asyncio.sleep(0.05)
                 self.assertIn("cat-food/main", h.peers)
 
+                caller_cfg = self.root / "caller_cfg"
+                caller_cfg.mkdir(parents=True, exist_ok=True)
+
+                async def _caller_oneshot(ns: argparse.Namespace) -> int:
+                    prev_cfg = os.environ.get("BUS_CONFIG_DIR")
+                    os.environ["BUS_CONFIG_DIR"] = str(caller_cfg)
+                    try:
+                        return await client.oneshot(ns)
+                    finally:
+                        if prev_cfg is None:
+                            os.environ.pop("BUS_CONFIG_DIR", None)
+                        else:
+                            os.environ["BUS_CONFIG_DIR"] = prev_cfg
+
                 # 1. Normal sync RPC
                 buf_ok = io.StringIO()
                 with contextlib.redirect_stdout(buf_ok):
-                    rc_ok = await client.oneshot(
+                    rc_ok = await _caller_oneshot(
                         argparse.Namespace(
                             cmd="send",
                             to="cat-food/main",
@@ -745,7 +763,7 @@ class AgentBusTests(unittest.TestCase):
                 # 2. Auth failure detection -> exit code 3
                 buf_auth = io.StringIO()
                 with contextlib.redirect_stdout(buf_auth):
-                    rc_auth = await client.oneshot(
+                    rc_auth = await _caller_oneshot(
                         argparse.Namespace(
                             cmd="send",
                             to="cat-food/main",
@@ -767,7 +785,7 @@ class AgentBusTests(unittest.TestCase):
                 # 3. Caller timeout (124) + late reply retrieval via `abus result`
                 err_slow = io.StringIO()
                 with contextlib.redirect_stderr(err_slow):
-                    rc_slow = await client.oneshot(
+                    rc_slow = await _caller_oneshot(
                         argparse.Namespace(
                             cmd="send",
                             to="cat-food/main",
@@ -803,7 +821,7 @@ class AgentBusTests(unittest.TestCase):
                 self.assertIn("SLOW_OK", res_obj["text"])
 
                 # 4. Event to cat-food/cattin01 -> ACC bridge event-emit.sh
-                rc_evt = await client.oneshot(
+                rc_evt = await _caller_oneshot(
                     argparse.Namespace(
                         cmd="send",
                         to="cat-food/cattin01",

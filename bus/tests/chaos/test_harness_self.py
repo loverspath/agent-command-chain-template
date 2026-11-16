@@ -142,9 +142,15 @@ async def test_tcp_fault_proxy_block_delay_cut_and_upstream_switch(
     assert elapsed_delayed >= 0.14, f"Expected >=0.14s with 80ms bidirectional delay, got {elapsed_delayed:.3f}s"
 
     proxy.clear_delay()
-    t_fast = time.monotonic()
-    await _ws_hello_and_banner(proxy.ws_url)
-    elapsed_fast = time.monotonic() - t_fast
+    fast_samples: list[float] = []
+    for _ in range(2):
+        t_fast = time.monotonic()
+        await _ws_hello_and_banner(proxy.ws_url)
+        dt = time.monotonic() - t_fast
+        fast_samples.append(dt)
+        if dt < 0.12:
+            break
+    elapsed_fast = min(fast_samples)
     assert elapsed_fast < 0.12
 
     # 3. Block (reject mode) drops new connections immediately

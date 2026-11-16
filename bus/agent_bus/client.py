@@ -61,8 +61,10 @@ _AUTH_ERR_PATTERNS = (
 
 _TERMINAL_ERROR_STATUSES = frozenset({"exec_error", "exec_uncertain", "expired"})
 
-# Optional chaos-test fault injection callback `(stage: str, row: dict[str, Any]) -> None`.
-_TEST_CRASH_HOOK: Callable[[str, dict[str, Any]], None] | None = None
+# Optional chaos-test fault injection callback `(stage: str, row: dict[str, Any]) -> Any`.
+# Returning `False` on `"before_claim"` or `"before_outbox_pump_send"` suppresses that
+# background poll tick; raising an exception with `_fatal_node_crash = True` halts sibling tasks.
+_TEST_CRASH_HOOK: Callable[[str, dict[str, Any]], Any] | None = None
 
 
 def is_http_url(url: str) -> bool:
@@ -545,6 +547,30 @@ async def run_node(a: argparse.Namespace) -> None:
     journal.recover_orphaned_running()
 
     ws_ref: dict[str, Any] = {"hub_key": url}
+    main_task = asyncio.current_task()
+    worker_task_ref: list[asyncio.Task[None] | None] = [None]
+    pump_task_ref: list[asyncio.Task[None] | None] = [None]
+    fatal_crash_flag: list[bool] = [False]
+
+    def _fire_test_crash_hook(stage: str, info: dict[str, Any]) -> Any:
+        hook = _TEST_CRASH_HOOK
+        if hook is None:
+            return None
+        try:
+            return hook(stage, info)
+        except BaseException as exc:
+            if getattr(exc, "_fatal_node_crash", False):
+                fatal_crash_flag[0] = True
+                cur = asyncio.current_task()
+                pt = pump_task_ref[0]
+                if pt is not None and pt is not cur and not pt.done():
+                    pt.cancel()
+                wt = worker_task_ref[0]
+                if wt is not None and wt is not cur and not wt.done():
+                    wt.cancel()
+                if main_task is not None and main_task is not cur and not main_task.done():
+                    main_task.cancel()
+            raise
 
     async def _transmit_outbox_item(mid: str, payload: dict[str, Any]) -> str:
         """Send 1 already-persisted outbox item on the active WS under FIFO lock.
@@ -607,7 +633,7 @@ async def run_node(a: argparse.Namespace) -> None:
         return False
 
     async def outbox_pump(ws_conn: Any) -> None:
-        while ws_ref.get("ws") is ws_conn:
+        while ws_ref.get("ws") is ws_conn and not fatal_crash_flag[0]:
             outbox_wakeup.clear()
             hub_key = str(ws_ref.get("hub_key") or url)
             pending = await loop.run_in_executor(
@@ -616,8 +642,10 @@ async def run_node(a: argparse.Namespace) -> None:
             )
             hit_backoff = False
             for item in pending:
-                if ws_ref.get("ws") is not ws_conn:
+                if ws_ref.get("ws") is not ws_conn or fatal_crash_flag[0]:
                     return
+                if _TEST_CRASH_HOOK is not None and _fire_test_crash_hook("before_outbox_pump_send", item) is False:
+                    continue
                 mid = str(item["id"])
                 res = await _transmit_outbox_item(mid, item)
                 if res == "disconnected":
@@ -634,7 +662,7 @@ async def run_node(a: argparse.Namespace) -> None:
                 pass
 
     async def worker() -> None:
-        while True:
+        while not fatal_crash_flag[0]:
             inbox_wakeup.clear()
 
             # 1. Transition any expired `queued` items (`now >= deadline`) -> `expired` + outbox reply.
@@ -644,7 +672,11 @@ async def run_node(a: argparse.Namespace) -> None:
 
             # 2. Claim 1 unexpired `queued` item atomically if this node label is an active worker.
             claimed: dict[str, Any] | None = None
-            if get_mode(a.mode) != "watch":
+            allow_claim = get_mode(a.mode) != "watch" and not fatal_crash_flag[0]
+            if allow_claim and _TEST_CRASH_HOOK is not None:
+                if _fire_test_crash_hook("before_claim", {"label": label}) is False:
+                    allow_claim = False
+            if allow_claim:
                 claimed = await loop.run_in_executor(
                     None,
                     lambda: journal.claim_next_queued(
@@ -680,7 +712,7 @@ async def run_node(a: argparse.Namespace) -> None:
                     )
 
             if _TEST_CRASH_HOOK is not None:
-                _TEST_CRASH_HOOK("after_claim_before_exec", claimed)
+                _fire_test_crash_hook("after_claim_before_exec", claimed)
 
             try:
                 ans, status = await loop.run_in_executor(
@@ -690,7 +722,7 @@ async def run_node(a: argparse.Namespace) -> None:
                 ans, status = f"[agent error] {exc}", "exec_error"
 
             if _TEST_CRASH_HOOK is not None:
-                _TEST_CRASH_HOOK("after_exec_before_save", claimed)
+                _fire_test_crash_hook("after_exec_before_save", claimed)
 
             reply_payload = await loop.run_in_executor(
                 None,
@@ -702,13 +734,13 @@ async def run_node(a: argparse.Namespace) -> None:
             )
 
             if _TEST_CRASH_HOOK is not None:
-                _TEST_CRASH_HOOK("after_save_before_send", claimed)
+                _fire_test_crash_hook("after_save_before_send", claimed)
 
             if reply_payload is not None:
                 await send_or_outbox(ws_ref, reply_payload)
 
-    main_task = asyncio.current_task()
     worker_task = asyncio.create_task(worker())
+    worker_task_ref[0] = worker_task
 
     def _on_worker_done(t: asyncio.Task[None]) -> None:
         if t.cancelled():
@@ -779,6 +811,7 @@ async def run_node(a: argparse.Namespace) -> None:
                                 if pump_task is None:
                                     outbox_wakeup.set()
                                     pump_task = asyncio.create_task(outbox_pump(ws))
+                                    pump_task_ref[0] = pump_task
 
                             ack_id = str(m["ack"]) if m.get("ack") else ""
                             if ack_id:
@@ -948,7 +981,7 @@ async def run_node(a: argparse.Namespace) -> None:
                             inbox_wakeup.set()
 
                         if _TEST_CRASH_HOOK is not None and changed and eff_state == "queued":
-                            _TEST_CRASH_HOOK("after_inbox_ack_before_claim", {"id": mid, "seq": seq})
+                            _fire_test_crash_hook("after_inbox_ack_before_claim", {"id": mid, "seq": seq})
 
                         if is_replay and replay_count >= 500 and last_replay_seq > hello_since and last_replay_seq < banner_seq:
                             carry_live_seq = max_live_seq
@@ -981,6 +1014,7 @@ async def run_node(a: argparse.Namespace) -> None:
                         fut.set_exception(ConnectionError("websocket disconnected"))
                 inflight.clear()
                 if pump_task is not None:
+                    pump_task_ref[0] = None
                     pump_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await pump_task

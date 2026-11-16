@@ -41,6 +41,8 @@ HUB_HOST = "127.0.0.1"
 HUB_A_PORT = 18765
 HUB_B_PORT = 18775
 FORBIDDEN_PORTS = frozenset({8765, 8766, 18769})
+_RESERVED_SANDBOX_PORTS = frozenset({HUB_A_PORT, HUB_B_PORT, 18785, 18786, 18799})
+_RECENT_PICKED_PORTS: list[int] = []
 
 
 def validate_sandbox_port(port: int, *, allow_zero: bool = False) -> None:
@@ -53,11 +55,19 @@ def validate_sandbox_port(port: int, *, allow_zero: bool = False) -> None:
 
 
 def pick_free_port(host: str = HUB_HOST) -> int:
-    for _ in range(20):
+    for _ in range(60):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((host, 0))
             port = int(sock.getsockname()[1])
-        if port not in FORBIDDEN_PORTS:
+        if (
+            port not in FORBIDDEN_PORTS
+            and port not in _RESERVED_SANDBOX_PORTS
+            and port not in _RECENT_PICKED_PORTS
+        ):
+            _RECENT_PICKED_PORTS.append(port)
+            if len(_RECENT_PICKED_PORTS) > 64:
+                del _RECENT_PICKED_PORTS[:-64]
             return port
     raise RuntimeError("Could not allocate a free non-forbidden loopback port")
 
@@ -71,8 +81,20 @@ def is_port_listening(host: str, port: int, timeout: float = 0.15) -> bool:
         return sock.connect_ex((host, port)) == 0
 
 
-def assert_ports_free(ports: Iterable[int], context: str = "preflight", host: str = HUB_HOST) -> None:
-    busy = [p for p in ports if p > 0 and is_port_listening(host, p)]
+def assert_ports_free(
+    ports: Iterable[int],
+    context: str = "preflight",
+    host: str = HUB_HOST,
+    *,
+    wait_timeout: float = 0.8,
+) -> None:
+    port_list = [p for p in ports if p > 0]
+    deadline = time.monotonic() + max(0.0, wait_timeout)
+    while True:
+        busy = [p for p in port_list if is_port_listening(host, p, timeout=0.05)]
+        if not busy or time.monotonic() >= deadline:
+            break
+        time.sleep(0.02)
     if busy:
         raise RuntimeError(f"[{context}] Sandbox port(s) {busy} on {host} are already listening")
 

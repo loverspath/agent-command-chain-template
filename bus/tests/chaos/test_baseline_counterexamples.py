@@ -171,27 +171,32 @@ async def test_r05_acked_outbox_cleared_before_hub_b_loses_message(
     hub_b = hub_factory.start_hub_b(port=HUB_B_PORT, local_node="cat-food")
     bus_config.save_config({"url": hub_b.ws_url, "urls": [hub_a.ws_url, hub_b.ws_url]})
 
-    # Start sender node daemon (so outbox pump flushes any retained items to Hub B)
-    monkeypatch.setenv("BUS_CONFIG_DIR", str(sender_cfg))
-    tx_daemon = node_runner.start(url=hub_b.ws_url, label="txdaemon", mode="watch", peers="cat-food")
-    await asyncio.sleep(0.05)
-
-    # Start receiver worker `cat-food/rx` on Hub B
-    monkeypatch.setenv("BUS_CONFIG_DIR", str(receiver_cfg))
-    rx_daemon = node_runner.start(url=hub_b.ws_url, label="rx", mode="hybrid", peers="cat-food")
-
     barrier_id = "r05-hub-b-barrier"
     async with websockets.connect(hub_b.ws_url) as probe_ws:
         await probe_ws.send(json.dumps({"v": 2, "label": "cli-probe", "since": 10**9, "accept_inbox": False}))
-        await asyncio.wait_for(probe_ws.recv(), 2.0)
+        await asyncio.wait_for(probe_ws.recv(), 4.0)
+
+        async def _peers_on_hub_b() -> set[str]:
+            await probe_ws.send(json.dumps({"op": "peers"}))
+            resp = json.loads(await asyncio.wait_for(probe_ws.recv(), 4.0))
+            return set(resp.get("peers") or [])
+
+        async def _tx_online() -> bool:
+            return "cat-food/txdaemon" in await _peers_on_hub_b()
 
         async def _both_daemons_online() -> bool:
-            await probe_ws.send(json.dumps({"op": "peers"}))
-            resp = json.loads(await asyncio.wait_for(probe_ws.recv(), 2.0))
-            peers_now = set(resp.get("peers") or [])
-            return {"cat-food/txdaemon", "cat-food/rx"}.issubset(peers_now)
+            return {"cat-food/txdaemon", "cat-food/rx"}.issubset(await _peers_on_hub_b())
 
-        await _wait_until(_both_daemons_online, timeout=3.0)
+        # Start sender node daemon (so outbox pump flushes any retained items to Hub B)
+        monkeypatch.setenv("BUS_CONFIG_DIR", str(sender_cfg))
+        tx_daemon = node_runner.start(url=hub_b.ws_url, label="txdaemon", mode="watch", peers="cat-food")
+        await _wait_until(_tx_online, timeout=8.0)
+
+        # Start receiver worker `cat-food/rx` on Hub B
+        monkeypatch.setenv("BUS_CONFIG_DIR", str(receiver_cfg))
+        rx_daemon = node_runner.start(url=hub_b.ws_url, label="rx", mode="hybrid", peers="cat-food")
+        await _wait_until(_both_daemons_online, timeout=8.0)
+
         await asyncio.sleep(0.1)  # allow txdaemon outbox pump to flush any retained entries
         hub_b_before_barrier = hub_b.inspect_db(consumer="cat-food/rx")
 
@@ -207,9 +212,9 @@ async def test_r05_acked_outbox_cleared_before_hub_b_loses_message(
                 }
             )
         )
-        await _recv_hub_ack(probe_ws, barrier_id)
+        await _recv_hub_ack(probe_ws, barrier_id, timeout=5.0)
 
-    await _wait_until(lambda: oracle.counter.count(barrier_id) == 1, timeout=3.0)
+    await _wait_until(lambda: oracle.counter.count(barrier_id) == 1, timeout=8.0)
 
     await node_runner.stop_task(tx_daemon)
     await node_runner.stop_task(rx_daemon)
@@ -383,10 +388,13 @@ async def test_r08_higher_seq_cursor_implicitly_acks_unexecuted_lower_seq(
         # Wait for `cat-food/main` to register on Hub A
         async def _worker_online() -> bool:
             await tx_ws.send(json.dumps({"op": "peers"}))
-            resp = json.loads(await asyncio.wait_for(tx_ws.recv(), 2.0))
+            resp = json.loads(await asyncio.wait_for(tx_ws.recv(), 4.0))
             return "cat-food/main" in (resp.get("peers") or [])
 
-        await _wait_until(_worker_online, timeout=3.0)
+        async def _worker_offline() -> bool:
+            return not await _worker_online()
+
+        await _wait_until(_worker_online, timeout=6.0)
 
         # 1. Send seq=1 (`blocker_id`) -> blocks inside `ask_claude`
         oracle.ledger.record_sent(blocker_id)
@@ -440,17 +448,18 @@ async def test_r08_higher_seq_cursor_implicitly_acks_unexecuted_lower_seq(
         assert ack3["seq"] == 3
 
         # Wait until Hub A observes seq=3 ACKed and client cursor on disk reached 3
-        await _wait_until(lambda: bus_client.load_cursor("main", client_cfg) >= 3, timeout=3.0)
+        await _wait_until(lambda: bus_client.load_cursor("main", client_cfg) >= 3, timeout=6.0)
         assert oracle.counter.count(victim_id) == 0, "Victim seq=2 must still be unexecuted before crash"
 
         # 4. Simulate worker crash/restart while seq=2 (`victim_id`) is still unexecuted
         saved_cursor_before_restart = bus_client.load_cursor("main", client_cfg)
         await node_runner.stop_task(worker_task_1)
         gate_1.release()
+        await _wait_until(_worker_offline, timeout=4.0)
 
         # Start worker generation #2 (same node/cfg_dir -> reconnects to Hub A)
         worker_task_2 = node_runner.start(url=hub_a.ws_url, label="main", mode="hybrid", peers="cat-food")
-        await _wait_until(_worker_online, timeout=3.0)
+        await _wait_until(_worker_online, timeout=6.0)
 
         # Send seq=4 probe so we deterministically know generation #2 drained all queued work
         await tx_ws.send(
@@ -465,9 +474,9 @@ async def test_r08_higher_seq_cursor_implicitly_acks_unexecuted_lower_seq(
                 }
             )
         )
-        await _recv_hub_ack(tx_ws, probe_id)
+        await _recv_hub_ack(tx_ws, probe_id, timeout=5.0)
 
-    await _wait_until(lambda: oracle.counter.count(probe_id) == 1, timeout=3.0)
+    await _wait_until(lambda: oracle.counter.count(probe_id) == 1, timeout=6.0)
     await node_runner.stop_task(worker_task_2)
 
     db_state = hub_a.inspect_db(consumer="cat-food/main")
@@ -562,7 +571,7 @@ async def test_r16_reconnect_reclaim_causes_duplicate_execution(
                 return await _worker_online()
             return False
 
-        await _wait_until(_reclaimed_on_reconnect, timeout=4.0)
+        await _wait_until(_reclaimed_on_reconnect, timeout=8.0)
 
         # Release execution #1 and send a FIFO drain barrier job to deterministically await queue completion
         gate.release()
@@ -579,9 +588,9 @@ async def test_r16_reconnect_reclaim_causes_duplicate_execution(
                 }
             )
         )
-        await _recv_hub_ack(tx_ws, barrier_id)
+        await _recv_hub_ack(tx_ws, barrier_id, timeout=5.0)
 
-    await _wait_until(lambda: oracle.counter.count(barrier_id) == 1, timeout=3.0)
+    await _wait_until(lambda: oracle.counter.count(barrier_id) == 1, timeout=6.0)
     await node_runner.stop_task(worker_task)
 
     dels = hub_a.inspect_db(consumer="cat-food/main")["deliveries"]

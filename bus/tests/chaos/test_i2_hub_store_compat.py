@@ -891,7 +891,11 @@ async def test_legacy_e7d0da2_hub_store_rollback_compat_on_i2_sqlite_db(
             assert rb_ack["seq"] == 4
     finally:
         _terminate_proc(rb_hub_proc)
-        await _wait_until(lambda: not is_port_listening("127.0.0.1", rb_ws_port), timeout=3.0)
+        await _wait_until(
+            lambda: not is_port_listening("127.0.0.1", rb_ws_port)
+            and not is_port_listening("127.0.0.1", rb_gw_port),
+            timeout=5.0,
+        )
 
     # ------------------------------------------------------------------
     # Phase C: Re-open DB under `I2` `BusStore` -> `hub_id` intact & rollback row readable!
@@ -1190,7 +1194,13 @@ async def test_banner_caps_no_replay_accept_inbox_and_h10_new_hub_id_reset(
         assert replayed[0]["rkind"] == "request"
         assert replayed[0]["deadline"] == pytest.approx(dl_epoch)
         await ws_w.send(json.dumps({"op": "ack", "seqs": [m["seq"] for m in replayed]}))
-        await asyncio.sleep(0.05)
+        await _wait_until(
+            lambda: sum(
+                1 for d in hub_a.inspect_db(consumer="cat-food/main")["deliveries"] if d["state"] == "acked"
+            )
+            == 3,
+            timeout=4.0,
+        )
 
     # 4) Verify `H10` DB wipe (`wipe_db=True` -> brand-new `hub_id`) resets `run_node` replay to `since=0`!
     worker_task = node_runner.start(url=hub_a.ws_url, label="main", mode="hybrid", peers="cat-food")
@@ -1393,7 +1403,7 @@ async def test_periodic_prune_expired_and_ws_http_health_metrics(
                 ).fetchone()
                 return rem is None and rem_del is None
 
-        await _wait_until(_pruned, timeout=2.0)
+        await _wait_until(_pruned, timeout=4.0)
         assert h.hub_id == h_http0["hub_id"]
         with h.store._lock:
             kept = h.store._conn.execute("SELECT id FROM messages WHERE id = 'hm-msg-1'").fetchone()

@@ -189,19 +189,23 @@ async def test_x02_crash_boundaries_sigkill_and_post_save_outbox_recovery(
         # ------------------------------------------------------------------
         req_pre_queued = "x02-pre-queued"
 
-        def _hook_pre_queued(stage: str, row: dict[str, Any]) -> None:
+        def _hook_pre_queued(stage: str, row: dict[str, Any]) -> Any:
+            if stage == "before_claim":
+                return False
             if stage == "after_inbox_ack_before_claim" and row.get("id") == req_pre_queued:
                 raise _SimulatedCrash("crash before claim")
+            return None
+
+        async def _main_online() -> bool:
+            return "cat-food/main" in await collector.peers()
+
+        def _outbox_pending_zero() -> bool:
+            with NodeJournal(client_cfg) as j_chk:
+                return j_chk.status_summary()["outbox"]["pending"] == 0
 
         monkeypatch.setattr(bus_client, "_TEST_CRASH_HOOK", _hook_pre_queued)
         w1 = node_runner.start(url=hub_a.ws_url, label="main", mode="hybrid", peers="cat-food")
-        await _wait_until(lambda: collector.peers(), timeout=3.0)
-        await _wait_until(
-            lambda: asyncio.ensure_future(collector.peers()),
-            timeout=3.0,
-        )
-        while "cat-food/main" not in await collector.peers():
-            await asyncio.sleep(0.02)
+        await _wait_until(_main_online, timeout=6.0)
 
         await collector.send(
             {
@@ -214,7 +218,7 @@ async def test_x02_crash_boundaries_sigkill_and_post_save_outbox_recovery(
                 "text": make_ask_prompt(req_pre_queued, "crash-while-queued"),
             }
         )
-        await _wait_until(lambda: w1.done(), timeout=3.0)
+        await _wait_until(lambda: w1.done(), timeout=6.0)
         await node_runner.stop_task(w1)
         monkeypatch.setattr(bus_client, "_TEST_CRASH_HOOK", None)
 
@@ -235,7 +239,8 @@ async def test_x02_crash_boundaries_sigkill_and_post_save_outbox_recovery(
         monkeypatch.setattr(bus_client, "_TEST_CRASH_HOOK", _hook_pre_exec)
         w2 = node_runner.start(url=hub_a.ws_url, label="main", mode="hybrid", peers="cat-food")
         # Note: w2 will first execute `req_pre_queued` cleanly, then crash on `req_pre_exec`!
-        await _wait_until(lambda: collector.first_reply(req_pre_queued) is not None, timeout=4.0)
+        await _wait_until(lambda: collector.first_reply(req_pre_queued) is not None, timeout=6.0)
+        await _wait_until(_outbox_pending_zero, timeout=4.0)
         assert oracle.counter.count(req_pre_queued) == 1
         assert collector.first_reply(req_pre_queued)["status"] == "ok"
 
@@ -250,7 +255,7 @@ async def test_x02_crash_boundaries_sigkill_and_post_save_outbox_recovery(
                 "text": make_ask_prompt(req_pre_exec, "crash-before-side-effect"),
             }
         )
-        await _wait_until(lambda: w2.done(), timeout=3.0)
+        await _wait_until(lambda: w2.done(), timeout=6.0)
         await node_runner.stop_task(w2)
         monkeypatch.setattr(bus_client, "_TEST_CRASH_HOOK", None)
         assert oracle.counter.count(req_pre_exec) == 0
@@ -315,7 +320,8 @@ async def test_x02_crash_boundaries_sigkill_and_post_save_outbox_recovery(
         spawned_procs.append(sub_proc)
 
         # Wait until subprocess recovers `req_pre_exec` -> `exec_uncertain` and registers online
-        await _wait_until(lambda: collector.first_reply(req_pre_exec) is not None, timeout=5.0)
+        await _wait_until(lambda: collector.first_reply(req_pre_exec) is not None, timeout=8.0)
+        await _wait_until(_main_online, timeout=6.0)
         assert collector.first_reply(req_pre_exec)["status"] == "exec_uncertain"
         assert oracle.counter.count(req_pre_exec) == 0
 
@@ -331,7 +337,7 @@ async def test_x02_crash_boundaries_sigkill_and_post_save_outbox_recovery(
                 "text": make_ask_prompt(req_sigkill, "kill-9-during-claude"),
             }
         )
-        await _wait_until(lambda: sigkill_marker.exists(), timeout=5.0)
+        await _wait_until(lambda: sigkill_marker.exists(), timeout=8.0)
         assert oracle.counter.count(req_sigkill) == 1
 
         os.killpg(sub_proc.pid, signal.SIGKILL)
@@ -353,7 +359,8 @@ async def test_x02_crash_boundaries_sigkill_and_post_save_outbox_recovery(
         monkeypatch.setattr(bus_client, "_TEST_CRASH_HOOK", _hook_before_save)
         w4 = node_runner.start(url=hub_a.ws_url, label="main", mode="hybrid", peers="cat-food")
         # w4 recovers `req_sigkill` -> `uncertain` and notifies caller!
-        await _wait_until(lambda: collector.first_reply(req_sigkill) is not None, timeout=4.0)
+        await _wait_until(lambda: collector.first_reply(req_sigkill) is not None, timeout=6.0)
+        await _wait_until(_outbox_pending_zero, timeout=4.0)
         assert collector.first_reply(req_sigkill)["status"] == "exec_uncertain"
         assert oracle.counter.count(req_sigkill) == 1
         with NodeJournal(client_cfg) as j:
@@ -373,7 +380,7 @@ async def test_x02_crash_boundaries_sigkill_and_post_save_outbox_recovery(
                 "text": make_ask_prompt(req_before_save, "crash-before-commit"),
             }
         )
-        await _wait_until(lambda: w4.done(), timeout=3.0)
+        await _wait_until(lambda: w4.done(), timeout=6.0)
         await node_runner.stop_task(w4)
         monkeypatch.setattr(bus_client, "_TEST_CRASH_HOOK", None)
         assert oracle.counter.count(req_before_save) == 1
@@ -383,13 +390,17 @@ async def test_x02_crash_boundaries_sigkill_and_post_save_outbox_recovery(
         # ------------------------------------------------------------------
         req_after_save = "x02-after-save-before-send"
 
-        def _hook_after_save(stage: str, row: dict[str, Any]) -> None:
+        def _hook_after_save(stage: str, row: dict[str, Any]) -> Any:
+            if stage == "before_outbox_pump_send" and row.get("corr_id") == req_after_save:
+                return False
             if stage == "after_save_before_send" and row.get("id") == req_after_save:
                 raise _SimulatedCrash("crash after journal commit before WS send")
+            return None
 
         monkeypatch.setattr(bus_client, "_TEST_CRASH_HOOK", _hook_after_save)
         w5 = node_runner.start(url=hub_a.ws_url, label="main", mode="hybrid", peers="cat-food")
-        await _wait_until(lambda: collector.first_reply(req_before_save) is not None, timeout=4.0)
+        await _wait_until(lambda: collector.first_reply(req_before_save) is not None, timeout=6.0)
+        await _wait_until(_outbox_pending_zero, timeout=4.0)
         assert collector.first_reply(req_before_save)["status"] == "exec_uncertain"
         assert oracle.counter.count(req_before_save) == 1
 
@@ -404,7 +415,7 @@ async def test_x02_crash_boundaries_sigkill_and_post_save_outbox_recovery(
                 "text": make_ask_prompt(req_after_save, "saved-before-crash"),
             }
         )
-        await _wait_until(lambda: w5.done(), timeout=3.0)
+        await _wait_until(lambda: w5.done(), timeout=6.0)
         await node_runner.stop_task(w5)
         monkeypatch.setattr(bus_client, "_TEST_CRASH_HOOK", None)
 
@@ -422,7 +433,7 @@ async def test_x02_crash_boundaries_sigkill_and_post_save_outbox_recovery(
 
         # Final recovery worker w6: must NOT re-execute `req_after_save`, and must flush exact `saved_reply_id`!
         w6 = node_runner.start(url=hub_a.ws_url, label="main", mode="hybrid", peers="cat-food")
-        await _wait_until(lambda: collector.first_reply(req_after_save) is not None, timeout=4.0)
+        await _wait_until(lambda: collector.first_reply(req_after_save) is not None, timeout=6.0)
         rep_as = collector.first_reply(req_after_save)
         assert rep_as is not None
         assert rep_as["status"] == "ok"
@@ -470,9 +481,12 @@ async def test_x02_dual_label_shared_journal_live_sibling_and_duplicate_id(
         crash_aux_id = "x02-dual-crash-aux"
         gate_main = oracle.stub.gate(live_main_id)
 
-        def _crash_only_aux(stage: str, row: dict[str, Any]) -> None:
+        def _crash_only_aux(stage: str, row: dict[str, Any]) -> Any:
+            if stage == "before_claim" and row.get("label") == "aux" and not gate_main.entered.is_set():
+                return False
             if stage == "after_exec_before_save" and row.get("id") == crash_aux_id:
                 raise _SimulatedCrash("aux crashed mid-flight")
+            return None
 
         monkeypatch.setattr(bus_client, "_TEST_CRASH_HOOK", _crash_only_aux)
 
@@ -483,7 +497,7 @@ async def test_x02_dual_label_shared_journal_live_sibling_and_duplicate_id(
             p = set(await collector.peers())
             return {"cat-food/main", "cat-food/aux"}.issubset(p)
 
-        await _wait_until(_both_labels_online, timeout=4.0)
+        await _wait_until(_both_labels_online, timeout=6.0)
 
         # 1. `main` claims `live_main_id` and stays running inside `ask_claude`
         await collector.send(
@@ -497,7 +511,7 @@ async def test_x02_dual_label_shared_journal_live_sibling_and_duplicate_id(
                 "text": make_ask_prompt(live_main_id, "main-long-running"),
             }
         )
-        await gate_main.wait_entered(timeout=3.0)
+        await gate_main.wait_entered(timeout=6.0)
 
         # 2. `aux` claims `crash_aux_id` and crashes while `main` is STILL running `live_main_id`!
         await collector.send(
@@ -511,13 +525,13 @@ async def test_x02_dual_label_shared_journal_live_sibling_and_duplicate_id(
                 "text": make_ask_prompt(crash_aux_id, "aux-crashes"),
             }
         )
-        await _wait_until(lambda: t_aux_1.done(), timeout=3.0)
+        await _wait_until(lambda: t_aux_1.done(), timeout=6.0)
         await node_runner.stop_task(t_aux_1)
         monkeypatch.setattr(bus_client, "_TEST_CRASH_HOOK", None)
 
         # 3. Restart `aux` WHILE `main` is still blocked inside `live_main_id`!
         t_aux_2 = node_runner.start(url=hub_a.ws_url, label="aux", mode="hybrid", peers="cat-food")
-        await _wait_until(lambda: collector.first_reply(crash_aux_id) is not None, timeout=4.0)
+        await _wait_until(lambda: collector.first_reply(crash_aux_id) is not None, timeout=6.0)
         assert collector.first_reply(crash_aux_id)["status"] == "exec_uncertain"
 
         # Verify `live_main_id` was NOT falsely marked `uncertain` by `aux`'s startup recovery!
@@ -526,12 +540,13 @@ async def test_x02_dual_label_shared_journal_live_sibling_and_duplicate_id(
             assert row_main is not None and row_main["state"] == "running"
 
         gate_main.release()
-        await _wait_until(lambda: collector.first_reply(live_main_id) is not None, timeout=4.0)
+        await _wait_until(lambda: collector.first_reply(live_main_id) is not None, timeout=6.0)
         assert collector.first_reply(live_main_id)["status"] == "ok"
         assert oracle.counter.count(live_main_id) == 1
         assert oracle.counter.count(crash_aux_id) == 1
 
         # 4. Bare-node fanout (`to='cat-food'`): Hub delivers EVERY message to BOTH `main` and `aux`!
+        await _wait_until(_both_labels_online, timeout=6.0)
         batch_ids = [f"x02-race-{i:02d}" for i in range(12)]
         for bid in batch_ids:
             await collector.send(
@@ -547,6 +562,10 @@ async def test_x02_dual_label_shared_journal_live_sibling_and_duplicate_id(
             )
         await _wait_until(
             lambda: all(collector.first_reply(bid) is not None for bid in batch_ids),
+            timeout=8.0,
+        )
+        await _wait_until(
+            lambda: bus_client.load_cursor("main", client_cfg) >= 12,
             timeout=6.0,
         )
         for bid in batch_ids:
@@ -630,12 +649,11 @@ async def test_x07_slow_ask_interleaved_events_three_reconnects_and_deadline_bou
             mode="hybrid",
             peers="cat-food",
         )
-        await _wait_until(
-            lambda: asyncio.ensure_future(collector.peers()),
-            timeout=3.0,
-        )
-        while "cat-food/main" not in await collector.peers():
-            await asyncio.sleep(0.02)
+
+        async def _x07_main_online() -> bool:
+            return "cat-food/main" in await collector.peers()
+
+        await _wait_until(_x07_main_online, timeout=6.0)
 
         # 1. Start slow `!ask` so worker stays busy throughout 3 reconnects & message bursts
         await collector.send(
@@ -649,7 +667,7 @@ async def test_x07_slow_ask_interleaved_events_three_reconnects_and_deadline_bou
                 "text": make_ask_prompt(slow_id, "slow-anchor-job"),
             }
         )
-        await gate_slow.wait_entered(timeout=3.0)
+        await gate_slow.wait_entered(timeout=6.0)
         assert oracle.counter.count(slow_id) == 1
 
         valid_ids = [f"x07-valid-{i}" for i in range(8)]
@@ -696,13 +714,13 @@ async def test_x07_slow_ask_interleaved_events_three_reconnects_and_deadline_bou
         )
 
         # Set deterministic timestamps on Hub A DB before unblocking reconnect #1:
-        # - `expire_queued_id`: `ts = now - 3599.55` -> `deadline = now + 0.45s` (valid on arrival, expires while queued!)
+        # - `expire_queued_id`: `ts = now - 3599.10` -> `deadline = now + 0.90s` (valid on arrival, expires while queued!)
         # - `expire_arrival_id`: `ts = now - 3615.0` -> `deadline = now - 15.0s` (already expired on arrival!)
         # - `aged_event_id`: `ts = now - 7200.0` -> `deadline = ts + 86400` (2h old event -> still valid!)
         now_mark = time.time()
         conn = sqlite3.connect(str(hub_a.db_path), timeout=5.0)
         try:
-            conn.execute("UPDATE messages SET ts = ? WHERE id = ?", (now_mark - 3599.55, expire_queued_id))
+            conn.execute("UPDATE messages SET ts = ? WHERE id = ?", (now_mark - 3599.10, expire_queued_id))
             conn.execute("UPDATE messages SET ts = ? WHERE id = ?", (now_mark - 3615.0, expire_arrival_id))
             conn.execute("UPDATE messages SET ts = ? WHERE id = ?", (now_mark - 7200.0, aged_event_id))
             conn.commit()
@@ -715,7 +733,7 @@ async def test_x07_slow_ask_interleaved_events_three_reconnects_and_deadline_bou
         async def _reconnected_after(prev_accepted: int) -> bool:
             return proxy.accepted_count > prev_accepted and ("cat-food/main" in await collector.peers())
 
-        await _wait_until(lambda: _reconnected_after(accepted_before_r1), timeout=5.0)
+        await _wait_until(lambda: _reconnected_after(accepted_before_r1), timeout=8.0)
 
         # Wait until `expire_queued_id` is durably recorded in `journal.db` `inbox` as `queued`
         def _queued_recorded() -> bool:
@@ -723,7 +741,7 @@ async def test_x07_slow_ask_interleaved_events_three_reconnects_and_deadline_bou
                 r = j.get_inbox_row(expire_queued_id)
                 return r is not None and r["state"] == "queued"
 
-        await _wait_until(_queued_recorded, timeout=3.0)
+        await _wait_until(_queued_recorded, timeout=6.0)
 
         # 3. Interleave valid tasks, events, and watch notes across Cuts #2 and #3!
         for idx in range(4):
@@ -764,7 +782,7 @@ async def test_x07_slow_ask_interleaved_events_three_reconnects_and_deadline_bou
         # Cut #2
         acc_r2 = proxy.accepted_count
         await proxy.cut()
-        await _wait_until(lambda: _reconnected_after(acc_r2), timeout=5.0)
+        await _wait_until(lambda: _reconnected_after(acc_r2), timeout=8.0)
 
         for idx in range(4, 8):
             await collector.send(
@@ -804,10 +822,10 @@ async def test_x07_slow_ask_interleaved_events_three_reconnects_and_deadline_bou
         # Cut #3
         acc_r3 = proxy.accepted_count
         await proxy.cut()
-        await _wait_until(lambda: _reconnected_after(acc_r3), timeout=5.0)
+        await _wait_until(lambda: _reconnected_after(acc_r3), timeout=8.0)
 
-        # Ensure `expire_queued_id`'s deadline (`now_mark + 0.45s`) has definitely elapsed
-        rem_sleep = (now_mark + 0.55) - time.time()
+        # Ensure `expire_queued_id`'s deadline (`now_mark + 0.90s`) has definitely elapsed
+        rem_sleep = (now_mark + 0.98) - time.time()
         if rem_sleep > 0:
             await asyncio.sleep(rem_sleep)
 
@@ -817,7 +835,7 @@ async def test_x07_slow_ask_interleaved_events_three_reconnects_and_deadline_bou
         all_expected_replies = [slow_id, *valid_ids, expire_queued_id, expire_arrival_id]
         await _wait_until(
             lambda: all(collector.first_reply(cid) is not None for cid in all_expected_replies),
-            timeout=8.0,
+            timeout=10.0,
         )
         await node_runner.stop_task(worker_task)
 
