@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import contextlib
 import dataclasses
 import json
+import math
 import os
 import pathlib
 import sys
@@ -24,6 +26,8 @@ from .auth import (
 from .config import (
     ALIASES,
     BUS_RULES,
+    DEFAULT_PRUNE_INTERVAL,
+    HUB_CAPS,
     LEASE_TTL,
     MAX_HOP,
     MAX_TEXT,
@@ -38,7 +42,7 @@ from .config import (
     load_config,
     log_dir,
 )
-from .store import BusStore
+from .store import VALID_RKINDS, BusStore, IdConflictError
 
 
 @dataclasses.dataclass
@@ -74,18 +78,109 @@ class BusHub:
         config_dir: pathlib.Path | None = None,
         database_path: pathlib.Path | None = None,
         logs_dir: pathlib.Path | None = None,
+        prune_interval: float | None = None,
     ) -> None:
         self.cfg_dir = pathlib.Path(config_dir) if config_dir else cfg_dir()
         self.db_path = pathlib.Path(database_path) if database_path else db_path()
         self.logs_dir = pathlib.Path(logs_dir) if logs_dir else log_dir()
+        self.started_at = time.time()
+        self._started_mono = time.monotonic()
+        self.prune_interval = self._resolve_prune_interval(prune_interval)
+        self.prune_runs: int = 0
+        self.last_prune_at: float | None = None
+        self._prune_task: asyncio.Task[None] | None = None
+        # Auth generation / age placeholders (populated in WBS I4).
+        self.auth_generation: int | None = None
+        self.auth_synced_at: float | None = None
+
         self.store = BusStore(self.db_path)
         self.peers: dict[str, PeerConn] = {}
         self.rate: dict[str, list[float]] = collections.defaultdict(list)
         # Seed SQLite sequence & unexpired messages from legacy messages.jsonl on first upgrade.
         self.store.import_jsonl_if_empty(self.logs_dir / "messages.jsonl", ttl=QUEUE_TTL)
 
+    @property
+    def hub_id(self) -> str:
+        return self.store.hub_id
+
+    @staticmethod
+    def _resolve_prune_interval(explicit: float | None) -> float:
+        if explicit is not None:
+            return max(0.01, float(explicit))
+        raw = os.environ.get("BUS_PRUNE_INTERVAL_SEC")
+        if raw is not None and raw.strip() != "":
+            return max(0.01, float(raw.strip()))
+        return float(DEFAULT_PRUNE_INTERVAL)
+
+    def start_prune_task(self, interval: float | None = None) -> asyncio.Task[None]:
+        """Start periodic background task invoking `store.prune_expired()` (default 600s)."""
+        if self._prune_task is not None and not self._prune_task.done():
+            return self._prune_task
+        eff_interval = max(0.01, float(interval)) if interval is not None else self.prune_interval
+
+        async def _prune_loop() -> None:
+            try:
+                while True:
+                    await asyncio.sleep(eff_interval)
+                    self.store.prune_expired()
+                    self.prune_runs += 1
+                    self.last_prune_at = time.time()
+            except asyncio.CancelledError:
+                raise
+
+        self._prune_task = asyncio.create_task(_prune_loop(), name="abus-hub-prune")
+        return self._prune_task
+
+    async def stop_prune_task(self) -> None:
+        task = self._prune_task
+        self._prune_task = None
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+
     def close(self) -> None:
+        if self._prune_task is not None and not self._prune_task.done():
+            self._prune_task.cancel()
+        self._prune_task = None
         self.store.close()
+
+    def health_snapshot(self, now: float | None = None) -> dict[str, Any]:
+        """Return unauthenticated hub & queue health metrics (`GET /v1/health`, WS `op='health'`)."""
+        wall_now = float(now) if now is not None else time.time()
+        uptime_s = round(max(0.0, time.monotonic() - self._started_mono), 3)
+        q = self.store.get_queue_metrics(now=wall_now)
+        auth_age_s = (
+            round(max(0.0, wall_now - self.auth_synced_at), 3)
+            if self.auth_synced_at is not None
+            else None
+        )
+        return {
+            "ok": True,
+            "hub_id": self.hub_id,
+            "seq": q["max_seq"],
+            "max_seq": q["max_seq"],
+            "pending": q["pending"],
+            "leased": q["leased"],
+            "oldest_pending_age": q["oldest_pending_age"],
+            "dead": q["dead"],
+            "queue": {
+                "pending": q["pending"],
+                "leased": q["leased"],
+                "oldest_pending_age": q["oldest_pending_age"],
+                "dead": q["dead"],
+            },
+            "wall_clock": wall_now,
+            "uptime_s": uptime_s,
+            "uptime": uptime_s,
+            "auth_generation": self.auth_generation,
+            "auth_age_s": auth_age_s,
+            "auth": {
+                "generation": self.auth_generation,
+                "age_s": auth_age_s,
+            },
+        }
 
     def append_audit_log(self, msg: dict[str, Any]) -> None:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
@@ -107,8 +202,16 @@ class BusHub:
                 return True
             corr_id = msg.get("corr_id")
             if corr_id:
-                orig_node = self.store.get_message_sender_node(corr_id)
-                if orig_node == peer.node:
+                orig_node = self.store.get_message_sender_node(str(corr_id))
+                if orig_node is not None:
+                    return orig_node == peer.node
+                rk = msg.get("rkind")
+                is_result = (rk == "result") or (rk is None and msg.get("id") != corr_id)
+                if (
+                    is_result
+                    and msg.get("fnode") != peer.node
+                    and (to == peer.node or to.startswith(f"{peer.node}/"))
+                ):
                     return True
             return False
 
@@ -178,6 +281,24 @@ class BusHub:
             corr_id = str(corr_id).strip() or None
         mid = str(payload.get("id") or uuid.uuid4().hex[:12])
 
+        raw_rkind = payload.get("rkind")
+        rkind: str | None = None
+        if raw_rkind is not None:
+            cand_rk = str(raw_rkind).strip().lower()
+            if cand_rk in VALID_RKINDS:
+                rkind = cand_rk
+
+        raw_deadline = payload.get("deadline")
+        deadline: float | None = None
+        if raw_deadline is not None:
+            try:
+                dl_val = float(raw_deadline)
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "invalid_deadline", "detail": "invalid deadline", "code": 400}
+            if not math.isfinite(dl_val) or dl_val <= 0:
+                return {"ok": False, "error": "invalid_deadline", "detail": "invalid deadline", "code": 400}
+            deadline = dl_val
+
         if auth.trust == "external":
             ok, reason = check_external_send_permission(auth, target, kind, text=text)
             if not ok:
@@ -196,19 +317,34 @@ class BusHub:
                 "code": 400,
             }
 
-        msg, is_dup = self.store.enqueue_message(
-            mid=mid,
-            sender=sender_key,
-            fnode=auth.node,
-            target=target,
-            text=text,
-            hop=hop,
-            kind=kind,
-            status=status,
-            corr_id=corr_id,
-            ttl=ttl,
-            trust=auth.trust,
-        )
+        try:
+            msg, is_dup = self.store.enqueue_message(
+                mid=mid,
+                sender=sender_key,
+                fnode=auth.node,
+                target=target,
+                text=text,
+                hop=hop,
+                kind=kind,
+                rkind=rkind,
+                status=status,
+                corr_id=corr_id,
+                ttl=ttl,
+                deadline=deadline,
+                trust=auth.trust,
+            )
+        except IdConflictError as exc:
+            print(
+                f"[id-conflict] node={auth.node} sender={sender_key} id={mid}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return {
+                "ok": False,
+                "error": "id_conflict",
+                "detail": str(exc),
+                "code": 409,
+            }
         if is_dup:
             return {
                 "ok": True,
@@ -290,7 +426,12 @@ class BusHub:
             if k == sender_key:
                 continue
             if to_target in (peer.node, peer.key) or (
-                peer.trust == "external" and self.store.get_message_sender_node(corr_id) == peer.node
+                peer.trust == "external"
+                and (
+                    to_target == peer.node
+                    or to_target.startswith(f"{peer.node}/")
+                    or self.store.get_message_sender_node(corr_id) == peer.node
+                )
             ):
                 try:
                     await peer.send_text(frame)
@@ -316,8 +457,7 @@ class BusHub:
 
     def query_rpc_result(self, auth: AuthResult, corr_id: str) -> dict[str, Any]:
         if auth.trust == "external":
-            orig_node = self.store.get_message_sender_node(corr_id)
-            if orig_node != auth.node:
+            if not self.store.can_external_access_rpc(corr_id, auth.node):
                 return {"ok": False, "error": "forbidden", "code": 403}
         res = self.store.get_rpc_result(corr_id)
         if res is None:
@@ -393,7 +533,16 @@ class BusHub:
             label = "".join(c for c in raw_label if c.isalnum() or c in "-_")[:24] or "main"
             key = f"{auth.node}/{label}"
             since = int(hello.get("since", 0) or 0)
+            hello_hub_id = str(hello.get("hub_id") or "").strip()
+            if hello_hub_id and hello_hub_id != self.hub_id:
+                # Hub DB was replaced/reinitialized with a new hub_id (H10): replay from 0.
+                since = 0
             accept_inbox = bool(hello.get("accept_inbox", label == "main"))
+            raw_no_replay = hello.get("no_replay")
+            if raw_no_replay is not None:
+                skip_replay = bool(raw_no_replay)
+            else:
+                skip_replay = (not accept_inbox) and label.startswith(("cli-", "doc-"))
 
             if key in self.peers:
                 try:
@@ -418,23 +567,27 @@ class BusHub:
                 "peers": self.visible_peers(auth),
                 "seq": max_seq,
                 "trust": auth.trust,
+                "hub_id": self.hub_id,
+                "caps": list(HUB_CAPS),
             }
             if auth.trust == "internal":
                 banner_kw["rules"] = BUS_RULES
             await send_text(sysmsg(f"connected as {key}; peers={banner_kw['peers']}", **banner_kw))
 
-            # Replay undelivered/pending messages with lease protection.
-            pending = self.store.poll_for_consumer(
-                node=auth.node,
-                consumer=key,
-                since=since,
-                limit=500,
-                trust=auth.trust,
-                lease_ttl=LEASE_TTL,
-                reclaim_on_reconnect=True,
-            )
-            for m in pending:
-                await send_text(json.dumps(m, ensure_ascii=False))
+            # Replay undelivered/pending messages with lease protection (unless suppressed).
+            if not skip_replay:
+                pending = self.store.poll_for_consumer(
+                    node=auth.node,
+                    consumer=key,
+                    since=since,
+                    limit=500,
+                    trust=auth.trust,
+                    accept_inbox=(accept_inbox and label == "main"),
+                    lease_ttl=LEASE_TTL,
+                    reclaim_on_reconnect=True,
+                )
+                for m in pending:
+                    await send_text(json.dumps(m, ensure_ascii=False))
 
             while True:
                 raw = await recv_text()
@@ -445,6 +598,10 @@ class BusHub:
                 if op == "peers":
                     plist = self.visible_peers(auth)
                     await send_text(sysmsg("peers=" + ",".join(plist), peers=plist))
+                elif op == "health":
+                    await send_text(
+                        json.dumps({"op": "health", **self.health_snapshot()}, ensure_ascii=False)
+                    )
                 elif op == "ack":
                     seqs: list[int] = []
                     if isinstance(m.get("seqs"), list):
@@ -459,7 +616,7 @@ class BusHub:
                     prog_res = await self.handle_progress(auth=auth, sender_key=key, payload=m)
                     if not prog_res.get("ok"):
                         await send_text(sysmsg(prog_res.get("detail") or prog_res.get("error", "forbidden"), error="forbidden"))
-                elif op == "rpc_result":
+                elif op in ("rpc_result", "result"):
                     cid = str(m.get("corr_id") or "").strip()
                     if cid:
                         res = self.query_rpc_result(auth, cid)
@@ -467,7 +624,10 @@ class BusHub:
                 elif op == "send":
                     res = await self.publish_message(auth=auth, sender_key=key, payload=m)
                     if not res.get("ok"):
-                        await send_text(sysmsg(res["detail"], error=res["error"]))
+                        err_kw: dict[str, Any] = {"error": res["error"]}
+                        if m.get("id") is not None:
+                            err_kw["id"] = str(m["id"])
+                        await send_text(sysmsg(res["detail"], **err_kw))
                     else:
                         dl = res["delivered"] or "queued"
                         await send_text(
@@ -529,6 +689,7 @@ async def serve_all(
     config_dir: pathlib.Path | None = None,
     database_path: pathlib.Path | None = None,
     logs_dir: pathlib.Path | None = None,
+    prune_interval: float | None = None,
 ) -> None:
     from .gateway import start_gateway_server
 
@@ -538,9 +699,15 @@ async def serve_all(
     gw_host = gateway_host if gateway_host is not None else get_gateway_host(cfg)
     gw_port = gateway_port if gateway_port is not None else get_gateway_port(cfg)
 
-    hub = BusHub(config_dir=config_dir, database_path=database_path, logs_dir=logs_dir)
+    hub = BusHub(
+        config_dir=config_dir,
+        database_path=database_path,
+        logs_dir=logs_dir,
+        prune_interval=prune_interval,
+    )
     gw_server = None
     try:
+        hub.start_prune_task()
         async with websockets.serve(
             lambda ws: _websockets_adapter(ws, hub),
             ws_host,
@@ -550,7 +717,7 @@ async def serve_all(
             ping_timeout=60,
         ):
             print(
-                f"agent-bus hub ws://{ws_host}:{ws_port} allow={sorted(allowed_nodes(hub.cfg_dir))} seq={hub.store.get_max_seq()}",
+                f"agent-bus hub ws://{ws_host}:{ws_port} hub_id={hub.hub_id} allow={sorted(allowed_nodes(hub.cfg_dir))} seq={hub.store.get_max_seq()}",
                 flush=True,
             )
             if gw_port and gw_port > 0:
@@ -558,6 +725,7 @@ async def serve_all(
                 print(f"agent-bus gateway http+ws://{gw_host}:{gw_port}/bus/v1", flush=True)
             await asyncio.Future()
     finally:
+        await hub.stop_prune_task()
         if gw_server is not None:
             gw_server.close()
             await gw_server.wait_closed()

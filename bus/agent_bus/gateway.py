@@ -59,7 +59,7 @@ async def handle_gateway_http(
     method = method.upper()
 
     if method == "GET" and path == "/v1/health":
-        return 200, {"ok": True, "seq": hub.store.get_max_seq()}
+        return 200, hub.health_snapshot()
 
     auth = await authenticate_http_request(
         remote_ip=remote_ip,
@@ -83,7 +83,9 @@ async def handle_gateway_http(
         sender_key = f"{auth.node}/{label}"
         res = await hub.publish_message(auth=auth, sender_key=sender_key, payload=body)
         if not res.get("ok"):
-            return int(res.get("code") or 400), {"ok": False, "error": res.get("detail") or res.get("error")}
+            err_code = res.get("error") or res.get("detail") or "error"
+            detail = res.get("detail") or err_code
+            return int(res.get("code") or 400), {"ok": False, "error": err_code, "detail": detail}
         return 200, res
 
     if method == "GET" and path == "/v1/poll":
@@ -91,12 +93,18 @@ async def handle_gateway_http(
         since = int(params.get("since") or 0)
         limit = min(500, max(1, int(params.get("limit") or 50)))
         consumer = f"{auth.node}/{label}"
+        raw_ai = params.get("accept_inbox")
+        if raw_ai is not None:
+            accept_inbox = str(raw_ai).strip().lower() in ("1", "true", "yes")
+        else:
+            accept_inbox = auth.trust == "internal" and label == "main"
         msgs = hub.store.poll_for_consumer(
             node=auth.node,
             consumer=consumer,
             since=since,
             limit=limit,
             trust=auth.trust,
+            accept_inbox=accept_inbox,
             lease_ttl=LEASE_TTL,
             reclaim_on_reconnect=False,
         )

@@ -2,16 +2,23 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import pathlib
 import sqlite3
 import threading
 import time
+import uuid
 from typing import Any
 
 from .config import LEASE_TTL, MAX_DELIVERY_ATTEMPTS, QUEUE_TTL
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS hub_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS messages (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
     id TEXT UNIQUE NOT NULL,
@@ -20,10 +27,12 @@ CREATE TABLE IF NOT EXISTS messages (
     fnode TEXT NOT NULL,
     target TEXT NOT NULL,
     kind TEXT NOT NULL DEFAULT 'task',
+    rkind TEXT DEFAULT NULL,
     status TEXT NOT NULL DEFAULT 'ok',
     hop INTEGER NOT NULL DEFAULT 0,
     ts REAL NOT NULL,
     expires_at REAL NOT NULL,
+    deadline REAL DEFAULT NULL,
     trust TEXT NOT NULL DEFAULT 'internal',
     text TEXT NOT NULL
 );
@@ -60,11 +69,34 @@ CREATE TABLE IF NOT EXISTS nonces (
 CREATE INDEX IF NOT EXISTS idx_nonces_expires ON nonces(expires_at);
 """
 
-TERMINAL_RPC_STATUSES = {"ok", "exec_error", "auth_error"}
+NON_TERMINAL_RPC_STATUSES = frozenset({"", "pending", "running"})
+TERMINAL_RPC_STATUSES = {
+    "ok",
+    "exec_error",
+    "auth_error",
+    "exec_uncertain",
+    "expired",
+    "dead",
+}
+VALID_RKINDS = frozenset({"request", "result", "event"})
+
+
+class IdConflictError(ValueError):
+    """Raised when an existing message `id` is re-submitted with different `target` or `text`."""
+
+
+def is_terminal_rpc_status(status: str | None) -> bool:
+    clean = str(status or "").strip().lower()
+    return clean not in NON_TERMINAL_RPC_STATUSES
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _row_to_msg(row: sqlite3.Row) -> dict[str, Any]:
-    d = {
+    keys = row.keys()
+    d: dict[str, Any] = {
         "v": 2,
         "op": "msg",
         "seq": row["seq"],
@@ -80,6 +112,10 @@ def _row_to_msg(row: sqlite3.Row) -> dict[str, Any]:
         "trust": row["trust"],
         "text": row["text"],
     }
+    if "rkind" in keys and row["rkind"] is not None:
+        d["rkind"] = row["rkind"]
+    if "deadline" in keys and row["deadline"] is not None:
+        d["deadline"] = float(row["deadline"])
     return d
 
 
@@ -97,6 +133,58 @@ class BusStore:
             self._conn.execute("PRAGMA synchronous=NORMAL;")
             self._conn.execute("PRAGMA busy_timeout=5000;")
             self._conn.executescript(_SCHEMA)
+            self._migrate_schema_locked()
+            self.hub_id: str = self._ensure_hub_id_locked()
+            self._conn.commit()
+
+    def _migrate_schema_locked(self) -> None:
+        """Safely add v2 optional nullable columns on pre-existing v1/e7d0da2 databases."""
+        msg_cols = {
+            str(r["name"])
+            for r in self._conn.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        if "rkind" not in msg_cols:
+            self._conn.execute("ALTER TABLE messages ADD COLUMN rkind TEXT")
+        if "deadline" not in msg_cols:
+            self._conn.execute("ALTER TABLE messages ADD COLUMN deadline REAL")
+
+    def _ensure_hub_id_locked(self) -> str:
+        """Transactionally initialize and return persistent `hub_meta.hub_id`."""
+        row = self._conn.execute(
+            "SELECT value FROM hub_meta WHERE key = 'hub_id'"
+        ).fetchone()
+        if row is not None and str(row["value"]).strip():
+            return str(row["value"]).strip()
+        generated = uuid.uuid4().hex
+        self._conn.execute(
+            "INSERT OR IGNORE INTO hub_meta (key, value) VALUES ('hub_id', ?)",
+            (generated,),
+        )
+        saved = self._conn.execute(
+            "SELECT value FROM hub_meta WHERE key = 'hub_id'"
+        ).fetchone()
+        return str(saved["value"]) if saved is not None else generated
+
+    def get_hub_id(self) -> str:
+        with self._lock:
+            return self.hub_id
+
+    def get_meta(self, key: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM hub_meta WHERE key = ?", (str(key),)
+            ).fetchone()
+            return str(row["value"]) if row is not None else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO hub_meta (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (str(key), str(value)),
+            )
             self._conn.commit()
 
     def close(self) -> None:
@@ -139,11 +227,17 @@ class BusStore:
                 target = str(m.get("to") or "*")
                 hop = int(m.get("hop") or 0)
                 text = str(m.get("text") or "")
+                raw_rk = m.get("rkind")
+                rk_val = str(raw_rk).strip().lower() if raw_rk is not None else None
+                if rk_val not in VALID_RKINDS:
+                    rk_val = None
+                raw_dl = m.get("deadline")
+                dl_val = float(raw_dl) if raw_dl is not None else None
                 self._conn.execute(
                     """
                     INSERT OR IGNORE INTO messages
-                        (seq, id, corr_id, sender, fnode, target, kind, status, hop, ts, expires_at, trust, text)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (seq, id, corr_id, sender, fnode, target, kind, rkind, status, hop, ts, expires_at, deadline, trust, text)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         seq if seq > 0 else None,
@@ -153,10 +247,12 @@ class BusStore:
                         fnode,
                         target,
                         str(m.get("kind") or "task"),
+                        rk_val,
                         str(m.get("status") or "ok"),
                         hop,
                         ts,
                         ts + ttl,
+                        dl_val,
                         str(m.get("trust") or "internal"),
                         text,
                     ),
@@ -182,55 +278,96 @@ class BusStore:
         text: str,
         hop: int = 0,
         kind: str = "task",
+        rkind: str | None = None,
         status: str = "ok",
         corr_id: str | None = None,
         ttl: float = QUEUE_TTL,
+        deadline: float | None = None,
         trust: str = "internal",
         ts: float | None = None,
     ) -> tuple[dict[str, Any], bool]:
-        """Insert a message idempotently by `mid`. Returns `(msg_dict, is_duplicate)`."""
+        """Insert a message idempotently by `mid`.
+
+        - Identical `(target, text)` SHA-256 -> returns `(existing_msg, True)` (`duplicate`).
+        - Different `target` or `text` SHA-256 -> raises `IdConflictError` without mutating DB.
+        """
         now = ts if ts is not None else time.time()
         expires_at = now + max(1.0, float(ttl))
+        norm_rkind: str | None = None
+        if rkind is not None:
+            cand = str(rkind).strip().lower()
+            if cand in VALID_RKINDS:
+                norm_rkind = cand
+        norm_deadline = float(deadline) if deadline is not None else None
+
         with self._lock:
             existing = self._conn.execute("SELECT * FROM messages WHERE id = ?", (mid,)).fetchone()
             if existing is not None:
+                same_target = _sha256_text(str(existing["target"])) == _sha256_text(target)
+                same_text = _sha256_text(str(existing["text"])) == _sha256_text(text)
+                if not (same_target and same_text):
+                    raise IdConflictError(
+                        f"id_conflict: message id '{mid}' already exists with different target or text"
+                    )
                 return _row_to_msg(existing), True
 
             cur = self._conn.execute(
                 """
                 INSERT INTO messages
-                    (id, corr_id, sender, fnode, target, kind, status, hop, ts, expires_at, trust, text)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, corr_id, sender, fnode, target, kind, rkind, status, hop, ts, expires_at, deadline, trust, text)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (mid, corr_id, sender, fnode, target, kind, status, hop, now, expires_at, trust, text),
+                (
+                    mid,
+                    corr_id,
+                    sender,
+                    fnode,
+                    target,
+                    kind,
+                    norm_rkind,
+                    status,
+                    hop,
+                    now,
+                    expires_at,
+                    norm_deadline,
+                    trust,
+                    text,
+                ),
             )
             seq = int(cur.lastrowid)
             if corr_id and kind != "ack":
-                existing_rpc = self._conn.execute(
-                    "SELECT status FROM rpc_results WHERE corr_id = ?", (corr_id,)
-                ).fetchone()
-                if existing_rpc is None:
-                    # First message carrying this corr_id is the request itself: mark pending.
-                    self._upsert_rpc_result_locked(
-                        corr_id=corr_id,
-                        seq=seq,
-                        sender=sender,
-                        status="pending",
-                        text="",
-                        ts=now,
-                        expires_at=expires_at,
-                    )
-                elif mid != corr_id:
-                    # Subsequent message with same corr_id is the reply/result.
-                    self._upsert_rpc_result_locked(
-                        corr_id=corr_id,
-                        seq=seq,
-                        sender=sender,
-                        status=status,
-                        text=text,
-                        ts=now,
-                        expires_at=expires_at,
-                    )
+                is_result = (norm_rkind == "result") or (norm_rkind is None and mid != corr_id)
+                is_request = (not is_result) and (norm_rkind == "request" or mid == corr_id)
+                if is_result:
+                    # Terminal RPC upsert regardless of whether original request exists on this hub.
+                    # Non-terminal `status == "running"` (or `"pending"`) is never treated as terminal.
+                    if is_terminal_rpc_status(status):
+                        self._upsert_rpc_result_locked(
+                            corr_id=corr_id,
+                            seq=seq,
+                            sender=sender,
+                            status=status,
+                            text=text,
+                            ts=now,
+                            expires_at=expires_at,
+                        )
+                elif is_request:
+                    # Record `pending` only when no unexpired RPC entry exists yet; NEVER overwrite
+                    # an already-arrived terminal (or running) RPC result!
+                    existing_rpc = self._conn.execute(
+                        "SELECT status, expires_at FROM rpc_results WHERE corr_id = ?",
+                        (corr_id,),
+                    ).fetchone()
+                    if existing_rpc is None or float(existing_rpc["expires_at"]) <= now:
+                        self._upsert_rpc_result_locked(
+                            corr_id=corr_id,
+                            seq=seq,
+                            sender=sender,
+                            status="pending",
+                            text="",
+                            ts=now,
+                            expires_at=expires_at,
+                        )
             self._conn.commit()
             row = self._conn.execute("SELECT * FROM messages WHERE seq = ?", (seq,)).fetchone()
             return _row_to_msg(row), False
@@ -247,24 +384,45 @@ class BusStore:
         expires_at: float,
     ) -> None:
         existing = self._conn.execute(
-            "SELECT status FROM rpc_results WHERE corr_id = ?", (corr_id,)
+            "SELECT status, expires_at FROM rpc_results WHERE corr_id = ?", (corr_id,)
         ).fetchone()
-        if existing is not None and existing["status"] in TERMINAL_RPC_STATUSES and status not in TERMINAL_RPC_STATUSES:
+        if (
+            existing is not None
+            and float(existing["expires_at"]) > ts
+            and is_terminal_rpc_status(str(existing["status"]))
+        ):
+            # Never overwrite an unexpired terminal result with progress/pending or late duplicates.
             return
-        self._conn.execute(
-            """
-            INSERT INTO rpc_results (corr_id, seq, sender, status, text, ts, expires_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(corr_id) DO UPDATE SET
-                seq = CASE WHEN excluded.seq > 0 THEN excluded.seq ELSE rpc_results.seq END,
-                sender = excluded.sender,
-                status = excluded.status,
-                text = CASE WHEN excluded.text != '' THEN excluded.text ELSE rpc_results.text END,
-                ts = excluded.ts,
-                expires_at = excluded.expires_at
-            """,
-            (corr_id, seq, sender, status, text, ts, expires_at),
-        )
+        if is_terminal_rpc_status(status):
+            self._conn.execute(
+                """
+                INSERT INTO rpc_results (corr_id, seq, sender, status, text, ts, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(corr_id) DO UPDATE SET
+                    seq = CASE WHEN excluded.seq > 0 THEN excluded.seq ELSE rpc_results.seq END,
+                    sender = excluded.sender,
+                    status = excluded.status,
+                    text = excluded.text,
+                    ts = excluded.ts,
+                    expires_at = excluded.expires_at
+                """,
+                (corr_id, seq, sender, status, text, ts, expires_at),
+            )
+        else:
+            self._conn.execute(
+                """
+                INSERT INTO rpc_results (corr_id, seq, sender, status, text, ts, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(corr_id) DO UPDATE SET
+                    seq = CASE WHEN excluded.seq > 0 THEN excluded.seq ELSE rpc_results.seq END,
+                    sender = excluded.sender,
+                    status = excluded.status,
+                    text = CASE WHEN excluded.text != '' THEN excluded.text ELSE rpc_results.text END,
+                    ts = excluded.ts,
+                    expires_at = excluded.expires_at
+                """,
+                (corr_id, seq, sender, status, text, ts, expires_at),
+            )
 
     def record_progress(
         self,
@@ -309,9 +467,47 @@ class BusStore:
     def get_message_sender_node(self, corr_id: str) -> str | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT fnode FROM messages WHERE id = ? LIMIT 1", (corr_id,)
+                """
+                SELECT fnode FROM messages
+                WHERE id = ? OR (corr_id = ? AND rkind = 'request')
+                ORDER BY seq ASC LIMIT 1
+                """,
+                (corr_id, corr_id),
             ).fetchone()
             return str(row["fnode"]) if row is not None else None
+
+    def can_external_access_rpc(self, corr_id: str, ext_node: str, *, now: float | None = None) -> bool:
+        """Return True iff `ext_node` owns `corr_id` either via original request on this hub
+        or via a result message targeting `ext_node` / `ext_node/*` (cross-hub R07/X08)."""
+        ts = now if now is not None else time.time()
+        clean_node = str(ext_node or "").strip().lower()
+        if not clean_node or not corr_id:
+            return False
+        with self._lock:
+            orig = self._conn.execute(
+                """
+                SELECT fnode FROM messages
+                WHERE id = ? OR (corr_id = ? AND rkind = 'request')
+                ORDER BY seq ASC LIMIT 1
+                """,
+                (corr_id, corr_id),
+            ).fetchone()
+            if orig is not None:
+                return str(orig["fnode"]).lower() == clean_node
+
+            res_row = self._conn.execute(
+                """
+                SELECT 1 FROM messages
+                WHERE corr_id = ?
+                  AND expires_at > ?
+                  AND (rkind = 'result' OR (rkind IS NULL AND id != corr_id))
+                  AND lower(fnode) != ?
+                  AND (lower(target) = ? OR lower(target) LIKE ?)
+                LIMIT 1
+                """,
+                (corr_id, ts, clean_node, clean_node, f"{clean_node}/%"),
+            ).fetchone()
+            return res_row is not None
 
     def get_message_routing(self, msg_id: str) -> tuple[str, str] | None:
         """Return (fnode, target) for an existing message by id or corr_id."""
@@ -409,6 +605,7 @@ class BusStore:
         since: int = 0,
         limit: int = 50,
         trust: str = "internal",
+        accept_inbox: bool = False,
         lease_ttl: float = LEASE_TTL,
         max_attempts: int = MAX_DELIVERY_ATTEMPTS,
         reclaim_on_reconnect: bool = False,
@@ -445,8 +642,9 @@ class BusStore:
 
             if trust == "external":
                 # Strict namespace isolation: external consumers NEVER receive '*' broadcasts
-                # or internal node traffic; only direct node/consumer targets or corr_id replies
-                # to requests originally sent by this external node.
+                # or internal node traffic; only direct node/consumer targets, corr_id replies
+                # to requests sent by this external node, or cross-hub result messages whose
+                # target node is this external node.
                 sql = """
                     SELECT m.*, d.state AS d_state, d.attempts AS d_attempts
                     FROM messages m
@@ -460,8 +658,15 @@ class BusStore:
                                 m.corr_id IS NOT NULL
                                 AND EXISTS (
                                     SELECT 1 FROM messages orig
-                                    WHERE orig.id = m.corr_id AND orig.fnode = ?
+                                    WHERE (orig.id = m.corr_id OR (orig.corr_id = m.corr_id AND orig.rkind = 'request'))
+                                      AND orig.fnode = ?
                                 )
+                            )
+                            OR (
+                                m.corr_id IS NOT NULL
+                                AND (m.rkind = 'result' OR (m.rkind IS NULL AND m.id != m.corr_id))
+                                AND m.fnode != ?
+                                AND (m.target = ? OR m.target LIKE ?)
                             )
                           )
                       AND (
@@ -471,7 +676,55 @@ class BusStore:
                     ORDER BY m.seq ASC
                     LIMIT ?
                 """
-                params = (consumer, now, consumer, node, consumer, node, since, limit)
+                params: tuple[Any, ...] = (
+                    consumer,
+                    now,
+                    consumer,
+                    node,
+                    consumer,
+                    node,
+                    node,
+                    node,
+                    f"{node}/%",
+                    since,
+                    limit,
+                )
+            elif accept_inbox:
+                sql = """
+                    SELECT m.*, d.state AS d_state, d.attempts AS d_attempts
+                    FROM messages m
+                    LEFT JOIN deliveries d ON d.seq = m.seq AND d.consumer = ?
+                    WHERE m.expires_at > ?
+                      AND m.kind != 'ack'
+                      AND (
+                            m.target IN (?, ?)
+                            OR (m.target = '*' AND m.fnode != ?)
+                            OR m.target = ?
+                            OR (
+                                m.target LIKE ?
+                                AND m.target NOT LIKE ?
+                                AND m.kind = 'event'
+                            )
+                          )
+                      AND (
+                            (m.seq > ? AND d.state IS NULL)
+                            OR d.state = 'pending'
+                          )
+                    ORDER BY m.seq ASC
+                    LIMIT ?
+                """
+                params = (
+                    consumer,
+                    now,
+                    node,
+                    consumer,
+                    node,
+                    f"{node}/inbox",
+                    f"{node}/%",
+                    f"{node}/cli-%",
+                    since,
+                    limit,
+                )
             else:
                 sql = """
                     SELECT m.*, d.state AS d_state, d.attempts AS d_attempts
@@ -515,6 +768,82 @@ class BusStore:
             self._conn.commit()
             return out
 
+    def get_queue_metrics(self, now: float | None = None) -> dict[str, Any]:
+        """Compute live queue depth & age metrics (`pending`, `leased`, `oldest_pending_age`, `dead`)."""
+        ts = now if now is not None else time.time()
+        with self._lock:
+            self.expire_leases_locked(ts, max_attempts=MAX_DELIVERY_ATTEMPTS)
+            self._conn.commit()
+
+            unleased_row = self._conn.execute(
+                """
+                SELECT COUNT(*) AS cnt, MIN(m.ts) AS min_ts
+                FROM messages m
+                WHERE m.expires_at > ?
+                  AND m.kind != 'ack'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM deliveries d WHERE d.seq = m.seq
+                  )
+                """,
+                (ts,),
+            ).fetchone()
+            pending_del_row = self._conn.execute(
+                """
+                SELECT COUNT(*) AS cnt, MIN(m.ts) AS min_ts
+                FROM deliveries d
+                JOIN messages m ON m.seq = d.seq
+                WHERE m.expires_at > ?
+                  AND m.kind != 'ack'
+                  AND d.state = 'pending'
+                """,
+                (ts,),
+            ).fetchone()
+            leased_row = self._conn.execute(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM deliveries d
+                JOIN messages m ON m.seq = d.seq
+                WHERE m.expires_at > ?
+                  AND m.kind != 'ack'
+                  AND d.state = 'leased'
+                """,
+                (ts,),
+            ).fetchone()
+            dead_row = self._conn.execute(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM deliveries d
+                JOIN messages m ON m.seq = d.seq
+                WHERE m.expires_at > ?
+                  AND m.kind != 'ack'
+                  AND d.state = 'dead'
+                """,
+                (ts,),
+            ).fetchone()
+
+            unleased_cnt = int(unleased_row["cnt"] or 0) if unleased_row is not None else 0
+            pending_del_cnt = int(pending_del_row["cnt"] or 0) if pending_del_row is not None else 0
+            pending_total = unleased_cnt + pending_del_cnt
+            leased_total = int(leased_row["cnt"] or 0) if leased_row is not None else 0
+            dead_total = int(dead_row["cnt"] or 0) if dead_row is not None else 0
+
+            min_candidates = [
+                float(r["min_ts"])
+                for r in (unleased_row, pending_del_row)
+                if r is not None and r["min_ts"] is not None
+            ]
+            oldest_pending_age: float | None = None
+            if pending_total > 0 and min_candidates:
+                oldest_pending_age = round(max(0.0, ts - min(min_candidates)), 3)
+
+            return {
+                "max_seq": self.get_max_seq(),
+                "pending": pending_total,
+                "leased": leased_total,
+                "oldest_pending_age": oldest_pending_age,
+                "dead": dead_total,
+            }
+
     def check_and_record_nonce(self, nonce_key: str, ttl: float = 600.0) -> bool:
         """Return True if nonce is unused (and record it); False if already seen."""
         now = time.time()
@@ -536,9 +865,9 @@ class BusStore:
     def prune_expired(self, now: float | None = None) -> int:
         ts = now if now is not None else time.time()
         with self._lock:
-            cur = self._conn.execute("DELETE FROM messages WHERE expires_at < ?", (ts,))
-            self._conn.execute("DELETE FROM rpc_results WHERE expires_at < ?", (ts,))
-            self._conn.execute("DELETE FROM nonces WHERE expires_at < ?", (ts,))
+            cur = self._conn.execute("DELETE FROM messages WHERE expires_at <= ?", (ts,))
+            self._conn.execute("DELETE FROM rpc_results WHERE expires_at <= ?", (ts,))
+            self._conn.execute("DELETE FROM nonces WHERE expires_at <= ?", (ts,))
             self._conn.execute(
                 "DELETE FROM deliveries WHERE seq NOT IN (SELECT seq FROM messages)"
             )

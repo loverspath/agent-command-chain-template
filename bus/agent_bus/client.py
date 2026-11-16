@@ -141,13 +141,24 @@ def http_request_json(
         return exc.code, parsed
 
 
-def build_ws_hello(label: str, since: int, accept_inbox: bool = True) -> dict[str, Any]:
+def build_ws_hello(
+    label: str,
+    since: int,
+    accept_inbox: bool = True,
+    *,
+    no_replay: bool = False,
+    hub_id: str | None = None,
+) -> dict[str, Any]:
     hello: dict[str, Any] = {
         "v": 2,
         "label": label,
         "since": since,
         "accept_inbox": accept_inbox,
     }
+    if no_replay:
+        hello["no_replay"] = True
+    if hub_id:
+        hello["hub_id"] = str(hub_id)
     token_id, secret = get_auth_credentials()
     if token_id and secret:
         hdrs = build_hmac_headers(token_id, secret, token_id.encode("utf-8"))
@@ -419,7 +430,7 @@ async def drain_outbox(
                     elif code == 429 or data.get("error") == "rate":
                         rate_limited = True
                         break
-                    elif code in (400, 403, 413):
+                    elif code in (400, 403, 409, 413):
                         journal.mark_outbox_expired(mid)
                         expired_total += 1
                     else:
@@ -443,7 +454,11 @@ async def drain_outbox(
                         ping_interval=20,
                         ping_timeout=60,
                     ) as ws:
-                        await ws.send(json.dumps(build_ws_hello(cli_label, 10**9, accept_inbox=False)))
+                        await ws.send(
+                            json.dumps(
+                                build_ws_hello(cli_label, 10**9, accept_inbox=False, no_replay=True)
+                            )
+                        )
                         banner_raw = await asyncio.wait_for(
                             ws.recv(),
                             timeout=max(0.2, min(5.0, deadline_mono - time.monotonic())),
@@ -477,7 +492,7 @@ async def drain_outbox(
                                     if err == "rate":
                                         hit_rate = True
                                         break
-                                    if err in ("forbidden", "size", "hop"):
+                                    if err in ("forbidden", "size", "hop", "id_conflict"):
                                         journal.mark_outbox_expired(mid)
                                         expired_total += 1
                                         break
@@ -573,7 +588,7 @@ async def run_node(a: argparse.Namespace) -> None:
             err = sys_frame.get("error")
             if err == "rate":
                 return "rate"
-            if err in ("forbidden", "size", "hop"):
+            if err in ("forbidden", "size", "hop", "id_conflict"):
                 journal.mark_outbox_expired(mid)
                 return "rejected"
             return "disconnected"
@@ -702,7 +717,9 @@ async def run_node(a: argparse.Namespace) -> None:
             main_task.cancel()
 
     worker_task.add_done_callback(_on_worker_done)
-    active_hub_key = url
+    known_hub_id = journal.resolve_hub_id(url)
+    active_hub_key = known_hub_id or url
+    ws_ref["hub_key"] = active_hub_key
     carry_live_seq = 0
     try:
         while True:
@@ -720,6 +737,7 @@ async def run_node(a: argparse.Namespace) -> None:
                                 label,
                                 hello_since,
                                 accept_inbox=(label == "main"),
+                                hub_id=known_hub_id,
                             )
                         )
                     )
@@ -743,10 +761,21 @@ async def run_node(a: argparse.Namespace) -> None:
                                 my_node = str(m["you"]).split("/", 1)[0]
                                 banner_seq = int(m.get("seq") or 0)
                                 if m.get("hub_id"):
-                                    active_hub_key = str(m["hub_id"])
-                                    ws_ref["hub_key"] = active_hub_key
-                                    if hello_since > 0:
-                                        journal.advance_cursor(active_hub_key, hello_since, label=label)
+                                    banner_hub_id = str(m["hub_id"])
+                                    journal.remember_hub_id(url, banner_hub_id)
+                                    if known_hub_id is not None and banner_hub_id != known_hub_id:
+                                        # Hub DB recreated with new hub_id (H10) -> cursor starts at 0.
+                                        active_hub_key = banner_hub_id
+                                        ws_ref["hub_key"] = active_hub_key
+                                        known_hub_id = banner_hub_id
+                                        hello_since = 0
+                                        last_replay_seq = 0
+                                    else:
+                                        active_hub_key = banner_hub_id
+                                        ws_ref["hub_key"] = active_hub_key
+                                        if known_hub_id is None and hello_since > 0 and hello_since <= banner_seq:
+                                            journal.advance_cursor(active_hub_key, hello_since, label=label)
+                                        known_hub_id = banner_hub_id
                                 if pump_task is None:
                                     outbox_wakeup.set()
                                     pump_task = asyncio.create_task(outbox_pump(ws))
@@ -1012,7 +1041,9 @@ async def oneshot(a: argparse.Namespace) -> int:
             ws_url = to_ws_url(url)
             cli_label = f"cli-{uuid.uuid4().hex[:6]}"
             async with websockets.connect(ws_url, ping_interval=20, ping_timeout=60) as ws:
-                await ws.send(json.dumps(build_ws_hello(cli_label, 10**9, accept_inbox=False)))
+                await ws.send(
+                    json.dumps(build_ws_hello(cli_label, 10**9, accept_inbox=False, no_replay=True))
+                )
                 await ws.recv()
                 while True:
                     await ws.send(json.dumps({"op": "rpc_result", "corr_id": cid}))
@@ -1037,7 +1068,9 @@ async def oneshot(a: argparse.Namespace) -> int:
         cli_label = f"cli-{uuid.uuid4().hex[:6]}"
         try:
             async with websockets.connect(ws_url, ping_interval=20, ping_timeout=60) as ws:
-                await ws.send(json.dumps(build_ws_hello(cli_label, 10**9, accept_inbox=False)))
+                await ws.send(
+                    json.dumps(build_ws_hello(cli_label, 10**9, accept_inbox=False, no_replay=True))
+                )
                 await ws.recv()
                 await ws.send(json.dumps({"op": "peers"}))
                 print(json.loads(await ws.recv())["text"])
@@ -1055,6 +1088,11 @@ async def oneshot(a: argparse.Namespace) -> int:
     is_say = bool(getattr(a, "say", False))
     wait_s = float(getattr(a, "wait", 0) or 0)
     kind = getattr(a, "kind", None) or ("event" if is_say else ("rpc" if wait_s > 0 else "task"))
+    explicit_rkind = getattr(a, "rkind", None)
+    if explicit_rkind in ("request", "result", "event"):
+        rkind = str(explicit_rkind)
+    else:
+        rkind = "event" if kind == "event" else "request"
     text = "!update" if is_update else (a.text if (is_say or kind == "event") else "!ask " + a.text)
     hop = int(getattr(a, "hop", 0) or 0)
     ttl = int(getattr(a, "ttl", 86400) or 86400)
@@ -1071,10 +1109,12 @@ async def oneshot(a: argparse.Namespace) -> int:
         "id": mid,
         "corr_id": corr_id,
         "kind": kind,
+        "rkind": rkind,
         "to": a.to,
         "text": text,
         "hop": hop,
         "ttl": ttl,
+        "deadline": send_deadline,
     }
 
     with NodeJournal(cdir) as journal:
@@ -1100,7 +1140,7 @@ async def oneshot(a: argparse.Namespace) -> int:
             print(f"[error] {exc}", file=sys.stderr)
             return 1
         if code >= 400 or not data.get("ok"):
-            if code in (400, 403, 413):
+            if code in (400, 403, 409, 413):
                 with NodeJournal(cdir) as journal:
                     journal.mark_outbox_expired(mid)
             elif (code == 429 or data.get("error") == "rate") and getattr(a, "offline_queue", False):
@@ -1140,7 +1180,9 @@ async def oneshot(a: argparse.Namespace) -> int:
     cli_label = f"cli-{uuid.uuid4().hex[:6]}"
     try:
         async with websockets.connect(ws_url, ping_interval=20, ping_timeout=60) as ws:
-            await ws.send(json.dumps(build_ws_hello(cli_label, 10**9, accept_inbox=False)))
+            await ws.send(
+                json.dumps(build_ws_hello(cli_label, 10**9, accept_inbox=False, no_replay=True))
+            )
             banner_raw = await ws.recv()  # connected banner
             banner = json.loads(banner_raw)
             hub_key = str(banner.get("hub_id") or ws_url)
@@ -1159,7 +1201,7 @@ async def oneshot(a: argparse.Namespace) -> int:
                     ack_msg = json.loads(ack_raw)
                     if ack_msg.get("op") == "sys" and ack_msg.get("ack") == item_id and not ack_msg.get("error"):
                         journal.mark_outbox_acked(item_id, hub_key)
-                    elif ack_msg.get("error") in ("forbidden", "size", "hop"):
+                    elif ack_msg.get("error") in ("forbidden", "size", "hop", "id_conflict"):
                         journal.mark_outbox_expired(item_id)
                     else:
                         break
@@ -1175,7 +1217,7 @@ async def oneshot(a: argparse.Namespace) -> int:
                     print(f"[hub] {m.get('text')}", file=sys.stderr)
                     err = m.get("error")
                     if err:
-                        if err in ("forbidden", "size", "hop"):
+                        if err in ("forbidden", "size", "hop", "id_conflict"):
                             with NodeJournal(cdir) as journal:
                                 journal.mark_outbox_expired(mid)
                         elif err == "rate" and getattr(a, "offline_queue", False):
@@ -1202,7 +1244,7 @@ async def oneshot(a: argparse.Namespace) -> int:
                     print(f"[hub] {m.get('text')}", file=sys.stderr)
                     err = m.get("error")
                     if err:
-                        if err in ("forbidden", "size", "hop"):
+                        if err in ("forbidden", "size", "hop", "id_conflict"):
                             with NodeJournal(cdir) as journal:
                                 journal.mark_outbox_expired(mid)
                         return 1
@@ -1320,15 +1362,32 @@ def run_doctor(a: argparse.Namespace) -> dict[str, Any]:
             report["hub_ok"] = code == 200 and bool(data.get("ok"))
             report["hub_seq"] = data.get("seq")
         else:
-            async def _ping() -> list[str]:
+            async def _ping() -> tuple[list[str], str | None, list[str] | None]:
                 async with websockets.connect(to_ws_url(url), open_timeout=5, close_timeout=2) as ws:
-                    await ws.send(json.dumps(build_ws_hello(f"doc-{uuid.uuid4().hex[:6]}", 10**9, accept_inbox=False)))
+                    await ws.send(
+                        json.dumps(
+                            build_ws_hello(
+                                f"doc-{uuid.uuid4().hex[:6]}",
+                                10**9,
+                                accept_inbox=False,
+                                no_replay=True,
+                            )
+                        )
+                    )
                     banner = json.loads(await asyncio.wait_for(ws.recv(), 5.0))
-                    return list(banner.get("peers") or [])
+                    return (
+                        list(banner.get("peers") or []),
+                        banner.get("hub_id"),
+                        banner.get("caps"),
+                    )
 
-            peers = asyncio.run(_ping())
+            peers, hub_id_val, caps_val = asyncio.run(_ping())
             report["hub_ok"] = True
             report["peers"] = peers
+            if hub_id_val is not None:
+                report["hub_id"] = hub_id_val
+            if caps_val is not None:
+                report["caps"] = caps_val
     except Exception as exc:
         report["hub_error"] = str(exc)
 

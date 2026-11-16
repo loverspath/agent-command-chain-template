@@ -2,9 +2,9 @@
 
 Each test reproduces Sol's adversarial counterexample while asserting the **v2 target
 acceptance criteria** (`design.md` §2, §6, §7).
-Current WBS status after `I1`:
+Current WBS status after `I2`:
 - `R05` -> `strict xfail` (resolved in `I3`: client dual-home + multi-hub ACK outbox retention)
-- `R07` -> `strict xfail` (resolved in `I2`: hub/store independent RPC result upsert + external query)
+- `R07` -> **PASSING** in `I2` (hub/store independent RPC result upsert + external query)
 - `R08` -> **PASSING** in `I1` (node durable inbox journal + monotonic cursor watermark)
 - `R16` -> **PASSING** in `I1` (node durable inbox/execution deduplication across reconnects)
 """
@@ -228,11 +228,6 @@ async def test_r05_acked_outbox_cleared_before_hub_b_loses_message(
 
 
 @pytest.mark.chaos
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="R07: 대체 허브B 응답 선도착 시 RPC pending 고착 및 외부 ext 조회 403 — 후속 I2(허브 결과 독립 upsert·ext 조회)에서 해소",
-)
 async def test_r07_reply_first_on_hub_b_sticks_pending_and_ext_403(
     hub_factory: HubController,
     oracle: ChaosOracle,

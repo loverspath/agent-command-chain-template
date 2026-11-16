@@ -165,8 +165,10 @@ def main(argv: list[str] | None = None) -> None:
     send_p.add_argument("--update", action="store_true")
     send_p.add_argument("--say", action="store_true")
     send_p.add_argument("--kind", choices=["rpc", "task", "event"], default=None)
+    send_p.add_argument("--rkind", choices=["request", "result", "event"], default=None)
     send_p.add_argument("--corr-id", default=None)
     send_p.add_argument("--ttl", type=int, default=86400)
+    send_p.add_argument("--deadline", type=float, default=None)
     send_p.add_argument("--offline-queue", action="store_true")
     send_p.add_argument("--url", default=None)
 

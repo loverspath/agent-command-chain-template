@@ -21,6 +21,8 @@ LEASE_TTL = 330
 MAX_DELIVERY_ATTEMPTS = 3
 DEFAULT_TASK_DEADLINE = 3600
 DEFAULT_EVENT_DEADLINE = 86400
+DEFAULT_PRUNE_INTERVAL = 600
+HUB_CAPS: tuple[str, ...] = ("v2", "journal", "rkind", "no_replay", "deadline")
 
 ALIASES = {
     "pc": "cat-food",

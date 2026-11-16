@@ -78,6 +78,12 @@ CREATE TABLE IF NOT EXISTS cursors (
     hub_key TEXT PRIMARY KEY,
     seq INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS hub_endpoints (
+    url TEXT PRIMARY KEY,
+    hub_id TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
 """
 
 _ACTIVE_WORKERS_LOCK = threading.RLock()
@@ -287,6 +293,7 @@ def _build_reply_payload(
         "id": rid,
         "corr_id": corr_id or None,
         "kind": "rpc" if orig_kind == "rpc" else "task",
+        "rkind": "result",
         "status": status,
         "to": str(row["from"]),
         "text": text,
@@ -874,6 +881,39 @@ class NodeJournal:
     # ------------------------------------------------------------------
     # Cursors & CLI diagnostics
     # ------------------------------------------------------------------
+
+    def resolve_hub_id(self, url: str) -> str | None:
+        clean_url = str(url or "").strip()
+        if not clean_url:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT hub_id FROM hub_endpoints WHERE url = ?",
+                (clean_url,),
+            ).fetchone()
+            return str(row["hub_id"]) if row is not None and row["hub_id"] else None
+
+    def remember_hub_id(self, url: str, hub_id: str) -> None:
+        clean_url = str(url or "").strip()
+        clean_id = str(hub_id or "").strip()
+        if not clean_url or not clean_id:
+            return
+        now = time.time()
+
+        def _op() -> None:
+            with self._immediate_tx() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO hub_endpoints (url, hub_id, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(url) DO UPDATE SET
+                        hub_id = excluded.hub_id,
+                        updated_at = excluded.updated_at
+                    """,
+                    (clean_url, clean_id, now),
+                )
+
+        _with_sqlite_retry(_op)
 
     def get_cursor(self, hub_key: str, *, label: str = "main", fallback_seq: int = 0) -> int:
         scoped_key = cursor_hub_key(hub_key, label=label)
