@@ -16,7 +16,12 @@ import sys
 import threading
 import time
 import urllib.parse
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None  # type: ignore[assignment]
 
 from .config import (
     CLIENT_CAPS,
@@ -45,7 +50,7 @@ class FleetValidationError(ValueError):
 
 
 class FleetConvergeExit(SystemExit):
-    """Raised by `run_node` after idle drain & `fleet-ack` flush to trigger supervisor restart (`75`)."""
+    """Legacy compat exception (superseded by in-place `os.execv` self-reexecution)."""
 
     def __init__(self, code: int = FLEET_EXIT_CODE) -> None:
         super().__init__(code)
@@ -60,8 +65,37 @@ class FleetConvergenceOutcome:
     reason: str = ""
 
 
+@contextlib.contextmanager
+def _fleet_state_lock(cfg_dir: pathlib.Path) -> Iterator[None]:
+    """Serialize `fleet-applied.json` / `fleet-attempts.json` RMW across threads and processes."""
+    cdir = pathlib.Path(cfg_dir)
+    with _FLEET_CONVERGE_LOCK:
+        fd: int | None = None
+        if fcntl is not None:
+            try:
+                locks_dir = cdir / "locks"
+                locks_dir.mkdir(parents=True, exist_ok=True)
+                lock_file = locks_dir / "fleet-state.lock"
+                fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR, 0o600)
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except OSError:
+                if fd is not None:
+                    with contextlib.suppress(OSError):
+                        os.close(fd)
+                    fd = None
+        try:
+            yield
+        finally:
+            if fd is not None:
+                if fcntl is not None:
+                    with contextlib.suppress(OSError):
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+
+
 def _fsync_dir(dir_path: pathlib.Path) -> None:
-    if not hasattr(os, "O_RDONLY"):
+    if os.name == "nt" or not hasattr(os, "O_RDONLY") or not hasattr(os, "fsync"):
         return
     fd: int | None = None
     try:
@@ -87,11 +121,14 @@ def _atomic_write_bytes(path: pathlib.Path, data: bytes, *, mode: int = 0o600) -
         written = 0
         while written < len(view):
             written += os.write(fd, view[written:])
-        os.fsync(fd)
+        if hasattr(os, "fsync"):
+            with contextlib.suppress(OSError):
+                os.fsync(fd)
         os.close(fd)
         fd = None
-        with contextlib.suppress(OSError):
-            os.chmod(tmp_path, mode)
+        if os.name != "nt" and hasattr(os, "chmod"):
+            with contextlib.suppress(OSError):
+                os.chmod(tmp_path, mode)
         os.replace(tmp_path, path)
         _fsync_dir(path.parent)
     finally:
@@ -311,30 +348,145 @@ def build_health_fleet(manifest: dict[str, Any] | None) -> dict[str, Any] | None
     return out
 
 
+def _commit_matches_target(target_commit: str, actual_commit: str) -> bool:
+    t_clean = str(target_commit or "").strip().lower()
+    if not t_clean:
+        return True
+    a_clean = str(actual_commit or "").strip().lower()
+    if not a_clean:
+        return False
+    return a_clean == t_clean or a_clean.startswith(t_clean)
+
+
+def _evaluate_checkout_entry(
+    target_fleet: dict[str, Any] | None,
+    entry: dict[str, Any],
+) -> tuple[bool, bool, list[str]]:
+    """Return `(converged, commit_match, mismatch_reasons)` for a single checkout entry."""
+    target_commit = str((target_fleet or {}).get("commit") or "").strip().lower()
+    actual_commit = str(entry.get("commit") or "").strip().lower()
+    c_match = _commit_matches_target(target_commit, actual_commit)
+    if target_fleet is None:
+        return True, True, []
+
+    reasons: list[str] = []
+    try:
+        e_rev = int(entry.get("rev") or 0)
+    except (TypeError, ValueError):
+        e_rev = 0
+    t_rev = int(target_fleet["rev"])
+    if e_rev != t_rev:
+        reasons.append(f"rev {e_rev} != target {t_rev}")
+
+    res = str(entry.get("result") or "").strip()
+    if not (res == "ok" or res.startswith("ok:")):
+        reasons.append(f"result={res or 'unknown'}")
+
+    if target_commit and not c_match:
+        a_short = actual_commit[:12] if actual_commit else "-"
+        t_short = target_commit[:12]
+        reasons.append(f"commit {a_short} != target {t_short}")
+
+    return len(reasons) == 0, c_match, reasons
+
+
+def evaluate_node_fleet_status(
+    target_fleet: dict[str, Any] | None,
+    node_status: dict[str, Any],
+) -> dict[str, Any]:
+    """Enrich `node_status` with per-checkout status, `converged`, and mismatch diagnostics."""
+    out = copy.deepcopy(node_status)
+    raw_cks = out.get("checkouts")
+    norm_cks: dict[str, dict[str, Any]] = {}
+    if isinstance(raw_cks, dict):
+        for ck_path, ck_val in sorted(raw_cks.items()):
+            if not isinstance(ck_val, dict):
+                continue
+            clean_p = str(ck_val.get("checkout") or ck_path or "").strip()
+            if not clean_p or clean_p == "__default__":
+                continue
+            ck_copy = dict(ck_val)
+            ck_copy["checkout"] = clean_p
+            ck_conv, ck_cm, ck_rsns = _evaluate_checkout_entry(target_fleet, ck_copy)
+            ck_copy["converged"] = ck_conv
+            ck_copy["commit_match"] = ck_cm
+            if ck_rsns:
+                ck_copy["mismatch_reasons"] = ck_rsns
+            norm_cks[clean_p] = ck_copy
+
+    top_checkout = str(out.get("checkout") or "").strip()
+    if not norm_cks and top_checkout:
+        ck_copy = {
+            "checkout": top_checkout,
+            "rev": int(out.get("rev") or 0),
+            "commit": str(out.get("commit") or ""),
+            "target_commit": str(out.get("target_commit") or ""),
+            "result": str(out.get("result") or ""),
+            "config_changed": bool(out.get("config_changed", False)),
+            "code_changed": bool(out.get("code_changed", False)),
+            "attempts": int(out.get("attempts") or 1),
+            "updated_at": float(out.get("updated_at") or 0.0),
+        }
+        ck_conv, ck_cm, ck_rsns = _evaluate_checkout_entry(target_fleet, ck_copy)
+        ck_copy["converged"] = ck_conv
+        ck_copy["commit_match"] = ck_cm
+        if ck_rsns:
+            ck_copy["mismatch_reasons"] = ck_rsns
+        norm_cks[top_checkout] = ck_copy
+
+    top_conv, top_cm, top_reasons = _evaluate_checkout_entry(target_fleet, out)
+
+    mismatch_reasons: list[str] = []
+    checkout_mismatch = False
+    if len(norm_cks) > 1:
+        distinct_commits = sorted(
+            {(str(v.get("commit") or "-")[:12] or "-") for v in norm_cks.values()}
+        )
+        distinct_revs = sorted({int(v.get("rev") or 0) for v in norm_cks.values()})
+        distinct_results = sorted({str(v.get("result") or "-") for v in norm_cks.values()})
+        if len(distinct_commits) > 1 or len(distinct_revs) > 1 or len(distinct_results) > 1:
+            checkout_mismatch = True
+            drift_parts: list[str] = []
+            if len(distinct_commits) > 1:
+                drift_parts.append(f"commits={','.join(distinct_commits)}")
+            if len(distinct_revs) > 1:
+                drift_parts.append(f"revs={','.join(str(r) for r in distinct_revs)}")
+            if len(distinct_results) > 1:
+                drift_parts.append(f"results={','.join(distinct_results)}")
+            mismatch_reasons.append(f"multi-checkout drift ({'; '.join(drift_parts)})")
+
+    if norm_cks:
+        for ck_path, ck_item in norm_cks.items():
+            for rsn in ck_item.get("mismatch_reasons") or []:
+                mismatch_reasons.append(
+                    f"checkout {ck_path}: {rsn}" if len(norm_cks) > 1 else rsn
+                )
+        all_ck_conv = all(bool(v.get("converged")) for v in norm_cks.values())
+        all_ck_cm = all(bool(v.get("commit_match")) for v in norm_cks.values())
+        converged = (not checkout_mismatch) and all_ck_conv
+        commit_match = (not checkout_mismatch) and all_ck_cm
+    else:
+        mismatch_reasons.extend(top_reasons)
+        converged = top_conv
+        commit_match = top_cm
+
+    target_mismatch = bool(target_fleet is not None and not converged)
+    out["checkout"] = top_checkout
+    out["checkouts"] = norm_cks
+    out["converged"] = converged
+    out["commit_match"] = commit_match
+    out["target_mismatch"] = target_mismatch
+    out["checkout_mismatch"] = checkout_mismatch
+    out["mismatch_reasons"] = mismatch_reasons
+    return out
+
+
 def is_node_converged(
     target_fleet: dict[str, Any] | None,
     node_status: dict[str, Any],
 ) -> bool:
-    """Return True iff `node_status` matches `target_fleet`'s `rev` with an `ok` result."""
-    if target_fleet is None:
-        return True
-    try:
-        node_rev = int(node_status.get("rev") or 0)
-    except (TypeError, ValueError):
-        return False
-    if node_rev != int(target_fleet["rev"]):
-        return False
-    res = str(node_status.get("result") or "")
-    if not (res == "ok" or res.startswith("ok:")):
-        return False
-    target_commit = str(target_fleet.get("commit") or "").strip().lower()
-    if target_commit and res == "ok":
-        node_commit = str(node_status.get("commit") or "").strip().lower()
-        if not node_commit:
-            return False
-        if not (node_commit == target_commit or node_commit.startswith(target_commit)):
-            return False
-    return True
+    """Return True iff `node_status` (and all its reported checkouts) match `target_fleet`."""
+    return bool(evaluate_node_fleet_status(target_fleet, node_status)["converged"])
 
 
 def _parse_caps_arg(raw: Any) -> list[str]:
@@ -442,7 +594,11 @@ def set_fleet_manifest(
 # ----------------------------------------------------------------------
 
 
-def load_fleet_applied(cfg_dir: pathlib.Path) -> dict[str, Any] | None:
+def normalize_checkout_path(repo_dir: pathlib.Path | str) -> str:
+    return str(pathlib.Path(repo_dir).expanduser().resolve())
+
+
+def _load_fleet_applied_raw_unlocked(cfg_dir: pathlib.Path) -> dict[str, Any] | None:
     p = fleet_applied_path(cfg_dir)
     if not p.is_file():
         return None
@@ -458,29 +614,173 @@ def load_fleet_applied(cfg_dir: pathlib.Path) -> dict[str, Any] | None:
         return None
 
 
-def save_fleet_applied(cfg_dir: pathlib.Path, doc: dict[str, Any]) -> pathlib.Path:
-    p = fleet_applied_path(cfg_dir)
-    _atomic_write_text(p, json.dumps(doc, indent=2, ensure_ascii=False) + "\n", mode=0o600)
+def max_known_fleet_applied_rev(cfg_dir: pathlib.Path) -> int:
+    """Return highest `rev` recorded across top-level summary and all per-checkout entries."""
+    doc = _load_fleet_applied_raw_unlocked(cfg_dir)
+    if doc is None:
+        return 0
+    max_rev = int(doc.get("rev") or 0)
+    cks = doc.get("checkouts")
+    if isinstance(cks, dict):
+        for v in cks.values():
+            if isinstance(v, dict):
+                r = v.get("rev")
+                if not isinstance(r, bool) and isinstance(r, int) and r > max_rev:
+                    max_rev = r
+    return max_rev
+
+
+def load_fleet_applied(
+    cfg_dir: pathlib.Path,
+    *,
+    repo_dir: pathlib.Path | None = None,
+) -> dict[str, Any] | None:
+    """Load `fleet-applied.json` (globally when `repo_dir is None`, or scoped to `repo_dir`)."""
+    doc = _load_fleet_applied_raw_unlocked(cfg_dir)
+    if doc is None:
+        return None
+    if repo_dir is None:
+        return doc
+
+    ck_key = normalize_checkout_path(repo_dir)
+    cks = doc.get("checkouts")
+    if isinstance(cks, dict) and cks:
+        entry = cks.get(ck_key)
+        if not isinstance(entry, dict):
+            return None
+        rev = entry.get("rev")
+        if isinstance(rev, bool) or not isinstance(rev, int) or rev <= 0:
+            return None
+        merged = copy.deepcopy(entry)
+        merged["checkouts"] = copy.deepcopy(cks)
+        return merged
+
+    top_ck = str(doc.get("checkout") or "").strip()
+    if top_ck and top_ck != ck_key:
+        return None
+    return doc
+
+
+def save_fleet_applied(
+    cfg_dir: pathlib.Path,
+    doc: dict[str, Any],
+    *,
+    repo_dir: pathlib.Path | None = None,
+) -> pathlib.Path:
+    """Atomically save `doc` into `fleet-applied.json` while preserving sibling `checkouts`."""
+    cdir = pathlib.Path(cfg_dir)
+    p = fleet_applied_path(cdir)
+    with _fleet_state_lock(cdir):
+        existing = _load_fleet_applied_raw_unlocked(cdir)
+        checkouts_map: dict[str, dict[str, Any]] = {}
+        if existing is not None:
+            raw_existing_cks = existing.get("checkouts")
+            if isinstance(raw_existing_cks, dict):
+                for k, v in raw_existing_cks.items():
+                    if isinstance(v, dict) and str(k).strip():
+                        checkouts_map[str(k).strip()] = copy.deepcopy(v)
+            else:
+                prev_ck = str(existing.get("checkout") or "").strip()
+                if prev_ck:
+                    prev_entry = {k: copy.deepcopy(v) for k, v in existing.items() if k != "checkouts"}
+                    checkouts_map[prev_ck] = prev_entry
+
+        incoming_cks = doc.get("checkouts")
+        if isinstance(incoming_cks, dict):
+            for k, v in incoming_cks.items():
+                if isinstance(v, dict) and str(k).strip():
+                    checkouts_map[str(k).strip()] = copy.deepcopy(v)
+
+        ck_key = str(doc.get("checkout") or "").strip()
+        if not ck_key and repo_dir is not None:
+            ck_key = normalize_checkout_path(repo_dir)
+
+        clean_entry = {k: copy.deepcopy(v) for k, v in doc.items() if k != "checkouts"}
+        if ck_key:
+            clean_entry["checkout"] = ck_key
+            checkouts_map[ck_key] = copy.deepcopy(clean_entry)
+
+        out_doc = copy.deepcopy(clean_entry)
+        if checkouts_map:
+            out_doc["checkouts"] = checkouts_map
+
+        _atomic_write_text(p, json.dumps(out_doc, indent=2, ensure_ascii=False) + "\n", mode=0o600)
     return p
 
 
-def record_fleet_applied_acked_hub(cfg_dir: pathlib.Path, rev: int, hub_key: str) -> None:
+def record_fleet_applied_acked_hub(
+    cfg_dir: pathlib.Path,
+    rev: int,
+    hub_key: str,
+    *,
+    repo_dir: pathlib.Path | None = None,
+) -> None:
     clean_hk = str(hub_key or "").strip()
     if not clean_hk:
         return
-    with _FLEET_CONVERGE_LOCK:
-        doc = load_fleet_applied(cfg_dir)
-        if doc is None or int(doc.get("rev") or 0) != int(rev):
+    cdir = pathlib.Path(cfg_dir)
+    with _fleet_state_lock(cdir):
+        doc = _load_fleet_applied_raw_unlocked(cdir)
+        if doc is None:
             return
-        acked = doc.get("acked_hubs")
-        acked_list = [str(x) for x in acked] if isinstance(acked, list) else []
-        if clean_hk not in acked_list:
-            acked_list.append(clean_hk)
-            doc["acked_hubs"] = acked_list
-            save_fleet_applied(cfg_dir, doc)
+        changed = False
+        ck_key = normalize_checkout_path(repo_dir) if repo_dir is not None else ""
+        cks = doc.get("checkouts")
+        if ck_key and isinstance(cks, dict) and isinstance(cks.get(ck_key), dict):
+            entry = cks[ck_key]
+            if int(entry.get("rev") or 0) == int(rev):
+                acked_e = entry.get("acked_hubs")
+                e_list = [str(x) for x in acked_e] if isinstance(acked_e, list) else []
+                if clean_hk not in e_list:
+                    e_list.append(clean_hk)
+                    entry["acked_hubs"] = e_list
+                    changed = True
+
+        top_matches = (not ck_key) or (str(doc.get("checkout") or "") == ck_key)
+        if top_matches and int(doc.get("rev") or 0) == int(rev):
+            acked_top = doc.get("acked_hubs")
+            t_list = [str(x) for x in acked_top] if isinstance(acked_top, list) else []
+            if clean_hk not in t_list:
+                t_list.append(clean_hk)
+                doc["acked_hubs"] = t_list
+                changed = True
+
+        if changed:
+            _atomic_write_text(
+                fleet_applied_path(cdir),
+                json.dumps(doc, indent=2, ensure_ascii=False) + "\n",
+                mode=0o600,
+            )
 
 
-def load_fleet_attempts(cfg_dir: pathlib.Path) -> dict[str, Any]:
+def record_fleet_execv_failure(
+    cfg_dir: pathlib.Path,
+    *,
+    repo_dir: pathlib.Path,
+    base_doc: dict[str, Any],
+    error_detail: str,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Record `blocked:execv-failed:<reason>` in `fleet-applied.json` when `os.execv` raises `OSError`."""
+    raw_reason = "".join(
+        ch if (ch.isalnum() or ch in "-_.:") else "_"
+        for ch in str(error_detail or "OSError").strip()
+    ).strip("_:")[:160] or "OSError"
+    updated = {
+        k: copy.deepcopy(v)
+        for k, v in base_doc.items()
+        if k != "checkouts"
+    }
+    updated["checkout"] = normalize_checkout_path(repo_dir)
+    updated["result"] = f"blocked:execv-failed:{raw_reason}"
+    updated["applied_at"] = float(now) if now is not None else time.time()
+    updated["acked_hubs"] = []
+    save_fleet_applied(cfg_dir, updated, repo_dir=repo_dir)
+    saved = load_fleet_applied(cfg_dir, repo_dir=repo_dir)
+    return saved if saved is not None else updated
+
+
+def _load_fleet_attempts_raw_unlocked(cfg_dir: pathlib.Path) -> dict[str, Any]:
     p = fleet_attempts_path(cfg_dir)
     if not p.is_file():
         return {}
@@ -491,17 +791,113 @@ def load_fleet_attempts(cfg_dir: pathlib.Path) -> dict[str, Any]:
         return {}
 
 
-def save_fleet_attempts(cfg_dir: pathlib.Path, doc: dict[str, Any]) -> pathlib.Path:
-    p = fleet_attempts_path(cfg_dir)
-    _atomic_write_text(p, json.dumps(doc, indent=2, ensure_ascii=False) + "\n", mode=0o600)
+def load_fleet_attempts(
+    cfg_dir: pathlib.Path,
+    *,
+    repo_dir: pathlib.Path | None = None,
+) -> dict[str, Any]:
+    doc = _load_fleet_attempts_raw_unlocked(cfg_dir)
+    if not doc or repo_dir is None:
+        return doc
+    ck_key = normalize_checkout_path(repo_dir)
+    cks = doc.get("checkouts")
+    if isinstance(cks, dict):
+        entry = cks.get(ck_key)
+        return dict(entry) if isinstance(entry, dict) else {}
+    top_ck = str(doc.get("checkout") or "").strip()
+    if top_ck and top_ck != ck_key:
+        return {}
+    return doc
+
+
+def save_fleet_attempts(
+    cfg_dir: pathlib.Path,
+    doc: dict[str, Any],
+    *,
+    repo_dir: pathlib.Path | None = None,
+) -> pathlib.Path:
+    cdir = pathlib.Path(cfg_dir)
+    p = fleet_attempts_path(cdir)
+    with _fleet_state_lock(cdir):
+        existing = _load_fleet_attempts_raw_unlocked(cdir)
+        cks: dict[str, dict[str, Any]] = {}
+        raw_cks = existing.get("checkouts") if isinstance(existing, dict) else None
+        if isinstance(raw_cks, dict):
+            for k, v in raw_cks.items():
+                if isinstance(v, dict) and str(k).strip():
+                    cks[str(k).strip()] = copy.deepcopy(v)
+        ck_key = str(doc.get("checkout") or "").strip()
+        if not ck_key and repo_dir is not None:
+            ck_key = normalize_checkout_path(repo_dir)
+        entry = {k: copy.deepcopy(v) for k, v in doc.items() if k != "checkouts"}
+        if ck_key:
+            entry["checkout"] = ck_key
+            cks[ck_key] = copy.deepcopy(entry)
+        out_doc = copy.deepcopy(entry)
+        if cks:
+            out_doc["checkouts"] = cks
+        _atomic_write_text(p, json.dumps(out_doc, indent=2, ensure_ascii=False) + "\n", mode=0o600)
     return p
 
 
-def clear_fleet_attempts(cfg_dir: pathlib.Path) -> None:
-    p = fleet_attempts_path(cfg_dir)
-    if p.exists():
+def clear_fleet_attempts(
+    cfg_dir: pathlib.Path,
+    *,
+    repo_dir: pathlib.Path | None = None,
+) -> None:
+    cdir = pathlib.Path(cfg_dir)
+    p = fleet_attempts_path(cdir)
+    with _fleet_state_lock(cdir):
+        if not p.exists():
+            return
+        if repo_dir is None:
+            with contextlib.suppress(OSError):
+                p.unlink()
+            return
+        ck_key = normalize_checkout_path(repo_dir)
+        existing = _load_fleet_attempts_raw_unlocked(cdir)
+        raw_cks = existing.get("checkouts") if isinstance(existing, dict) else None
+        if isinstance(raw_cks, dict):
+            raw_cks.pop(ck_key, None)
+            if raw_cks:
+                last_entry = next(reversed(raw_cks.values()))
+                out_doc = {k: copy.deepcopy(v) for k, v in last_entry.items() if k != "checkouts"}
+                out_doc["checkouts"] = raw_cks
+                _atomic_write_text(
+                    p, json.dumps(out_doc, indent=2, ensure_ascii=False) + "\n", mode=0o600
+                )
+                return
         with contextlib.suppress(OSError):
             p.unlink()
+
+
+def _serialize_ack_checkout_entry(entry: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        rev = int(entry.get("rev") or 0)
+    except (TypeError, ValueError):
+        return None
+    res = str(entry.get("result") or "").strip()
+    ck = str(entry.get("checkout") or "").strip()
+    if rev <= 0 or not res or not ck:
+        return None
+    ts_raw = entry.get("updated_at", entry.get("applied_at"))
+    try:
+        ts_val = float(ts_raw) if ts_raw is not None else time.time()
+        if not math.isfinite(ts_val) or ts_val <= 0:
+            ts_val = time.time()
+    except (TypeError, ValueError):
+        ts_val = time.time()
+    return {
+        "checkout": ck[:512],
+        "rev": rev,
+        "commit": str(entry.get("commit") or "").strip(),
+        "target_commit": str(entry.get("target_commit") or "").strip(),
+        "result": res[:256],
+        "config_changed": bool(entry.get("config_changed", False)),
+        "code_changed": bool(entry.get("code_changed", False)),
+        "attempts": max(1, int(entry.get("attempts") or 1)),
+        "updated_at": ts_val,
+    }
 
 
 def build_fleet_ack_payload(
@@ -510,8 +906,9 @@ def build_fleet_ack_payload(
     mid: str | None = None,
 ) -> dict[str, Any]:
     """Construct a durable `kind='event'`, `rkind='event'` `fleet-ack` outbound message."""
-    ack_doc = {
+    ack_doc: dict[str, Any] = {
         "rev": int(applied["rev"]),
+        "checkout": str(applied.get("checkout") or ""),
         "commit": str(applied.get("commit") or ""),
         "target_commit": str(applied.get("target_commit") or ""),
         "result": str(applied["result"]),
@@ -520,6 +917,17 @@ def build_fleet_ack_payload(
         "attempts": int(applied.get("attempts") or 1),
         "updated_at": float(applied.get("applied_at") or time.time()),
     }
+    raw_cks = applied.get("checkouts")
+    if isinstance(raw_cks, dict) and raw_cks:
+        ack_cks: dict[str, dict[str, Any]] = {}
+        for k, v in sorted(raw_cks.items()):
+            if isinstance(v, dict):
+                ser = _serialize_ack_checkout_entry({**v, "checkout": v.get("checkout") or k})
+                if ser is not None:
+                    ack_cks[ser["checkout"]] = ser
+        if ack_cks:
+            ack_doc["checkouts"] = ack_cks
+
     msg_id = str(mid).strip() if mid else new_message_id()
     body_json = json.dumps(ack_doc, ensure_ascii=False, separators=(",", ":"))
     return {
@@ -569,8 +977,18 @@ def parse_fleet_ack_payload(payload: dict[str, Any], text: str = "") -> dict[str
     except (TypeError, ValueError):
         attempts = 1
 
-    return {
+    parsed_cks: dict[str, dict[str, Any]] = {}
+    in_cks = raw_ack.get("checkouts")
+    if isinstance(in_cks, dict):
+        for k, v in in_cks.items():
+            if isinstance(v, dict):
+                ser = _serialize_ack_checkout_entry({**v, "checkout": v.get("checkout") or k})
+                if ser is not None:
+                    parsed_cks[ser["checkout"]] = ser
+
+    out: dict[str, Any] = {
         "rev": int(raw_rev),
+        "checkout": str(raw_ack.get("checkout") or "").strip()[:512],
         "commit": str(raw_ack.get("commit") or "").strip(),
         "target_commit": str(raw_ack.get("target_commit") or "").strip(),
         "result": raw_res[:256],
@@ -579,6 +997,9 @@ def parse_fleet_ack_payload(payload: dict[str, Any], text: str = "") -> dict[str
         "attempts": attempts,
         "updated_at": updated_at,
     }
+    if parsed_cks:
+        out["checkouts"] = parsed_cks
+    return out
 
 
 # ----------------------------------------------------------------------
@@ -587,17 +1008,24 @@ def parse_fleet_ack_payload(payload: dict[str, Any], text: str = "") -> dict[str
 
 
 def resolve_fleet_repo_dir() -> pathlib.Path:
-    """Return target Git repository root (`BUS_FLEET_REPO_DIR` override or package repo root)."""
+    """Return checkout root of the running `agent_bus` module (`BUS_FLEET_REPO_DIR` test override)."""
     env_override = (os.environ.get("BUS_FLEET_REPO_DIR") or "").strip()
     if env_override:
         return pathlib.Path(env_override).expanduser().resolve()
     return pathlib.Path(__file__).resolve().parents[2]
 
 
-def _git_env() -> dict[str, str]:
+def has_git_checkout(repo_dir: pathlib.Path) -> bool:
+    """Return True iff `repo_dir/.git` exists (directory for normal clone, file for git worktree)."""
+    return (pathlib.Path(repo_dir) / ".git").exists()
+
+
+def _git_env(repo_dir: pathlib.Path | None = None) -> dict[str, str]:
     env = os.environ.copy()
     env["GIT_TERMINAL_PROMPT"] = "0"
     env.setdefault("LC_ALL", "C")
+    if repo_dir is not None:
+        env["GIT_CEILING_DIRECTORIES"] = str(pathlib.Path(repo_dir).resolve().parent)
     return env
 
 
@@ -609,7 +1037,7 @@ def _run_git(
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", "-C", str(repo_dir), *args],
-        env=_git_env(),
+        env=_git_env(repo_dir),
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -619,7 +1047,7 @@ def _run_git(
 
 
 def _read_git_head_safe(repo_dir: pathlib.Path, *, timeout: float = 5.0) -> str:
-    if not repo_dir.exists():
+    if not repo_dir.exists() or not has_git_checkout(repo_dir):
         return ""
     try:
         res = _run_git(repo_dir, ["rev-parse", "--verify", "HEAD"], timeout=timeout)
@@ -631,6 +1059,8 @@ def _read_git_head_safe(repo_dir: pathlib.Path, *, timeout: float = 5.0) -> str:
 
 
 def _resolve_local_commit_sha(repo_dir: pathlib.Path, spec: str, *, timeout: float = 5.0) -> str:
+    if not has_git_checkout(repo_dir):
+        return ""
     try:
         res = _run_git(repo_dir, ["rev-parse", "--verify", "--quiet", f"{spec}^{{commit}}"], timeout=timeout)
         if res.returncode == 0 and res.stdout.strip():
@@ -689,8 +1119,10 @@ def _is_commit_on_origin(repo_dir: pathlib.Path, resolved_sha: str, *, timeout: 
 def should_attempt_convergence(
     cfg_dir: pathlib.Path,
     incoming_fleet: Any,
+    *,
+    repo_dir: pathlib.Path | None = None,
 ) -> dict[str, Any] | None:
-    """Return validated `incoming_fleet` iff valid and `incoming.rev > local_applied.rev`."""
+    """Return validated `incoming_fleet` iff valid, not downgraded, and `rev > checkout_rev`."""
     try:
         validated = validate_fleet_manifest(incoming_fleet, require_commit=False)
     except FleetValidationError as exc:
@@ -700,9 +1132,20 @@ def should_attempt_convergence(
             flush=True,
         )
         return None
-    applied = load_fleet_applied(cfg_dir)
-    local_rev = int(applied.get("rev") or 0) if applied is not None else 0
-    if validated["rev"] <= local_rev:
+
+    in_rev = int(validated["rev"])
+    max_known_rev = max_known_fleet_applied_rev(cfg_dir)
+    if in_rev < max_known_rev:
+        return None
+
+    eff_repo = (
+        pathlib.Path(repo_dir).expanduser().resolve()
+        if repo_dir is not None
+        else resolve_fleet_repo_dir()
+    )
+    applied_ck = load_fleet_applied(cfg_dir, repo_dir=eff_repo)
+    local_rev = int(applied_ck.get("rev") or 0) if applied_ck is not None else 0
+    if in_rev <= local_rev:
         return None
     return validated
 
@@ -778,19 +1221,21 @@ def converge_fleet_once(
 ) -> FleetConvergenceOutcome:
     """Execute one deterministic self-convergence pass for `incoming_fleet`."""
     cdir = pathlib.Path(cfg_dir)
+    eff_repo = (
+        pathlib.Path(repo_dir).expanduser().resolve()
+        if repo_dir is not None
+        else resolve_fleet_repo_dir()
+    )
+    checkout_str = normalize_checkout_path(eff_repo)
+
     with _FLEET_CONVERGE_LOCK:
-        validated = should_attempt_convergence(cdir, incoming_fleet)
+        validated = should_attempt_convergence(cdir, incoming_fleet, repo_dir=eff_repo)
         if validated is None:
             return FleetConvergenceOutcome(action="ignored", reason="not_needed_or_invalid")
 
         rev = int(validated["rev"])
         target_commit = str(validated.get("commit") or "").strip()
         cur_now = float(now) if now is not None else time.time()
-        eff_repo = (
-            pathlib.Path(repo_dir).expanduser().resolve()
-            if repo_dir is not None
-            else resolve_fleet_repo_dir()
-        )
         eff_timeout = (
             max(0.2, float(git_timeout))
             if git_timeout is not None
@@ -802,9 +1247,10 @@ def converge_fleet_once(
         sup_caps = {str(c) for c in supported_caps}
         missing_caps = [c for c in req_caps if c not in sup_caps]
         if missing_caps:
-            clear_fleet_attempts(cdir)
+            clear_fleet_attempts(cdir, repo_dir=eff_repo)
             doc = {
                 "rev": rev,
+                "checkout": checkout_str,
                 "commit": _read_git_head_safe(eff_repo),
                 "target_commit": target_commit,
                 "applied_at": cur_now,
@@ -815,23 +1261,25 @@ def converge_fleet_once(
                 "attempts": 1,
                 "acked_hubs": [],
             }
-            save_fleet_applied(cdir, doc)
+            save_fleet_applied(cdir, doc, repo_dir=eff_repo)
+            saved_mc = load_fleet_applied(cdir, repo_dir=eff_repo) or doc
             return FleetConvergenceOutcome(
                 action="blocked",
-                applied_doc=doc,
+                applied_doc=saved_mc,
                 needs_restart=False,
                 attempts=1,
                 reason="blocked:missing_caps",
             )
 
-        att_state = load_fleet_attempts(cdir)
+        att_state = load_fleet_attempts(cdir, repo_dir=eff_repo)
         prev_att = int(att_state.get("attempts") or 0) if int(att_state.get("rev") or 0) == rev else 0
         attempt_num = prev_att + 1
 
         def _block_immediately(err_tag: str) -> FleetConvergenceOutcome:
-            clear_fleet_attempts(cdir)
+            clear_fleet_attempts(cdir, repo_dir=eff_repo)
             b_doc = {
                 "rev": rev,
+                "checkout": checkout_str,
                 "commit": _read_git_head_safe(eff_repo),
                 "target_commit": target_commit,
                 "applied_at": cur_now,
@@ -841,10 +1289,11 @@ def converge_fleet_once(
                 "attempts": attempt_num,
                 "acked_hubs": [],
             }
-            save_fleet_applied(cdir, b_doc)
+            save_fleet_applied(cdir, b_doc, repo_dir=eff_repo)
+            saved_b = load_fleet_applied(cdir, repo_dir=eff_repo) or b_doc
             return FleetConvergenceOutcome(
                 action="blocked",
-                applied_doc=b_doc,
+                applied_doc=saved_b,
                 needs_restart=False,
                 attempts=attempt_num,
                 reason=f"blocked:{err_tag}",
@@ -854,16 +1303,19 @@ def converge_fleet_once(
             save_fleet_attempts(
                 cdir,
                 {
+                    "checkout": checkout_str,
                     "rev": rev,
                     "attempts": attempt_num,
                     "last_error": err_tag,
                     "updated_at": cur_now,
                 },
+                repo_dir=eff_repo,
             )
             if attempt_num >= max(1, int(max_attempts)):
-                clear_fleet_attempts(cdir)
+                clear_fleet_attempts(cdir, repo_dir=eff_repo)
                 b_doc = {
                     "rev": rev,
+                    "checkout": checkout_str,
                     "commit": _read_git_head_safe(eff_repo),
                     "target_commit": target_commit,
                     "applied_at": cur_now,
@@ -873,10 +1325,11 @@ def converge_fleet_once(
                     "attempts": attempt_num,
                     "acked_hubs": [],
                 }
-                save_fleet_applied(cdir, b_doc)
+                save_fleet_applied(cdir, b_doc, repo_dir=eff_repo)
+                saved_b = load_fleet_applied(cdir, repo_dir=eff_repo) or b_doc
                 return FleetConvergenceOutcome(
                     action="blocked",
-                    applied_doc=b_doc,
+                    applied_doc=saved_b,
                     needs_restart=False,
                     attempts=attempt_num,
                     reason=f"blocked:{err_tag}",
@@ -889,14 +1342,48 @@ def converge_fleet_once(
                 reason=err_tag,
             )
 
-        # 2) Git commit convergence (`--ff-only`; skipped when `--no-auto-update`)
+        # 2) Non-Git checkout check (`not (repo_dir / ".git").exists()`):
+        #    When `.git` is absent at checkout root, skip `commit` step (`blocked:not-a-git-repo`)
+        #    while still applying `config.json` (`urls`/`hub_peers`) normally!
+        repo_has_git = has_git_checkout(eff_repo)
+        if auto_update and not repo_has_git:
+            try:
+                config_changed = _converge_config_json(cdir, validated)
+            except Exception:
+                return _fail_transient("config_write_failed")
+
+            clear_fleet_attempts(cdir, repo_dir=eff_repo)
+            ng_doc = {
+                "rev": rev,
+                "checkout": checkout_str,
+                "commit": "",
+                "target_commit": target_commit,
+                "applied_at": cur_now,
+                "result": "blocked:not-a-git-repo",
+                "commit_skipped": True,
+                "config_changed": config_changed,
+                "code_changed": False,
+                "attempts": 1,
+                "acked_hubs": [],
+            }
+            save_fleet_applied(cdir, ng_doc, repo_dir=eff_repo)
+            saved_ng = load_fleet_applied(cdir, repo_dir=eff_repo) or ng_doc
+            return FleetConvergenceOutcome(
+                action="blocked",
+                applied_doc=saved_ng,
+                needs_restart=bool(config_changed),
+                attempts=1,
+                reason="blocked:not-a-git-repo",
+            )
+
+        # 3) Git commit convergence (`--ff-only`; skipped when `--no-auto-update`)
         initial_head = _read_git_head_safe(eff_repo)
         final_head = initial_head
         code_changed = False
 
         if auto_update and target_commit:
             if not initial_head:
-                return _fail_transient("not_a_git_repo")
+                return _block_immediately("not-a-git-repo")
 
             already_at_commit = initial_head.lower() == target_commit.lower()
             if not already_at_commit and len(target_commit) >= 7:
@@ -956,16 +1443,17 @@ def converge_fleet_once(
                     final_head = _read_git_head_safe(eff_repo) or resolved_sha
                     code_changed = final_head.lower() != initial_head.lower()
 
-        # 3) `config.json` atomic convergence (`.bak` + preserve unknown keys)
+        # 4) `config.json` atomic convergence (`.bak` + preserve unknown keys)
         try:
             config_changed = _converge_config_json(cdir, validated)
         except Exception:
             return _fail_transient("config_write_failed")
 
-        clear_fleet_attempts(cdir)
+        clear_fleet_attempts(cdir, repo_dir=eff_repo)
         result_str = "ok:no_auto_update" if not auto_update else "ok"
         applied_doc = {
             "rev": rev,
+            "checkout": checkout_str,
             "commit": final_head,
             "target_commit": target_commit,
             "applied_at": cur_now,
@@ -976,10 +1464,11 @@ def converge_fleet_once(
             "attempts": attempt_num,
             "acked_hubs": [],
         }
-        save_fleet_applied(cdir, applied_doc)
+        save_fleet_applied(cdir, applied_doc, repo_dir=eff_repo)
+        saved_ok = load_fleet_applied(cdir, repo_dir=eff_repo) or applied_doc
         return FleetConvergenceOutcome(
             action="applied",
-            applied_doc=applied_doc,
+            applied_doc=saved_ok,
             needs_restart=bool(config_changed or code_changed),
             attempts=attempt_num,
             reason=result_str,

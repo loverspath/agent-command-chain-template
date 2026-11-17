@@ -30,6 +30,11 @@ try:
 except ImportError:  # pragma: no cover - Windows fallback
     fcntl = None  # type: ignore[assignment]
 
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None  # type: ignore[assignment]
+
 from .config import (
     DEFAULT_EVENT_DEADLINE,
     DEFAULT_TASK_DEADLINE,
@@ -164,6 +169,25 @@ def _with_sqlite_retry(fn: Callable[[], T], *, max_retries: int = 80) -> T:
 def _is_pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            kernel32 = getattr(ctypes, "windll", None)
+            if kernel32 is None:
+                return False
+            handle = kernel32.kernel32.OpenProcess(0x1000, False, int(pid))
+            if not handle:
+                return False
+            try:
+                exit_code = ctypes.c_ulong(0)
+                ok = kernel32.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+                return bool(ok and exit_code.value == 259)
+            finally:
+                kernel32.kernel32.CloseHandle(handle)
+        except Exception:
+            return False
+
     stat_path = pathlib.Path(f"/proc/{pid}/stat")
     if stat_path.exists():
         try:
@@ -173,6 +197,8 @@ def _is_pid_alive(pid: int) -> bool:
                 return False
         except Exception:
             pass
+    if not hasattr(os, "kill"):
+        return False
     try:
         os.kill(pid, 0)
         return True
@@ -205,6 +231,9 @@ class WorkerSession:
             try:
                 if fcntl is not None:
                     fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+                elif msvcrt is not None:
+                    os.lseek(self._lock_fd, 0, os.SEEK_SET)
+                    msvcrt.locking(self._lock_fd, msvcrt.LK_UNLCK, 1)
             except Exception:
                 pass
             try:
@@ -229,6 +258,9 @@ def register_worker_session(config_dir: pathlib.Path, label: str) -> WorkerSessi
         os.write(fd, f"{pid} {clean_label} {worker_id}\n".encode("utf-8"))
         if fcntl is not None:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        elif msvcrt is not None:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
     except Exception:
         if fd is not None:
             with contextlib.suppress(OSError):
@@ -285,7 +317,36 @@ def is_worker_owner_alive(
             if fd is not None:
                 with contextlib.suppress(OSError):
                     os.close(fd)
+    elif msvcrt is not None:
+        if not lock_path.exists():
+            return False
+        fd = None
+        try:
+            fd = os.open(str(lock_path), os.O_RDWR)
+            try:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            except OSError:
+                return True
+            with contextlib.suppress(OSError):
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            os.close(fd)
+            fd = None
+            with contextlib.suppress(OSError):
+                lock_path.unlink()
+            return False
+        except FileNotFoundError:
+            return False
+        except Exception:
+            pass
+        finally:
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
 
+    if not lock_path.exists():
+        return False
     if owner_pid is not None:
         return _is_pid_alive(int(owner_pid))
     return False

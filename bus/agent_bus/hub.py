@@ -70,7 +70,7 @@ from .fleet import (
     build_banner_fleet,
     build_health_fleet,
     canonical_fleet_sha256,
-    is_node_converged,
+    evaluate_node_fleet_status,
     load_active_fleet_manifest,
     parse_fleet_ack_payload,
 )
@@ -614,10 +614,7 @@ class BusHub:
         raw_fleet_nodes = self.store.list_fleet_status()
         fleet_nodes: dict[str, dict[str, Any]] = {}
         for node_name, node_st in raw_fleet_nodes.items():
-            fleet_nodes[node_name] = {
-                **node_st,
-                "converged": is_node_converged(fleet_target, node_st),
-            }
+            fleet_nodes[node_name] = evaluate_node_fleet_status(fleet_target, node_st)
         return {
             "ok": True,
             "hub_id": self.hub_id,

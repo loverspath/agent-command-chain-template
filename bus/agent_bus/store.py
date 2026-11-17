@@ -71,13 +71,15 @@ CREATE INDEX IF NOT EXISTS idx_nonces_expires ON nonces(expires_at);
 CREATE TABLE IF NOT EXISTS fleet_status (
     node TEXT PRIMARY KEY,
     rev INTEGER NOT NULL,
+    checkout TEXT NOT NULL DEFAULT '',
     commit_sha TEXT NOT NULL DEFAULT '',
     target_commit TEXT NOT NULL DEFAULT '',
     result TEXT NOT NULL,
     config_changed INTEGER NOT NULL DEFAULT 0,
     code_changed INTEGER NOT NULL DEFAULT 0,
     attempts INTEGER NOT NULL DEFAULT 1,
-    updated_at REAL NOT NULL
+    updated_at REAL NOT NULL,
+    checkouts_json TEXT NOT NULL DEFAULT '{}'
 );
 """
 
@@ -159,6 +161,20 @@ class BusStore:
             self._conn.execute("ALTER TABLE messages ADD COLUMN rkind TEXT")
         if "deadline" not in msg_cols:
             self._conn.execute("ALTER TABLE messages ADD COLUMN deadline REAL")
+
+        fleet_cols = {
+            str(r["name"])
+            for r in self._conn.execute("PRAGMA table_info(fleet_status)").fetchall()
+        }
+        if fleet_cols:
+            if "checkout" not in fleet_cols:
+                self._conn.execute(
+                    "ALTER TABLE fleet_status ADD COLUMN checkout TEXT NOT NULL DEFAULT ''"
+                )
+            if "checkouts_json" not in fleet_cols:
+                self._conn.execute(
+                    "ALTER TABLE fleet_status ADD COLUMN checkouts_json TEXT NOT NULL DEFAULT '{}'"
+                )
 
     def _ensure_hub_id_locked(self) -> str:
         """Transactionally initialize and return persistent `hub_meta.hub_id`."""
@@ -886,6 +902,67 @@ class BusStore:
             self._conn.commit()
             return int(cur.rowcount or 0)
 
+    @staticmethod
+    def _parse_checkouts_json(raw: Any) -> dict[str, dict[str, Any]]:
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(str(raw))
+        except Exception:
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+        out: dict[str, dict[str, Any]] = {}
+        for k, v in parsed.items():
+            ck_p = str((v.get("checkout") if isinstance(v, dict) else None) or k or "").strip()
+            if not ck_p or not isinstance(v, dict):
+                continue
+            out[ck_p] = {
+                "checkout": ck_p,
+                "rev": int(v.get("rev") or 0),
+                "commit": str(v.get("commit") or ""),
+                "target_commit": str(v.get("target_commit") or ""),
+                "result": str(v.get("result") or ""),
+                "config_changed": bool(v.get("config_changed", False)),
+                "code_changed": bool(v.get("code_changed", False)),
+                "attempts": max(1, int(v.get("attempts") or 1)),
+                "updated_at": float(v.get("updated_at") or 0.0),
+            }
+        return out
+
+    @classmethod
+    def _merge_checkout_map_entry(
+        cls,
+        cks: dict[str, dict[str, Any]],
+        entry: dict[str, Any],
+    ) -> None:
+        ck_p = str(entry.get("checkout") or "").strip()
+        if not ck_p:
+            return
+        cand_rev = int(entry.get("rev") or 0)
+        if cand_rev <= 0:
+            return
+        cand_ts = float(entry.get("updated_at") or 0.0)
+        prev = cks.get(ck_p)
+        if prev is not None:
+            prev_rev = int(prev.get("rev") or 0)
+            prev_ts = float(prev.get("updated_at") or 0.0)
+            if (cand_rev, cand_ts) < (prev_rev, prev_ts) and cand_rev < prev_rev:
+                return
+            if cand_rev < prev_rev:
+                return
+        cks[ck_p] = {
+            "checkout": ck_p,
+            "rev": cand_rev,
+            "commit": str(entry.get("commit") or ""),
+            "target_commit": str(entry.get("target_commit") or ""),
+            "result": str(entry.get("result") or "ok"),
+            "config_changed": bool(entry.get("config_changed", False)),
+            "code_changed": bool(entry.get("code_changed", False)),
+            "attempts": max(1, int(entry.get("attempts") or 1)),
+            "updated_at": cand_ts,
+        }
+
     def upsert_fleet_status(
         self,
         *,
@@ -894,12 +971,14 @@ class BusStore:
         commit: str,
         result: str,
         updated_at: float | None = None,
+        checkout: str = "",
         target_commit: str = "",
         config_changed: bool = False,
         code_changed: bool = False,
         attempts: int = 1,
+        checkouts: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """Persist monotonic per-node `fleet-ack` convergence status across hub restarts."""
+        """Persist monotonic per-node & per-checkout `fleet-ack` convergence status across restarts."""
         clean_node = str(node or "").strip().lower()
         if not clean_node:
             raise ValueError("node must be non-empty")
@@ -908,6 +987,7 @@ class BusStore:
         att_int = max(1, int(attempts))
         cfg_int = 1 if config_changed else 0
         code_int = 1 if code_changed else 0
+        clean_checkout = str(checkout or "").strip()
         clean_commit = str(commit or "").strip()
         clean_target = str(target_commit or "").strip()
         clean_result = str(result or "ok").strip()
@@ -917,27 +997,84 @@ class BusStore:
                 "SELECT * FROM fleet_status WHERE node = ?",
                 (clean_node,),
             ).fetchone()
+            merged_cks: dict[str, dict[str, Any]] = {}
+            if existing is not None:
+                merged_cks = self._parse_checkouts_json(existing["checkouts_json"])
+                ex_ck = str(existing["checkout"] or "").strip()
+                if ex_ck and ex_ck not in merged_cks:
+                    self._merge_checkout_map_entry(
+                        merged_cks,
+                        {
+                            "checkout": ex_ck,
+                            "rev": int(existing["rev"]),
+                            "commit": str(existing["commit_sha"]),
+                            "target_commit": str(existing["target_commit"]),
+                            "result": str(existing["result"]),
+                            "config_changed": bool(existing["config_changed"]),
+                            "code_changed": bool(existing["code_changed"]),
+                            "attempts": int(existing["attempts"]),
+                            "updated_at": float(existing["updated_at"]),
+                        },
+                    )
+
+            if isinstance(checkouts, dict):
+                for ck_k, ck_v in checkouts.items():
+                    if isinstance(ck_v, dict):
+                        self._merge_checkout_map_entry(
+                            merged_cks,
+                            {**ck_v, "checkout": ck_v.get("checkout") or ck_k},
+                        )
+
+            if clean_checkout:
+                self._merge_checkout_map_entry(
+                    merged_cks,
+                    {
+                        "checkout": clean_checkout,
+                        "rev": rev_int,
+                        "commit": clean_commit,
+                        "target_commit": clean_target,
+                        "result": clean_result,
+                        "config_changed": bool(cfg_int),
+                        "code_changed": bool(code_int),
+                        "attempts": att_int,
+                        "updated_at": ts,
+                    },
+                )
+
+            cks_json = json.dumps(merged_cks, sort_keys=True, ensure_ascii=False)
+
             if existing is not None and int(existing["rev"]) > rev_int:
-                row = existing
+                self._conn.execute(
+                    "UPDATE fleet_status SET checkouts_json = ? WHERE node = ?",
+                    (cks_json, clean_node),
+                )
+                self._conn.commit()
             else:
+                eff_checkout = clean_checkout
+                if not eff_checkout and existing is not None:
+                    eff_checkout = str(existing["checkout"] or "").strip()
                 self._conn.execute(
                     """
                     INSERT INTO fleet_status
-                        (node, rev, commit_sha, target_commit, result, config_changed, code_changed, attempts, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (node, rev, checkout, commit_sha, target_commit, result,
+                         config_changed, code_changed, attempts, updated_at, checkouts_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(node) DO UPDATE SET
                         rev = excluded.rev,
+                        checkout = excluded.checkout,
                         commit_sha = excluded.commit_sha,
                         target_commit = excluded.target_commit,
                         result = excluded.result,
                         config_changed = excluded.config_changed,
                         code_changed = excluded.code_changed,
                         attempts = excluded.attempts,
-                        updated_at = excluded.updated_at
+                        updated_at = excluded.updated_at,
+                        checkouts_json = excluded.checkouts_json
                     """,
                     (
                         clean_node,
                         rev_int,
+                        eff_checkout,
                         clean_commit,
                         clean_target,
                         clean_result,
@@ -945,18 +1082,20 @@ class BusStore:
                         code_int,
                         att_int,
                         ts,
+                        cks_json,
                     ),
                 )
                 self._conn.commit()
-                row = self._conn.execute(
-                    "SELECT * FROM fleet_status WHERE node = ?",
-                    (clean_node,),
-                ).fetchone()
 
+            row = self._conn.execute(
+                "SELECT * FROM fleet_status WHERE node = ?",
+                (clean_node,),
+            ).fetchone()
             assert row is not None
             return {
                 "node": str(row["node"]),
                 "rev": int(row["rev"]),
+                "checkout": str(row["checkout"]),
                 "commit": str(row["commit_sha"]),
                 "target_commit": str(row["target_commit"]),
                 "result": str(row["result"]),
@@ -964,6 +1103,7 @@ class BusStore:
                 "code_changed": bool(row["code_changed"]),
                 "attempts": int(row["attempts"]),
                 "updated_at": float(row["updated_at"]),
+                "checkouts": self._parse_checkouts_json(row["checkouts_json"]),
             }
 
     def list_fleet_status(self) -> dict[str, dict[str, Any]]:
@@ -976,6 +1116,7 @@ class BusStore:
             for row in rows:
                 out[str(row["node"])] = {
                     "rev": int(row["rev"]),
+                    "checkout": str(row["checkout"]),
                     "commit": str(row["commit_sha"]),
                     "target_commit": str(row["target_commit"]),
                     "result": str(row["result"]),
@@ -983,5 +1124,6 @@ class BusStore:
                     "code_changed": bool(row["code_changed"]),
                     "attempts": int(row["attempts"]),
                     "updated_at": float(row["updated_at"]),
+                    "checkouts": self._parse_checkouts_json(row["checkouts_json"]),
                 }
             return out

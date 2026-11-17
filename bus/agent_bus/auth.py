@@ -107,14 +107,16 @@ def _fire_auth_pointer_crash_hook(generation: int, cfg_dir: pathlib.Path) -> Non
             fd = os.open(str(marker), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             try:
                 os.write(fd, f"{generation}\n".encode("utf-8"))
-                os.fsync(fd)
+                if hasattr(os, "fsync"):
+                    with contextlib.suppress(OSError):
+                        os.fsync(fd)
             finally:
                 os.close(fd)
             os._exit(91)
 
 
 def _fsync_dir(dir_path: pathlib.Path) -> None:
-    if not hasattr(os, "O_RDONLY"):
+    if os.name == "nt" or not hasattr(os, "O_RDONLY") or not hasattr(os, "fsync"):
         return
     fd: int | None = None
     try:
@@ -140,11 +142,14 @@ def _atomic_write_bytes(path: pathlib.Path, data: bytes, *, mode: int = 0o600) -
         written = 0
         while written < len(view):
             written += os.write(fd, view[written:])
-        os.fsync(fd)
+        if hasattr(os, "fsync"):
+            with contextlib.suppress(OSError):
+                os.fsync(fd)
         os.close(fd)
         fd = None
-        with contextlib.suppress(OSError):
-            os.chmod(tmp_path, mode)
+        if os.name != "nt" and hasattr(os, "chmod"):
+            with contextlib.suppress(OSError):
+                os.chmod(tmp_path, mode)
         os.replace(tmp_path, path)
         _fsync_dir(path.parent)
     finally:
@@ -845,8 +850,9 @@ def apply_replica_manifest(
         # New generation (`gen > cur_gen`): stage all files in `auth-gen/<gen>/` and fsync first.
         gen_dir = cdir / "auth-gen" / str(gen)
         gen_dir.mkdir(parents=True, exist_ok=True)
-        with contextlib.suppress(OSError):
-            os.chmod(gen_dir, 0o700)
+        if os.name != "nt" and hasattr(os, "chmod"):
+            with contextlib.suppress(OSError):
+                os.chmod(gen_dir, 0o700)
 
         allow_content = (
             "\n".join(validated["allow"]) + ("\n" if validated["allow"] else "")

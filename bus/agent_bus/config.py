@@ -7,10 +7,12 @@ or runtime tailnet discovery.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import pathlib
 import subprocess
+import sys
 from typing import Any
 
 MAX_HOP = 3
@@ -35,6 +37,8 @@ MAX_FLEET_ATTEMPTS = 3
 DEFAULT_FLEET_POLL_INTERVAL = 15.0
 DEFAULT_FLEET_RETRY_INTERVAL = 1.0
 DEFAULT_FLEET_GIT_TIMEOUT = 30.0
+DEFAULT_WS_PING_INTERVAL = 20.0
+DEFAULT_WS_PING_TIMEOUT = 60.0
 HUB_CAPS: tuple[str, ...] = ("v2", "journal", "rkind", "no_replay", "deadline")
 CLIENT_CAPS: tuple[str, ...] = (*HUB_CAPS, "fleet")
 
@@ -64,8 +68,38 @@ FRAME = (
 )
 
 
+def is_windows() -> bool:
+    return os.name == "nt" or sys.platform.startswith("win")
+
+
+def is_termux() -> bool:
+    return bool((os.environ.get("TERMUX_VERSION") or "").strip()) or (
+        "/com.termux/" in (os.environ.get("PREFIX") or "")
+    )
+
+
 def home_dir() -> pathlib.Path:
-    return pathlib.Path.home()
+    if is_windows():
+        drive = os.environ.get("HOMEDRIVE") or ""
+        hpath = os.environ.get("HOMEPATH") or ""
+        win_combo = f"{drive}{hpath}" if (drive and hpath) else ""
+        env_home = (
+            os.environ.get("USERPROFILE")
+            or os.environ.get("HOME")
+            or win_combo
+        )
+    else:
+        env_home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+        if not env_home and is_termux():
+            prefix = (os.environ.get("PREFIX") or "").strip()
+            if prefix:
+                env_home = str(pathlib.Path(prefix).parent / "home")
+    if env_home and env_home.strip():
+        return pathlib.Path(env_home.strip())
+    try:
+        return pathlib.Path.home()
+    except Exception:
+        return pathlib.Path(os.path.expanduser("~"))
 
 
 def cfg_dir() -> pathlib.Path:
@@ -184,10 +218,9 @@ def save_config(cfg: dict[str, Any], config_dir: pathlib.Path | None = None) -> 
     p = config_file_path(config_dir)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    try:
-        os.chmod(p, 0o600)
-    except Exception:
-        pass
+    if os.name != "nt" and hasattr(os, "chmod"):
+        with contextlib.suppress(OSError):
+            os.chmod(p, 0o600)
     return p
 
 
@@ -480,3 +513,21 @@ def get_fleet_git_timeout(
     if eff_cfg.get("fleet_git_timeout") is not None:
         return max(0.2, float(eff_cfg["fleet_git_timeout"]))
     return float(DEFAULT_FLEET_GIT_TIMEOUT)
+
+
+def get_ws_ping_interval(
+    explicit: float | None = None,
+    cfg: dict[str, Any] | None = None,
+) -> float:
+    return _resolve_positive_timeout(
+        explicit, "BUS_WS_PING_INTERVAL", cfg, "ws_ping_interval", DEFAULT_WS_PING_INTERVAL
+    )
+
+
+def get_ws_ping_timeout(
+    explicit: float | None = None,
+    cfg: dict[str, Any] | None = None,
+) -> float:
+    return _resolve_positive_timeout(
+        explicit, "BUS_WS_PING_TIMEOUT", cfg, "ws_ping_timeout", DEFAULT_WS_PING_TIMEOUT
+    )
