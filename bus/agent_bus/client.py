@@ -29,10 +29,13 @@ import websockets
 from .auth import build_hmac_headers, get_test_local_node_header
 from .bridge import ack_inbox, deliver_to_inbox, read_inbox
 from .config import (
+    FLEET_EXIT_CODE,
     FRAME,
     MAX_HOP,
     MAX_RECONNECT_BACKOFF,
     cfg_dir,
+    fleet_applied_path,
+    fleet_file_path,
     get_ack_timeout,
     get_auth_credentials,
     get_banner_timeout,
@@ -40,12 +43,32 @@ from .config import (
     get_bus_urls,
     get_configured_multi_urls,
     get_dial_timeout,
+    get_fleet_poll_interval,
+    get_fleet_retry_interval,
     get_hello_timeout,
+    get_ws_ping_interval,
+    get_ws_ping_timeout,
     home_dir,
     load_config,
     mode_file_path,
     parse_url_list,
     save_config,
+)
+from .fleet import (
+    FleetConvergeExit,
+    FleetValidationError,
+    build_fleet_ack_payload,
+    converge_fleet_once,
+    evaluate_node_fleet_status,
+    has_git_checkout,
+    is_node_converged,
+    load_fleet_applied,
+    max_known_fleet_applied_rev,
+    record_fleet_applied_acked_hub,
+    record_fleet_execv_failure,
+    resolve_fleet_repo_dir,
+    should_attempt_convergence,
+    validate_fleet_manifest,
 )
 from .journal import (
     NodeJournal,
@@ -54,6 +77,11 @@ from .journal import (
     new_message_id,
     register_worker_session,
 )
+
+try:
+    _INITIAL_CWD: str = os.getcwd()
+except OSError:
+    _INITIAL_CWD = ""
 
 for _st in (sys.stdout, sys.stderr):  # Preserve UTF-8 output under Windows cp949 redirects.
     try:
@@ -166,6 +194,7 @@ def build_ws_hello(
     *,
     no_replay: bool = False,
     hub_id: str | None = None,
+    fleet_notify: bool = False,
 ) -> dict[str, Any]:
     hello: dict[str, Any] = {
         "v": 2,
@@ -177,6 +206,8 @@ def build_ws_hello(
         hello["no_replay"] = True
     if hub_id:
         hello["hub_id"] = str(hub_id)
+    if fleet_notify:
+        hello["fleet_notify"] = True
     token_id, secret = get_auth_credentials()
     if token_id and secret:
         hdrs = build_hmac_headers(token_id, secret, token_id.encode("utf-8"))
@@ -275,7 +306,7 @@ def ask_claude(text: str, frm: str, cwd: pathlib.Path | None = None) -> tuple[st
         claude_args.extend(["--allowedTools", allowed])
     extra_args = os.environ.get("BUS_CLAUDE_EXTRA_ARGS")
     if extra_args:
-        claude_args.extend(shlex.split(extra_args))
+        claude_args.extend(shlex.split(extra_args, posix=(os.name != "nt")))
     r = subprocess.run(
         claude_args,
         input=FRAME.format(frm=frm, text=text),
@@ -294,28 +325,23 @@ def ask_claude(text: str, frm: str, cwd: pathlib.Path | None = None) -> tuple[st
 
 
 def _git_repo_root() -> str:
-    here = pathlib.Path(__file__).resolve().parent
-    try:
-        r = subprocess.run(
-            ["git", "-C", str(here), "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            return r.stdout.strip()
-    except Exception:
-        pass
-    return str(here)
+    return str(resolve_fleet_repo_dir())
 
 
 def update_repo() -> bool:
     """Run git pull --ff-only on repo root. Returns True if HEAD changed."""
-    repo = _git_repo_root()
+    repo_path = pathlib.Path(_git_repo_root())
+    if not has_git_checkout(repo_path):
+        return False
+    repo = str(repo_path)
+    git_env = os.environ.copy()
+    git_env["GIT_TERMINAL_PROMPT"] = "0"
+    git_env["GIT_CEILING_DIRECTORIES"] = str(repo_path.resolve().parent)
 
     def head() -> str:
         return subprocess.run(
             ["git", "-C", repo, "rev-parse", "HEAD"],
+            env=git_env,
             capture_output=True,
             text=True,
             timeout=10,
@@ -325,6 +351,7 @@ def update_repo() -> bool:
     try:
         subprocess.run(
             ["git", "-C", repo, "pull", "--ff-only", "-q"],
+            env=git_env,
             capture_output=True,
             text=True,
             timeout=90,
@@ -336,13 +363,45 @@ def update_repo() -> bool:
     return bool(old and new and old != new)
 
 
+def build_exec_argv(executable: str | None = None) -> list[str]:
+    """Reconstruct exact process launch argv via `sys.orig_argv` (Python 3.10+) or `sys.argv`."""
+    exe = str(executable) if executable else sys.executable
+    orig = getattr(sys, "orig_argv", None)
+    if isinstance(orig, list) and len(orig) >= 1:
+        return [exe, *[str(x) for x in orig[1:]]]
+    return [exe, *[str(x) for x in sys.argv]]
+
+
+def _resolve_execv_executable() -> str:
+    override = (os.environ.get("BUS_TEST_EXECV_EXECUTABLE") or "").strip()
+    return override if override else sys.executable
+
+
+def _exec_self_in_place(*, initial_cwd: str | None = None) -> None:
+    """Flush stdio, restore `initial_cwd`, and replace process image via `os.execv`."""
+    for st in (sys.stdout, sys.stderr):
+        with contextlib.suppress(Exception):
+            st.flush()
+    target_cwd = initial_cwd if initial_cwd is not None else _INITIAL_CWD
+    if target_cwd:
+        os.chdir(target_cwd)
+    if not hasattr(os, "execv"):
+        raise OSError("os.execv is not supported on this platform")
+    exe = _resolve_execv_executable()
+    argv = build_exec_argv(executable=exe)
+    os.execv(exe, argv)
+
+
 def restart_self() -> None:
-    """Restart cleanly without leaking log file handles on Windows watchdogs."""
+    """Restart cleanly in-place via `os.execv` (keeping OS PID on POSIX/Termux)."""
     print("[update] new commit pulled, restarting", flush=True)
-    if os.name == "nt":
-        code = 42 if os.environ.get("BUS_SUPERVISOR") == "1" else 0
-        sys.exit(code)
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+    try:
+        _exec_self_in_place()
+    except OSError as exc:
+        print(f"[update-error] os.execv failed: {exc}", file=sys.stderr, flush=True)
+        if os.name == "nt":
+            code = 42 if os.environ.get("BUS_SUPERVISOR") == "1" else 0
+            sys.exit(code)
 
 
 def _is_inbox_delivery(msg: dict[str, Any], my_label: str) -> tuple[bool, str]:
@@ -421,13 +480,17 @@ async def _open_ws_with_deadlines(
     dial_timeout: float,
     hello_timeout: float,
     banner_timeout: float,
+    ping_interval: float | None = None,
+    ping_timeout: float | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Connect WS (`dial_timeout`), send `hello` (`hello_timeout`), and read banner (`banner_timeout`)."""
+    eff_ping_iv = ping_interval if ping_interval is not None else get_ws_ping_interval()
+    eff_ping_to = ping_timeout if ping_timeout is not None else get_ws_ping_timeout()
     connect_kw: dict[str, Any] = {
         "open_timeout": dial_timeout,
         "close_timeout": 2.0,
-        "ping_interval": 20,
-        "ping_timeout": 60,
+        "ping_interval": eff_ping_iv,
+        "ping_timeout": eff_ping_to,
     }
     if "auth" not in hello:
         test_hdrs = get_test_local_node_header()
@@ -676,647 +739,981 @@ async def run_node(a: argparse.Namespace) -> None:
     peers = {p.strip().lower() for p in a.peers.split(",") if p.strip()}
     raw_cdir = getattr(a, "config_dir", None)
     cdir = pathlib.Path(raw_cdir).expanduser() if raw_cdir else cfg_dir()
-    cfg = load_config(cdir)
-    raw_urls = get_bus_urls(cfg, explicit_url=getattr(a, "url", None))
-    quorum_urls = _resolve_quorum_urls(cdir, raw_urls)
-    dial_timeout = get_dial_timeout(getattr(a, "dial_timeout", None), cfg)
-    hello_timeout = get_hello_timeout(getattr(a, "hello_timeout", None), cfg)
-    banner_timeout = get_banner_timeout(getattr(a, "banner_timeout", None), cfg)
-    ack_timeout = get_ack_timeout(getattr(a, "ack_timeout", None), cfg)
-    work_cwd = pathlib.Path(a.cwd).expanduser() if getattr(a, "cwd", None) else home_dir()
-    ack_events: dict[str, asyncio.Event] = {}
+    auto_update = not bool(getattr(a, "no_auto_update", False))
+    my_repo_dir = resolve_fleet_repo_dir()
+    try:
+        initial_cwd = _INITIAL_CWD or os.getcwd()
+    except OSError:
+        initial_cwd = _INITIAL_CWD
 
-    if not getattr(a, "no_auto_update", False) and update_repo():
+    skip_startup_pull = bool(
+        (os.environ.get("BUS_FLEET_REPO_DIR") or "").strip()
+        or os.environ.get("BUS_TEST_ALLOW_LOCALHOST") == "1"
+        or os.environ.get("BUS_DISABLE_STARTUP_PULL") == "1"
+        or fleet_applied_path(cdir).is_file()
+        or fleet_file_path(cdir).is_file()
+    )
+    if auto_update and not skip_startup_pull and update_repo():
         restart_self()
 
     loop = asyncio.get_running_loop()
-    journal = NodeJournal(cdir)
-    initial_upgrade_cursor = not journal.has_any_cursor(label=label)
-    worker_session = register_worker_session(cdir, label)
-
-    inbox_wakeup = asyncio.Event()
-    inbox_wakeup.set()
-
-    # Startup recovery: transition any orphaned `running` items (from dead workers) to
-    # `uncertain` (`exec_uncertain`) and enqueue `status='exec_uncertain'` into `outbox`.
-    journal.recover_orphaned_running()
-
     main_task = asyncio.current_task()
-    worker_task_ref: list[asyncio.Task[None] | None] = [None]
-    hub_tasks: list[asyncio.Task[None]] = []
-    pump_tasks: set[asyncio.Task[None]] = set()
-    bg_tasks: set[asyncio.Task[Any]] = set()
-    fatal_crash_flag: list[bool] = [False]
-    fatal_exc_slot: list[BaseException | None] = [None]
 
-    hub_states: list[dict[str, Any]] = []
-    for raw_u in raw_urls:
-        ws_u = to_ws_url(raw_u)
-        canon_u = canonical_hub_url(raw_u)
-        known_id = journal.resolve_hub_id(raw_u)
-        ev = asyncio.Event()
-        ev.set()
-        hub_states.append(
-            {
-                "raw_url": raw_u,
-                "ws_url": ws_u,
-                "canon_url": canon_u,
-                "hub_key": known_id or canon_u,
-                "caps": frozenset(),
-                "pump_wakeup": ev,
-                "my_node": "",
-            }
-        )
+    while True:
+        cfg = load_config(cdir)
+        raw_urls = get_bus_urls(cfg, explicit_url=getattr(a, "url", None))
+        quorum_urls = _resolve_quorum_urls(cdir, raw_urls)
+        dial_timeout = get_dial_timeout(getattr(a, "dial_timeout", None), cfg)
+        hello_timeout = get_hello_timeout(getattr(a, "hello_timeout", None), cfg)
+        banner_timeout = get_banner_timeout(getattr(a, "banner_timeout", None), cfg)
+        ack_timeout = get_ack_timeout(getattr(a, "ack_timeout", None), cfg)
+        ws_ping_interval = get_ws_ping_interval(cfg=cfg)
+        ws_ping_timeout = get_ws_ping_timeout(cfg=cfg)
+        fleet_poll_interval = get_fleet_poll_interval(cfg=cfg, config_dir=cdir)
+        fleet_retry_interval = get_fleet_retry_interval(cfg=cfg, config_dir=cdir)
+        work_cwd = pathlib.Path(a.cwd).expanduser() if getattr(a, "cwd", None) else home_dir()
+        ack_events: dict[str, asyncio.Event] = {}
 
-    def _notify_all_pumps() -> None:
-        for st in hub_states:
-            st["pump_wakeup"].set()
+        journal = NodeJournal(cdir)
+        initial_upgrade_cursor = not journal.has_any_cursor(label=label)
+        worker_session = register_worker_session(cdir, label)
 
-    def _cancel_all_siblings(cur: asyncio.Task[Any] | None) -> None:
-        for pt in list(pump_tasks):
-            if pt is not cur and not pt.done():
-                pt.cancel()
-        for ht in list(hub_tasks):
-            if ht is not cur and not ht.done():
-                ht.cancel()
-        wt = worker_task_ref[0]
-        if wt is not None and wt is not cur and not wt.done():
-            wt.cancel()
-        if main_task is not None and main_task is not cur and not main_task.done():
-            main_task.cancel()
+        inbox_wakeup = asyncio.Event()
+        inbox_wakeup.set()
+        fleet_wakeup = asyncio.Event()
+        worker_idle_event = asyncio.Event()
+        worker_idle_event.set()
+        worker_busy_count: list[int] = [0]
+        active_reply_mid_slot: list[str | None] = [None]
+        fleet_drain_requested: list[bool] = [False]
+        fleet_execv_doc_slot: list[dict[str, Any] | None] = [None]
+        pending_fleet_manifest: list[dict[str, Any] | None] = [None]
+        pending_ack_hub_keys: set[str] = set()
 
-    def _fire_test_crash_hook(stage: str, info: dict[str, Any]) -> Any:
-        hook = _TEST_CRASH_HOOK
-        if hook is None:
-            return None
-        try:
-            return hook(stage, info)
-        except BaseException as exc:
-            if getattr(exc, "_fatal_node_crash", False):
-                fatal_crash_flag[0] = True
-                if fatal_exc_slot[0] is None:
-                    fatal_exc_slot[0] = exc
-                _cancel_all_siblings(asyncio.current_task())
-            raise
+        # Startup recovery: transition any orphaned `running` items (from dead workers) to
+        # `uncertain` (`exec_uncertain`) and enqueue `status='exec_uncertain'` into `outbox`.
+        journal.recover_orphaned_running()
 
-    async def _transmit_outbox_item(h_state: dict[str, Any], mid: str, payload: dict[str, Any]) -> str:
-        """Send 1 already-persisted outbox item on `h_state`'s active WS under FIFO lock.
+        worker_task_ref: list[asyncio.Task[None] | None] = [None]
+        fleet_task_ref: list[asyncio.Task[None] | None] = [None]
+        hub_tasks: list[asyncio.Task[None]] = []
+        pump_tasks: set[asyncio.Task[None]] = set()
+        bg_tasks: set[asyncio.Task[Any]] = set()
+        fatal_crash_flag: list[bool] = [False]
+        fatal_exc_slot: list[BaseException | None] = [None]
 
-        Returns `'acked'`, `'rate'`, `'rejected'`, `'already_done'`, or `'disconnected'`.
-        """
-        ws = h_state.get("ws")
-        send_lock: asyncio.Lock | None = h_state.get("send_lock")
-        inflight: dict[str, asyncio.Future[dict[str, Any]]] | None = h_state.get("inflight")
-        current_mid_slot: list[str] | None = h_state.get("current_mid")
-        hub_key = str(h_state.get("hub_key") or h_state["canon_url"])
-        if ws is None or send_lock is None or inflight is None or current_mid_slot is None:
-            return "disconnected"
-
-        async with send_lock:
-            if h_state.get("ws") is not ws:
-                return "disconnected"
-            row = journal.get_outbox_row(mid)
-            if row is not None and row["state"] != "pending":
-                return "already_done"
-            if row is not None and time.time() >= float(row["deadline"]):
-                journal.mark_outbox_expired(mid)
-                return "rejected"
-
-            fut: asyncio.Future[dict[str, Any]] = loop.create_future()
-            inflight[mid] = fut
-            current_mid_slot[:] = [mid]
-            try:
-                await asyncio.wait_for(ws.send(json.dumps(payload, ensure_ascii=False)), timeout=hello_timeout)
-                sys_frame = await asyncio.wait_for(fut, timeout=ack_timeout)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                # Hub failed to ACK within deadline (e.g., SIGSTOP freeze / H2 hang) or socket died:
-                # abort/close `ws` so `_run_hub_loop` exits `async for raw in ws:` and reconnects
-                # cleanly instead of leaving an open socket with a dead `_outbox_pump`.
-                with contextlib.suppress(Exception):
-                    transport = getattr(ws, "transport", None)
-                    if transport is not None:
-                        transport.abort()
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(ws.close(), timeout=0.3)
-                return "disconnected"
-            finally:
-                inflight.pop(mid, None)
-                if current_mid_slot == [mid]:
-                    current_mid_slot.clear()
-
-            if sys_frame.get("ack") == mid and not sys_frame.get("error"):
-                journal.mark_outbox_acked(mid, hub_key, required_hubs=quorum_urls)
-                return "acked"
-            err = str(sys_frame.get("error") or "")
-            if err == "rate":
-                return "rate"
-            if err in _PERMANENT_REJECT_ERRORS:
-                journal.mark_outbox_rejected(mid, hub_key=hub_key, error=err)
-                return "rejected"
-            return "disconnected"
-
-    async def _outbox_pump(h_state: dict[str, Any], ws_conn: Any) -> None:
-        pump_wakeup: asyncio.Event = h_state["pump_wakeup"]
-        rate_backoff = 0.25
-        while h_state.get("ws") is ws_conn and not fatal_crash_flag[0]:
-            pump_wakeup.clear()
-            hub_key = str(h_state.get("hub_key") or h_state["canon_url"])
-            pending = await loop.run_in_executor(
-                None,
-                lambda hk=hub_key: journal.list_outbox_pending(hub_key=hk),
+        hub_states: list[dict[str, Any]] = []
+        for raw_u in raw_urls:
+            ws_u = to_ws_url(raw_u)
+            canon_u = canonical_hub_url(raw_u)
+            known_id = journal.resolve_hub_id(raw_u)
+            ev = asyncio.Event()
+            ev.set()
+            hub_states.append(
+                {
+                    "raw_url": raw_u,
+                    "ws_url": ws_u,
+                    "canon_url": canon_u,
+                    "hub_key": known_id or canon_u,
+                    "caps": frozenset(),
+                    "pump_wakeup": ev,
+                    "my_node": "",
+                }
             )
-            hit_backoff = False
-            for item in pending:
-                if h_state.get("ws") is not ws_conn or fatal_crash_flag[0]:
-                    return
-                if _TEST_CRASH_HOOK is not None and _fire_test_crash_hook("before_outbox_pump_send", item) is False:
-                    continue
-                mid = str(item["id"])
-                res = await _transmit_outbox_item(h_state, mid, item)
-                if res == "disconnected":
-                    return
-                if res == "rate":
-                    hit_backoff = True
-                    break
-                rate_backoff = 0.25
-            if hit_backoff:
-                await asyncio.sleep(rate_backoff)
-                rate_backoff = min(rate_backoff * 1.5, 2.0)
-                continue
+
+        def _notify_all_pumps() -> None:
+            for st in hub_states:
+                st["pump_wakeup"].set()
+
+        def _cancel_all_siblings(
+            cur: asyncio.Task[Any] | None,
+            *,
+            cancel_main: bool = True,
+        ) -> None:
+            for pt in list(pump_tasks):
+                if pt is not cur and not pt.done():
+                    pt.cancel()
+            for ht in list(hub_tasks):
+                if ht is not cur and not ht.done():
+                    ht.cancel()
+            ft = fleet_task_ref[0]
+            if ft is not None and ft is not cur and not ft.done():
+                ft.cancel()
+            wt = worker_task_ref[0]
+            if wt is not None and wt is not cur and not wt.done():
+                wt.cancel()
+            if cancel_main and main_task is not None and main_task is not cur and not main_task.done():
+                main_task.cancel()
+
+        def _submit_fleet_manifest(raw_fleet: Any, *, hub_key: str = "") -> None:
             try:
-                await asyncio.wait_for(pump_wakeup.wait(), timeout=0.25)
-            except asyncio.TimeoutError:
-                pass
-
-    def _broadcast_progress_best_effort(corr_id: str, sender: str) -> None:
-        if not corr_id:
-            return
-        frame_txt = json.dumps(
-            {
-                "op": "progress",
-                "corr_id": corr_id,
-                "to": sender,
-                "status": "running",
-            },
-            ensure_ascii=False,
-        )
-        for st in hub_states:
-            ws_cur = st.get("ws")
-            slock: asyncio.Lock | None = st.get("send_lock")
-            if ws_cur is None or slock is None:
-                continue
-
-            async def _send_prog(w: Any = ws_cur, lk: asyncio.Lock = slock) -> None:
-                with contextlib.suppress(Exception):
-                    async with lk:
-                        await asyncio.wait_for(w.send(frame_txt), timeout=1.5)
-
-            t = asyncio.create_task(_send_prog())
-            bg_tasks.add(t)
-            t.add_done_callback(bg_tasks.discard)
-
-    async def worker() -> None:
-        while not fatal_crash_flag[0]:
-            inbox_wakeup.clear()
-
-            # 1. Transition any expired `queued` items (`now >= deadline`) -> `expired` + outbox reply.
-            expired_replies = await loop.run_in_executor(None, journal.expire_queued_inbox)
-            if expired_replies:
-                _notify_all_pumps()
-
-            # 2. Claim 1 unexpired `queued` item atomically if this node label is an active worker.
-            claimed: dict[str, Any] | None = None
-            allow_claim = get_mode(a.mode) != "watch" and not fatal_crash_flag[0]
-            if allow_claim and _TEST_CRASH_HOOK is not None:
-                if _fire_test_crash_hook("before_claim", {"label": label}) is False:
-                    allow_claim = False
-            if allow_claim:
-                claimed = await loop.run_in_executor(
-                    None,
-                    lambda: journal.claim_next_queued(
-                        worker_id=worker_session.worker_id,
-                        worker_pid=worker_session.pid,
-                    ),
+                validated = validate_fleet_manifest(raw_fleet, require_commit=False)
+            except FleetValidationError as exc:
+                print(
+                    f"[fleet-warn] ignoring invalid fleet manifest: {exc}",
+                    file=sys.stderr,
+                    flush=True,
                 )
+                return
+            in_rev = int(validated["rev"])
+            if in_rev < max_known_fleet_applied_rev(cdir):
+                return
+            applied = load_fleet_applied(cdir, repo_dir=my_repo_dir)
+            local_rev = int(applied.get("rev") or 0) if applied is not None else 0
+            if in_rev <= local_rev:
+                if hub_key and applied is not None:
+                    acked_list = applied.get("acked_hubs")
+                    if not isinstance(acked_list, list) or hub_key not in acked_list:
+                        pending_ack_hub_keys.add(hub_key)
+                        fleet_wakeup.set()
+                return
+            cur_pending = pending_fleet_manifest[0]
+            if cur_pending is None or in_rev >= int(cur_pending["rev"]):
+                pending_fleet_manifest[0] = validated
+                fleet_wakeup.set()
 
-            if claimed is None:
+        def _fire_test_crash_hook(stage: str, info: dict[str, Any]) -> Any:
+            hook = _TEST_CRASH_HOOK
+            if hook is None:
+                return None
+            try:
+                return hook(stage, info)
+            except BaseException as exc:
+                if getattr(exc, "_fatal_node_crash", False):
+                    fatal_crash_flag[0] = True
+                    if fatal_exc_slot[0] is None:
+                        fatal_exc_slot[0] = exc
+                    _cancel_all_siblings(asyncio.current_task())
+                raise
+
+        async def _transmit_outbox_item(h_state: dict[str, Any], mid: str, payload: dict[str, Any]) -> str:
+            """Send 1 already-persisted outbox item on `h_state`'s active WS under FIFO lock.
+
+            Returns `'acked'`, `'rate'`, `'rejected'`, `'already_done'`, or `'disconnected'`.
+            """
+            ws = h_state.get("ws")
+            send_lock: asyncio.Lock | None = h_state.get("send_lock")
+            inflight: dict[str, asyncio.Future[dict[str, Any]]] | None = h_state.get("inflight")
+            current_mid_slot: list[str] | None = h_state.get("current_mid")
+            hub_key = str(h_state.get("hub_key") or h_state["canon_url"])
+            if ws is None or send_lock is None or inflight is None or current_mid_slot is None:
+                return "disconnected"
+
+            async with send_lock:
+                if h_state.get("ws") is not ws:
+                    return "disconnected"
+                row = journal.get_outbox_row(mid)
+                if row is not None and row["state"] != "pending":
+                    return "already_done"
+                if row is not None and time.time() >= float(row["deadline"]):
+                    journal.mark_outbox_expired(mid)
+                    return "rejected"
+
+                fut: asyncio.Future[dict[str, Any]] = loop.create_future()
+                inflight[mid] = fut
+                current_mid_slot[:] = [mid]
                 try:
-                    await asyncio.wait_for(inbox_wakeup.wait(), timeout=0.2)
+                    await asyncio.wait_for(ws.send(json.dumps(payload, ensure_ascii=False)), timeout=hello_timeout)
+                    sys_frame = await asyncio.wait_for(fut, timeout=ack_timeout)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # Hub failed to ACK within deadline (e.g., SIGSTOP freeze / H2 hang) or socket died:
+                    # abort/close `ws` so `_run_hub_loop` exits `async for raw in ws:` and reconnects
+                    # cleanly instead of leaving an open socket with a dead `_outbox_pump`.
+                    with contextlib.suppress(Exception):
+                        transport = getattr(ws, "transport", None)
+                        if transport is not None:
+                            transport.abort()
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(ws.close(), timeout=0.3)
+                    return "disconnected"
+                finally:
+                    inflight.pop(mid, None)
+                    if current_mid_slot == [mid]:
+                        current_mid_slot.clear()
+
+                if sys_frame.get("ack") == mid and not sys_frame.get("error"):
+                    journal.mark_outbox_acked(mid, hub_key, required_hubs=quorum_urls)
+                    return "acked"
+                err = str(sys_frame.get("error") or "")
+                if err == "rate":
+                    return "rate"
+                if err in _PERMANENT_REJECT_ERRORS:
+                    journal.mark_outbox_rejected(mid, hub_key=hub_key, error=err)
+                    return "rejected"
+                return "disconnected"
+
+        async def _outbox_pump(h_state: dict[str, Any], ws_conn: Any) -> None:
+            pump_wakeup: asyncio.Event = h_state["pump_wakeup"]
+            rate_backoff = 0.25
+            while h_state.get("ws") is ws_conn and not fatal_crash_flag[0]:
+                pump_wakeup.clear()
+                hub_key = str(h_state.get("hub_key") or h_state["canon_url"])
+                pending = await loop.run_in_executor(
+                    None,
+                    lambda hk=hub_key: journal.list_outbox_pending(hub_key=hk),
+                )
+                hit_backoff = False
+                for item in pending:
+                    if h_state.get("ws") is not ws_conn or fatal_crash_flag[0]:
+                        return
+                    if _TEST_CRASH_HOOK is not None and _fire_test_crash_hook("before_outbox_pump_send", item) is False:
+                        continue
+                    mid = str(item["id"])
+                    res = await _transmit_outbox_item(h_state, mid, item)
+                    if res == "disconnected":
+                        return
+                    if res == "rate":
+                        hit_backoff = True
+                        break
+                    rate_backoff = 0.25
+                if hit_backoff:
+                    await asyncio.sleep(rate_backoff)
+                    rate_backoff = min(rate_backoff * 1.5, 2.0)
+                    continue
+                try:
+                    await asyncio.wait_for(pump_wakeup.wait(), timeout=0.25)
                 except asyncio.TimeoutError:
                     pass
-                continue
 
-            mid = str(claimed["id"])
-            corr_id = str(claimed.get("corr_id") or mid)
-            sender = str(claimed["from"])
-
-            _broadcast_progress_best_effort(corr_id, sender)
-
-            if _TEST_CRASH_HOOK is not None:
-                _fire_test_crash_hook("after_claim_before_exec", claimed)
-
-            try:
-                ans, status = await loop.run_in_executor(
-                    None, ask_claude, str(claimed["text"]), sender, work_cwd
-                )
-            except Exception as exc:
-                ans, status = f"[agent error] {exc}", "exec_error"
-
-            if _TEST_CRASH_HOOK is not None:
-                _fire_test_crash_hook("after_exec_before_save", claimed)
-
-            reply_payload = await loop.run_in_executor(
-                None,
-                lambda: journal.complete_inbox_and_enqueue_reply(
-                    mid,
-                    result_status=status,
-                    result_text=ans,
-                ),
+        def _broadcast_progress_best_effort(corr_id: str, sender: str) -> None:
+            if not corr_id:
+                return
+            frame_txt = json.dumps(
+                {
+                    "op": "progress",
+                    "corr_id": corr_id,
+                    "to": sender,
+                    "status": "running",
+                },
+                ensure_ascii=False,
             )
+            for st in hub_states:
+                ws_cur = st.get("ws")
+                slock: asyncio.Lock | None = st.get("send_lock")
+                if ws_cur is None or slock is None:
+                    continue
 
-            if _TEST_CRASH_HOOK is not None:
-                _fire_test_crash_hook("after_save_before_send", claimed)
+                async def _send_prog(w: Any = ws_cur, lk: asyncio.Lock = slock) -> None:
+                    with contextlib.suppress(Exception):
+                        async with lk:
+                            await asyncio.wait_for(w.send(frame_txt), timeout=1.5)
 
-            if reply_payload is not None:
+                t = asyncio.create_task(_send_prog())
+                bg_tasks.add(t)
+                t.add_done_callback(bg_tasks.discard)
+
+        async def _wait_outbox_mid_acked_on_connected_hubs(mid: str, *, timeout: float = 3.0) -> list[str]:
+            _notify_all_pumps()
+            deadline_m = time.monotonic() + max(0.05, float(timeout))
+            acked_set: set[str] = set()
+            while time.monotonic() < deadline_m and not fatal_crash_flag[0]:
+                row = await loop.run_in_executor(None, journal.get_outbox_row, mid)
+                if row is None:
+                    return sorted(acked_set)
+                try:
+                    parsed_acked = json.loads(row.get("acked_hubs") or "[]")
+                    if isinstance(parsed_acked, list):
+                        acked_set = {str(x) for x in parsed_acked if str(x)}
+                except Exception:
+                    pass
+                connected_keys = [
+                    str(st["hub_key"])
+                    for st in hub_states
+                    if st.get("ws") is not None and st.get("hub_key")
+                ]
+                if row.get("state") in ("done", "expired", "rejected"):
+                    return sorted(acked_set)
+                if connected_keys and all(hk in acked_set for hk in connected_keys):
+                    return sorted(acked_set)
                 _notify_all_pumps()
-                await asyncio.sleep(0)
+                await asyncio.sleep(0.02)
+            return sorted(acked_set)
 
-    async def _run_hub_loop(hub_idx: int, h_state: dict[str, Any]) -> None:
-        raw_url = h_state["raw_url"]
-        ws_url = h_state["ws_url"]
-        canon_url = h_state["canon_url"]
-        is_primary = hub_idx == 0
-        delay = 0.5
-        carry_live_seq = 0
-        known_hub_id = journal.resolve_hub_id(raw_url)
-        active_hub_key = known_hub_id or canon_url
-        h_state["hub_key"] = active_hub_key
+        async def _is_node_completely_idle() -> bool:
+            if worker_busy_count[0] > 0:
+                return False
+            running_cnt = await loop.run_in_executor(None, journal.count_inbox_running)
+            if running_cnt > 0:
+                return False
+            rep_mid = active_reply_mid_slot[0]
+            if rep_mid:
+                await _wait_outbox_mid_acked_on_connected_hubs(rep_mid, timeout=3.0)
+                if active_reply_mid_slot[0] == rep_mid:
+                    active_reply_mid_slot[0] = None
+            if worker_busy_count[0] > 0:
+                return False
+            return (await loop.run_in_executor(None, journal.count_inbox_running)) == 0
 
-        while not fatal_crash_flag[0]:
-            ws: Any = None
-            pump_task: asyncio.Task[None] | None = None
-            inflight: dict[str, asyncio.Future[dict[str, Any]]] = {}
-            current_mid_slot: list[str] = []
-            reconnect_immediately = False
-            try:
-                legacy_seq = load_cursor(label, cdir) if is_primary else 0
-                hello_since = journal.get_cursor(
-                    active_hub_key,
-                    label=label,
-                    fallback_seq=legacy_seq,
-                    use_fallback_when_missing=(
-                        is_primary and initial_upgrade_cursor and known_hub_id is None
-                    ),
+        async def worker() -> None:
+            while not fatal_crash_flag[0]:
+                inbox_wakeup.clear()
+
+                # 1. Transition any expired `queued` items (`now >= deadline`) -> `expired` + outbox reply.
+                expired_replies = await loop.run_in_executor(None, journal.expire_queued_inbox)
+                if expired_replies:
+                    _notify_all_pumps()
+
+                # 2. Claim 1 unexpired `queued` item atomically if this node label is an active worker.
+                claimed: dict[str, Any] | None = None
+                allow_claim = (
+                    get_mode(a.mode) != "watch"
+                    and not fatal_crash_flag[0]
+                    and not fleet_drain_requested[0]
                 )
-                ws, banner = await _open_ws_with_deadlines(
-                    ws_url,
-                    build_ws_hello(
-                        label,
-                        hello_since,
-                        accept_inbox=(label == "main"),
-                        hub_id=known_hub_id,
-                    ),
-                    dial_timeout=dial_timeout,
-                    hello_timeout=hello_timeout,
-                    banner_timeout=banner_timeout,
-                )
-
-                # Reset exponential backoff ONLY after a valid connected banner arrives (F15).
-                delay = 0.5
-                my_node = str(banner["you"]).split("/", 1)[0]
-                h_state["my_node"] = my_node
-                banner_seq = int(banner.get("seq") or 0)
-                raw_caps = banner.get("caps")
-                h_state["caps"] = (
-                    frozenset(str(c) for c in raw_caps) if isinstance(raw_caps, list) else frozenset()
-                )
-
-                replay_count = 0
-                last_replay_seq = hello_since
-                max_live_seq = carry_live_seq
-
-                if banner.get("hub_id"):
-                    banner_hub_id = str(banner["hub_id"])
-                    journal.remember_hub_id(raw_url, banner_hub_id)
-                    if known_hub_id is not None and banner_hub_id != known_hub_id:
-                        # Hub DB recreated with new hub_id (H10) -> cursor starts at 0 & outbox republishes.
-                        active_hub_key = banner_hub_id
-                        known_hub_id = banner_hub_id
-                        hello_since = 0
-                        last_replay_seq = 0
-                    else:
-                        active_hub_key = banner_hub_id
-                        if known_hub_id is None and hello_since > 0 and hello_since <= banner_seq:
-                            journal.advance_cursor(active_hub_key, hello_since, label=label)
-                        known_hub_id = banner_hub_id
-                else:
-                    # Legacy hub without `hub_id` / `caps` (F16 fallback): key by canonical URL.
-                    journal.clear_hub_id(raw_url)
-                    known_hub_id = None
-                    active_hub_key = canon_url
-
-                h_state["hub_key"] = active_hub_key
-                h_state["ws"] = ws
-                h_state["send_lock"] = asyncio.Lock()
-                h_state["inflight"] = inflight
-                h_state["current_mid"] = current_mid_slot
-
-                print(f"[hub:{ws_url}] {banner.get('text')}", flush=True)
-                if banner.get("rules"):
-                    print(banner["rules"], flush=True)
-
-                h_state["pump_wakeup"].set()
-                pump_task = asyncio.create_task(_outbox_pump(h_state, ws))
-                pump_tasks.add(pump_task)
-
-                async for raw in ws:
-                    m = json.loads(raw)
-                    op = m.get("op")
-                    if op == "sys":
-                        ack_id = str(m["ack"]) if m.get("ack") else ""
-                        if ack_id:
-                            if ack_id in ack_events:
-                                ack_events[ack_id].set()
-                            fut = inflight.get(ack_id)
-                            if fut is not None and not fut.done():
-                                fut.set_result(m)
-                            elif not m.get("error"):
-                                journal.mark_outbox_acked(ack_id, active_hub_key, required_hubs=quorum_urls)
-                        elif m.get("error") and current_mid_slot:
-                            cur_id = current_mid_slot[0]
-                            fut = inflight.get(cur_id)
-                            if fut is not None and not fut.done():
-                                fut.set_result(m)
-
-                        print(f"[hub:{ws_url}] {m.get('text')}", flush=True)
-                        if m.get("rules"):
-                            print(m["rules"], flush=True)
-                        continue
-
-                    if op != "msg":
-                        continue
-
-                    seq = int(m["seq"])
-                    mid = str(m.get("id") or f"seq-{seq}")
-                    sender = str(m.get("from") or "")
-                    corr_id = str(m["corr_id"]) if m.get("corr_id") is not None else None
-                    kind = str(m.get("kind") or "task").strip().lower()
-                    raw_text = str(m.get("text") or "")
-                    hop = int(m.get("hop", 0) or 0)
-                    received_at = time.time()
-                    msg_ts = float(m.get("ts") or received_at)
-                    msg_deadline = compute_deadline(
-                        kind=kind,
-                        base_ts=msg_ts,
-                        explicit_deadline=m.get("deadline"),
-                    )
-                    is_replay = bool(m.get("replay"))
-
-                    print(f"[{sender}] hop={hop} {raw_text}", flush=True)
-                    node = sender.split("/")[0].lower()
-                    peer_ok = (not peers) or (node in peers)
-
-                    # 1. `!update` control path (inbox commit -> hub ack -> cursor).
-                    if raw_text.strip() == "!update":
-                        inserted, _ = await loop.run_in_executor(
-                            None,
-                            lambda m_id=mid, s_from=sender, c_id=corr_id, k_val=kind, r_txt=raw_text, h_val=hop, r_at=received_at, m_dl=msg_deadline: journal.receive_inbox(
-                                mid=m_id,
-                                sender=s_from,
-                                corr_id=c_id,
-                                kind=k_val,
-                                text=r_txt,
-                                hop=h_val,
-                                received_at=r_at,
-                                deadline=m_dl,
-                                eligible=False,
-                            ),
-                        )
-                        with contextlib.suppress(Exception):
-                            await ws.send(json.dumps({"op": "ack", "seq": seq, "id": mid}))
-                        if is_replay:
-                            replay_count += 1
-                            last_replay_seq = max(last_replay_seq, seq)
-                            watermark = last_replay_seq
-                        else:
-                            max_live_seq = max(max_live_seq, seq)
-                            watermark = max(last_replay_seq, max_live_seq)
-                        journal.advance_cursor(active_hub_key, watermark, label=label)
-                        if is_primary:
-                            save_cursor(label, watermark, cdir)
-                        if (
-                            inserted
-                            and received_at < msg_deadline
-                            and peer_ok
-                            and m.get("trust") != "external"
-                        ):
-                            if await loop.run_in_executor(None, update_repo):
-                                restart_self()
-                        if is_replay and replay_count >= 500 and last_replay_seq > hello_since and last_replay_seq < banner_seq:
-                            carry_live_seq = max_live_seq
-                            reconnect_immediately = True
-                            break
-                        continue
-
-                    # 2. ACC bridge / local `inbox.jsonl` delivery path (atomic dedup across dual hubs).
-                    is_inbox_msg, target_sess = _is_inbox_delivery(m, label)
-                    if is_inbox_msg:
-                        inserted, _ = await loop.run_in_executor(
-                            None,
-                            lambda m_id=mid, s_from=sender, c_id=corr_id, k_val=kind, r_txt=raw_text, h_val=hop, r_at=received_at, m_dl=msg_deadline: journal.receive_inbox(
-                                mid=m_id,
-                                sender=s_from,
-                                corr_id=c_id,
-                                kind=k_val,
-                                text=r_txt,
-                                hop=h_val,
-                                received_at=r_at,
-                                deadline=m_dl,
-                                eligible=False,
-                            ),
-                        )
-                        if inserted and received_at < msg_deadline:
-                            deliver_to_inbox(m, cfg_dir=cdir, target_session=target_sess)
-                        with contextlib.suppress(Exception):
-                            await ws.send(json.dumps({"op": "ack", "seq": seq, "id": mid}))
-                        if is_replay:
-                            replay_count += 1
-                            last_replay_seq = max(last_replay_seq, seq)
-                            watermark = last_replay_seq
-                        else:
-                            max_live_seq = max(max_live_seq, seq)
-                            watermark = max(last_replay_seq, max_live_seq)
-                        journal.advance_cursor(active_hub_key, watermark, label=label)
-                        if is_primary:
-                            save_cursor(label, watermark, cdir)
-                        if is_replay and replay_count >= 500 and last_replay_seq > hello_since and last_replay_seq < banner_seq:
-                            carry_live_seq = max_live_seq
-                            reconnect_immediately = True
-                            break
-                        continue
-
-                    # 3. Standard request/watch path:
-                    #    Step A: Commit into `journal.db` `inbox` (`queued` vs `skipped`).
-                    #    Step B: Send hub `ack` ONLY after `inbox` transaction commits.
-                    #    Step C: Advance monotonic cursor watermark for this hub.
-                    mode_now = get_mode(a.mode)
-                    self_key = f"{my_node}/{label}".lower() if my_node else ""
-                    not_self = not (self_key and sender.lower() == self_key)
-                    in_status = str(m.get("status") or "ok").strip().lower()
-                    in_rkind = str(m.get("rkind") or "").strip().lower()
-                    eligible = (
-                        not_self
-                        and (in_rkind != "result")
-                        and (in_status not in _TERMINAL_ERROR_STATUSES)
-                        and (hop + 1 <= MAX_HOP)
-                        and peer_ok
-                        and should_reply(mode_now, raw_text)
-                    )
-                    stored_text = strip_ask(raw_text) if eligible else raw_text
-
-                    changed, eff_state = await loop.run_in_executor(
+                if allow_claim and _TEST_CRASH_HOOK is not None:
+                    if _fire_test_crash_hook("before_claim", {"label": label}) is False:
+                        allow_claim = False
+                if allow_claim:
+                    claimed = await loop.run_in_executor(
                         None,
-                        lambda m_id=mid, s_from=sender, c_id=corr_id, k_val=kind, s_txt=stored_text, h_val=hop, r_at=received_at, m_dl=msg_deadline, el=eligible: journal.receive_inbox(
-                            mid=m_id,
-                            sender=s_from,
-                            corr_id=c_id,
-                            kind=k_val,
-                            text=s_txt,
-                            hop=h_val,
-                            received_at=r_at,
-                            deadline=m_dl,
-                            eligible=el,
+                        lambda: journal.claim_next_queued(
+                            worker_id=worker_session.worker_id,
+                            worker_pid=worker_session.pid,
                         ),
                     )
 
-                    with contextlib.suppress(Exception):
-                        await ws.send(json.dumps({"op": "ack", "seq": seq, "id": mid}))
+                if claimed is None:
+                    try:
+                        await asyncio.wait_for(inbox_wakeup.wait(), timeout=0.2)
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
 
-                    if is_replay:
-                        replay_count += 1
-                        last_replay_seq = max(last_replay_seq, seq)
-                        watermark = last_replay_seq
+                worker_busy_count[0] += 1
+                worker_idle_event.clear()
+                try:
+                    mid = str(claimed["id"])
+                    corr_id = str(claimed.get("corr_id") or mid)
+                    sender = str(claimed["from"])
+
+                    _broadcast_progress_best_effort(corr_id, sender)
+
+                    if _TEST_CRASH_HOOK is not None:
+                        _fire_test_crash_hook("after_claim_before_exec", claimed)
+
+                    try:
+                        ans, status = await loop.run_in_executor(
+                            None, ask_claude, str(claimed["text"]), sender, work_cwd
+                        )
+                    except Exception as exc:
+                        ans, status = f"[agent error] {exc}", "exec_error"
+
+                    if _TEST_CRASH_HOOK is not None:
+                        _fire_test_crash_hook("after_exec_before_save", claimed)
+
+                    reply_payload = await loop.run_in_executor(
+                        None,
+                        lambda: journal.complete_inbox_and_enqueue_reply(
+                            mid,
+                            result_status=status,
+                            result_text=ans,
+                        ),
+                    )
+
+                    if _TEST_CRASH_HOOK is not None:
+                        _fire_test_crash_hook("after_save_before_send", claimed)
+
+                    if reply_payload is not None:
+                        active_reply_mid_slot[0] = str(reply_payload["id"])
+                        _notify_all_pumps()
+                        await asyncio.sleep(0)
+                finally:
+                    worker_busy_count[0] = max(0, worker_busy_count[0] - 1)
+                    if worker_busy_count[0] == 0:
+                        worker_idle_event.set()
+                        fleet_wakeup.set()
+
+        async def _fleet_converge_loop() -> None:
+            while not fatal_crash_flag[0]:
+                fleet_wakeup.clear()
+
+                if pending_ack_hub_keys and pending_fleet_manifest[0] is None:
+                    applied_now = await loop.run_in_executor(
+                        None, lambda: load_fleet_applied(cdir, repo_dir=my_repo_dir)
+                    )
+                    if applied_now is not None:
+                        pending_ack_hub_keys.clear()
+                        ack_msg = build_fleet_ack_payload(applied_now)
+                        saved_ack = await loop.run_in_executor(None, journal.enqueue_outbox, ack_msg)
+                        acked_hks = await _wait_outbox_mid_acked_on_connected_hubs(
+                            str(saved_ack["id"]),
+                            timeout=2.5,
+                        )
+                        for hk in acked_hks:
+                            await loop.run_in_executor(
+                                None,
+                                lambda h_key=hk, r_num=int(applied_now["rev"]): record_fleet_applied_acked_hub(
+                                    cdir,
+                                    r_num,
+                                    h_key,
+                                    repo_dir=my_repo_dir,
+                                ),
+                            )
                     else:
-                        max_live_seq = max(max_live_seq, seq)
-                        watermark = max(last_replay_seq, max_live_seq)
+                        pending_ack_hub_keys.clear()
 
-                    journal.advance_cursor(active_hub_key, watermark, label=label)
-                    if is_primary:
-                        save_cursor(label, watermark, cdir)
+                candidate = pending_fleet_manifest[0]
+                if candidate is None:
+                    try:
+                        await asyncio.wait_for(fleet_wakeup.wait(), timeout=fleet_poll_interval)
+                    except asyncio.TimeoutError:
+                        for st in hub_states:
+                            ws_cur = st.get("ws")
+                            slock: asyncio.Lock | None = st.get("send_lock")
+                            if ws_cur is not None and slock is not None:
+                                with contextlib.suppress(Exception):
+                                    async with slock:
+                                        await asyncio.wait_for(
+                                            ws_cur.send(json.dumps({"op": "health"})),
+                                            timeout=1.5,
+                                        )
+                    continue
 
-                    if changed and eff_state == "queued":
-                        inbox_wakeup.set()
+                still_needed = await loop.run_in_executor(
+                    None,
+                    lambda cand=candidate: should_attempt_convergence(
+                        cdir, cand, repo_dir=my_repo_dir
+                    ),
+                )
+                if still_needed is None:
+                    if pending_fleet_manifest[0] is candidate:
+                        pending_fleet_manifest[0] = None
+                    fleet_drain_requested[0] = False
+                    inbox_wakeup.set()
+                    continue
 
-                    if _TEST_CRASH_HOOK is not None and changed and eff_state == "queued":
-                        _fire_test_crash_hook("after_inbox_ack_before_claim", {"id": mid, "seq": seq})
+                if not await _is_node_completely_idle():
+                    if not fleet_drain_requested[0]:
+                        fleet_drain_requested[0] = True
+                        print(
+                            f"[fleet] rev={still_needed['rev']} detected while worker busy; "
+                            "draining active execution before convergence",
+                            flush=True,
+                        )
+                    try:
+                        await asyncio.wait_for(worker_idle_event.wait(), timeout=0.1)
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
 
-                    if is_replay and replay_count >= 500 and last_replay_seq > hello_since and last_replay_seq < banner_seq:
-                        carry_live_seq = max_live_seq
-                        reconnect_immediately = True
-                        break
-                else:
-                    carry_live_seq = 0
+                fleet_drain_requested[0] = True
+                if not await _is_node_completely_idle():
+                    continue
 
-                if not reconnect_immediately and max_live_seq > last_replay_seq and replay_count < 500:
-                    journal.advance_cursor(active_hub_key, max_live_seq, label=label)
-                    if is_primary:
-                        save_cursor(label, max_live_seq, cdir)
-                    carry_live_seq = 0
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                if getattr(exc, "_fatal_node_crash", False):
-                    raise
-                is_auth_err, auth_detail = _extract_ws_auth_error(exc)
-                if is_auth_err:
+                outcome = await loop.run_in_executor(
+                    None,
+                    lambda cand=still_needed: converge_fleet_once(
+                        cdir,
+                        cand,
+                        auto_update=auto_update,
+                        repo_dir=my_repo_dir,
+                    ),
+                )
+
+                if outcome.action == "retry_later":
+                    fleet_drain_requested[0] = False
+                    inbox_wakeup.set()
                     print(
-                        f"[auth-error:{ws_url}: {auth_detail}] retry in {delay:.1f}s",
+                        f"[fleet] rev={still_needed['rev']} transient failure ({outcome.reason}) "
+                        f"attempt={outcome.attempts}; retrying in {fleet_retry_interval:.2f}s",
                         file=sys.stderr,
                         flush=True,
                     )
-                else:
+                    try:
+                        await asyncio.wait_for(fleet_wakeup.wait(), timeout=fleet_retry_interval)
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
+
+                if pending_fleet_manifest[0] is candidate:
+                    pending_fleet_manifest[0] = None
+                pending_ack_hub_keys.clear()
+
+                if outcome.applied_doc is not None:
+                    ack_payload = build_fleet_ack_payload(outcome.applied_doc)
+                    saved_ack = await loop.run_in_executor(None, journal.enqueue_outbox, ack_payload)
+                    acked_hks = await _wait_outbox_mid_acked_on_connected_hubs(
+                        str(saved_ack["id"]),
+                        timeout=3.0,
+                    )
+                    for hk in acked_hks:
+                        await loop.run_in_executor(
+                            None,
+                            lambda h_key=hk, r_num=int(outcome.applied_doc["rev"]): record_fleet_applied_acked_hub(
+                                cdir,
+                                r_num,
+                                h_key,
+                                repo_dir=my_repo_dir,
+                            ),
+                        )
                     print(
-                        f"[disconnected:{ws_url}: {type(exc).__name__}] retry in {delay:.1f}s",
+                        f"[fleet] rev={outcome.applied_doc['rev']} result={outcome.applied_doc['result']} "
+                        f"checkout={outcome.applied_doc.get('checkout') or my_repo_dir} "
+                        f"config_changed={outcome.applied_doc['config_changed']} "
+                        f"code_changed={outcome.applied_doc['code_changed']} "
+                        f"attempts={outcome.applied_doc['attempts']}",
                         flush=True,
                     )
-            finally:
-                h_state.pop("ws", None)
-                h_state.pop("send_lock", None)
-                h_state.pop("inflight", None)
-                h_state.pop("current_mid", None)
-                for fut in list(inflight.values()):
-                    if not fut.done():
-                        fut.set_exception(ConnectionError("websocket disconnected"))
-                inflight.clear()
-                if pump_task is not None:
-                    pump_tasks.discard(pump_task)
-                    pump_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError, Exception):
-                        await pump_task
-                if ws is not None:
-                    with contextlib.suppress(Exception):
-                        await ws.close()
 
-            if fatal_crash_flag[0]:
-                break
-            if reconnect_immediately:
-                continue
-            await asyncio.sleep(delay * (0.5 + random.random()))
-            delay = min(delay * 2, MAX_RECONNECT_BACKOFF)
+                if outcome.needs_restart:
+                    while not await _is_node_completely_idle():
+                        await asyncio.sleep(0.03)
+                    fleet_execv_doc_slot[0] = outcome.applied_doc or {
+                        "rev": int(still_needed["rev"]),
+                        "checkout": str(my_repo_dir),
+                        "commit": "",
+                        "target_commit": str(still_needed.get("commit") or ""),
+                        "result": "ok",
+                        "config_changed": True,
+                        "code_changed": False,
+                        "attempts": 1,
+                    }
+                    _cancel_all_siblings(asyncio.current_task(), cancel_main=False)
+                    return
 
-    worker_task = asyncio.create_task(worker())
-    worker_task_ref[0] = worker_task
+                fleet_drain_requested[0] = False
+                inbox_wakeup.set()
 
-    def _on_child_done(t: asyncio.Task[None]) -> None:
-        if t.cancelled():
+        async def _run_hub_loop(hub_idx: int, h_state: dict[str, Any]) -> None:
+            raw_url = h_state["raw_url"]
+            ws_url = h_state["ws_url"]
+            canon_url = h_state["canon_url"]
+            is_primary = hub_idx == 0
+            delay = 0.5
+            carry_live_seq = 0
+            known_hub_id = journal.resolve_hub_id(raw_url)
+            active_hub_key = known_hub_id or canon_url
+            h_state["hub_key"] = active_hub_key
+
+            while not fatal_crash_flag[0]:
+                ws: Any = None
+                pump_task: asyncio.Task[None] | None = None
+                inflight: dict[str, asyncio.Future[dict[str, Any]]] = {}
+                current_mid_slot: list[str] = []
+                reconnect_immediately = False
+                try:
+                    legacy_seq = load_cursor(label, cdir) if is_primary else 0
+                    hello_since = journal.get_cursor(
+                        active_hub_key,
+                        label=label,
+                        fallback_seq=legacy_seq,
+                        use_fallback_when_missing=(
+                            is_primary and initial_upgrade_cursor and known_hub_id is None
+                        ),
+                    )
+                    ws, banner = await _open_ws_with_deadlines(
+                        ws_url,
+                        build_ws_hello(
+                            label,
+                            hello_since,
+                            accept_inbox=(label == "main"),
+                            hub_id=known_hub_id,
+                            fleet_notify=True,
+                        ),
+                        dial_timeout=dial_timeout,
+                        hello_timeout=hello_timeout,
+                        banner_timeout=banner_timeout,
+                        ping_interval=ws_ping_interval,
+                        ping_timeout=ws_ping_timeout,
+                    )
+
+                    # Reset exponential backoff ONLY after a valid connected banner arrives (F15).
+                    delay = 0.5
+                    my_node = str(banner["you"]).split("/", 1)[0]
+                    h_state["my_node"] = my_node
+                    banner_seq = int(banner.get("seq") or 0)
+                    raw_caps = banner.get("caps")
+                    h_state["caps"] = (
+                        frozenset(str(c) for c in raw_caps) if isinstance(raw_caps, list) else frozenset()
+                    )
+
+                    replay_count = 0
+                    last_replay_seq = hello_since
+                    max_live_seq = carry_live_seq
+
+                    if banner.get("hub_id"):
+                        banner_hub_id = str(banner["hub_id"])
+                        journal.remember_hub_id(raw_url, banner_hub_id)
+                        if known_hub_id is not None and banner_hub_id != known_hub_id:
+                            # Hub DB recreated with new hub_id (H10) -> cursor starts at 0 & outbox republishes.
+                            active_hub_key = banner_hub_id
+                            known_hub_id = banner_hub_id
+                            hello_since = 0
+                            last_replay_seq = 0
+                        else:
+                            active_hub_key = banner_hub_id
+                            if known_hub_id is None and hello_since > 0 and hello_since <= banner_seq:
+                                journal.advance_cursor(active_hub_key, hello_since, label=label)
+                            known_hub_id = banner_hub_id
+                    else:
+                        # Legacy hub without `hub_id` / `caps` (F16 fallback): key by canonical URL.
+                        journal.clear_hub_id(raw_url)
+                        known_hub_id = None
+                        active_hub_key = canon_url
+
+                    h_state["hub_key"] = active_hub_key
+                    h_state["ws"] = ws
+                    h_state["send_lock"] = asyncio.Lock()
+                    h_state["inflight"] = inflight
+                    h_state["current_mid"] = current_mid_slot
+
+                    print(f"[hub:{ws_url}] {banner.get('text')}", flush=True)
+                    if banner.get("rules"):
+                        print(banner["rules"], flush=True)
+
+                    h_state["pump_wakeup"].set()
+                    pump_task = asyncio.create_task(_outbox_pump(h_state, ws))
+                    pump_tasks.add(pump_task)
+
+                    if "fleet" in banner and banner["fleet"] is not None:
+                        _submit_fleet_manifest(banner["fleet"], hub_key=active_hub_key)
+                    else:
+                        applied_cur = load_fleet_applied(cdir, repo_dir=my_repo_dir)
+                        if applied_cur is not None:
+                            acked_cur = applied_cur.get("acked_hubs")
+                            if not isinstance(acked_cur, list) or active_hub_key not in acked_cur:
+                                pending_ack_hub_keys.add(active_hub_key)
+                                fleet_wakeup.set()
+
+                    async for raw in ws:
+                        m = json.loads(raw)
+                        op = m.get("op")
+                        if op == "sys":
+                            ack_id = str(m["ack"]) if m.get("ack") else ""
+                            if ack_id:
+                                if ack_id in ack_events:
+                                    ack_events[ack_id].set()
+                                fut = inflight.get(ack_id)
+                                if fut is not None and not fut.done():
+                                    fut.set_result(m)
+                                elif not m.get("error"):
+                                    journal.mark_outbox_acked(ack_id, active_hub_key, required_hubs=quorum_urls)
+                            elif m.get("error") and current_mid_slot:
+                                cur_id = current_mid_slot[0]
+                                fut = inflight.get(cur_id)
+                                if fut is not None and not fut.done():
+                                    fut.set_result(m)
+
+                            print(f"[hub:{ws_url}] {m.get('text')}", flush=True)
+                            if m.get("rules"):
+                                print(m["rules"], flush=True)
+                            if "fleet" in m and m["fleet"] is not None:
+                                _submit_fleet_manifest(m["fleet"], hub_key=active_hub_key)
+                            continue
+
+                        if op in ("fleet", "health"):
+                            if "fleet" in m and m["fleet"] is not None:
+                                _submit_fleet_manifest(m["fleet"], hub_key=active_hub_key)
+                            continue
+
+                        if op != "msg":
+                            continue
+
+                        seq = int(m["seq"])
+                        mid = str(m.get("id") or f"seq-{seq}")
+                        sender = str(m.get("from") or "")
+                        corr_id = str(m["corr_id"]) if m.get("corr_id") is not None else None
+                        kind = str(m.get("kind") or "task").strip().lower()
+                        raw_text = str(m.get("text") or "")
+                        hop = int(m.get("hop", 0) or 0)
+                        received_at = time.time()
+                        msg_ts = float(m.get("ts") or received_at)
+                        msg_deadline = compute_deadline(
+                            kind=kind,
+                            base_ts=msg_ts,
+                            explicit_deadline=m.get("deadline"),
+                        )
+                        is_replay = bool(m.get("replay"))
+
+                        print(f"[{sender}] hop={hop} {raw_text}", flush=True)
+                        node = sender.split("/")[0].lower()
+                        peer_ok = (not peers) or (node in peers)
+
+                        # 1. `!update` control path (inbox commit -> hub ack -> cursor).
+                        if raw_text.strip() == "!update":
+                            inserted, _ = await loop.run_in_executor(
+                                None,
+                                lambda m_id=mid, s_from=sender, c_id=corr_id, k_val=kind, r_txt=raw_text, h_val=hop, r_at=received_at, m_dl=msg_deadline: journal.receive_inbox(
+                                    mid=m_id,
+                                    sender=s_from,
+                                    corr_id=c_id,
+                                    kind=k_val,
+                                    text=r_txt,
+                                    hop=h_val,
+                                    received_at=r_at,
+                                    deadline=m_dl,
+                                    eligible=False,
+                                ),
+                            )
+                            with contextlib.suppress(Exception):
+                                await ws.send(json.dumps({"op": "ack", "seq": seq, "id": mid}))
+                            if is_replay:
+                                replay_count += 1
+                                last_replay_seq = max(last_replay_seq, seq)
+                                watermark = last_replay_seq
+                            else:
+                                max_live_seq = max(max_live_seq, seq)
+                                watermark = max(last_replay_seq, max_live_seq)
+                            journal.advance_cursor(active_hub_key, watermark, label=label)
+                            if is_primary:
+                                save_cursor(label, watermark, cdir)
+                            if (
+                                inserted
+                                and received_at < msg_deadline
+                                and peer_ok
+                                and m.get("trust") != "external"
+                            ):
+                                if await loop.run_in_executor(None, update_repo):
+                                    restart_self()
+                            if is_replay and replay_count >= 500 and last_replay_seq > hello_since and last_replay_seq < banner_seq:
+                                carry_live_seq = max_live_seq
+                                reconnect_immediately = True
+                                break
+                            continue
+
+                        # 2. ACC bridge / local `inbox.jsonl` delivery path (atomic dedup across dual hubs).
+                        is_inbox_msg, target_sess = _is_inbox_delivery(m, label)
+                        if is_inbox_msg:
+                            inserted, _ = await loop.run_in_executor(
+                                None,
+                                lambda m_id=mid, s_from=sender, c_id=corr_id, k_val=kind, r_txt=raw_text, h_val=hop, r_at=received_at, m_dl=msg_deadline: journal.receive_inbox(
+                                    mid=m_id,
+                                    sender=s_from,
+                                    corr_id=c_id,
+                                    kind=k_val,
+                                    text=r_txt,
+                                    hop=h_val,
+                                    received_at=r_at,
+                                    deadline=m_dl,
+                                    eligible=False,
+                                ),
+                            )
+                            if inserted and received_at < msg_deadline:
+                                deliver_to_inbox(m, cfg_dir=cdir, target_session=target_sess)
+                            with contextlib.suppress(Exception):
+                                await ws.send(json.dumps({"op": "ack", "seq": seq, "id": mid}))
+                            if is_replay:
+                                replay_count += 1
+                                last_replay_seq = max(last_replay_seq, seq)
+                                watermark = last_replay_seq
+                            else:
+                                max_live_seq = max(max_live_seq, seq)
+                                watermark = max(last_replay_seq, max_live_seq)
+                            journal.advance_cursor(active_hub_key, watermark, label=label)
+                            if is_primary:
+                                save_cursor(label, watermark, cdir)
+                            if is_replay and replay_count >= 500 and last_replay_seq > hello_since and last_replay_seq < banner_seq:
+                                carry_live_seq = max_live_seq
+                                reconnect_immediately = True
+                                break
+                            continue
+
+                        # 3. Standard request/watch path:
+                        #    Step A: Commit into `journal.db` `inbox` (`queued` vs `skipped`).
+                        #    Step B: Send hub `ack` ONLY after `inbox` transaction commits.
+                        #    Step C: Advance monotonic cursor watermark for this hub.
+                        mode_now = get_mode(a.mode)
+                        self_key = f"{my_node}/{label}".lower() if my_node else ""
+                        not_self = not (self_key and sender.lower() == self_key)
+                        in_status = str(m.get("status") or "ok").strip().lower()
+                        in_rkind = str(m.get("rkind") or "").strip().lower()
+                        eligible = (
+                            not_self
+                            and (in_rkind != "result")
+                            and (in_status not in _TERMINAL_ERROR_STATUSES)
+                            and (hop + 1 <= MAX_HOP)
+                            and peer_ok
+                            and should_reply(mode_now, raw_text)
+                        )
+                        stored_text = strip_ask(raw_text) if eligible else raw_text
+
+                        changed, eff_state = await loop.run_in_executor(
+                            None,
+                            lambda m_id=mid, s_from=sender, c_id=corr_id, k_val=kind, s_txt=stored_text, h_val=hop, r_at=received_at, m_dl=msg_deadline, el=eligible: journal.receive_inbox(
+                                mid=m_id,
+                                sender=s_from,
+                                corr_id=c_id,
+                                kind=k_val,
+                                text=s_txt,
+                                hop=h_val,
+                                received_at=r_at,
+                                deadline=m_dl,
+                                eligible=el,
+                            ),
+                        )
+
+                        with contextlib.suppress(Exception):
+                            await ws.send(json.dumps({"op": "ack", "seq": seq, "id": mid}))
+
+                        if is_replay:
+                            replay_count += 1
+                            last_replay_seq = max(last_replay_seq, seq)
+                            watermark = last_replay_seq
+                        else:
+                            max_live_seq = max(max_live_seq, seq)
+                            watermark = max(last_replay_seq, max_live_seq)
+
+                        journal.advance_cursor(active_hub_key, watermark, label=label)
+                        if is_primary:
+                            save_cursor(label, watermark, cdir)
+
+                        if changed and eff_state == "queued":
+                            inbox_wakeup.set()
+
+                        if _TEST_CRASH_HOOK is not None and changed and eff_state == "queued":
+                            _fire_test_crash_hook("after_inbox_ack_before_claim", {"id": mid, "seq": seq})
+
+                        if is_replay and replay_count >= 500 and last_replay_seq > hello_since and last_replay_seq < banner_seq:
+                            carry_live_seq = max_live_seq
+                            reconnect_immediately = True
+                            break
+                    else:
+                        carry_live_seq = 0
+
+                    if not reconnect_immediately and max_live_seq > last_replay_seq and replay_count < 500:
+                        journal.advance_cursor(active_hub_key, max_live_seq, label=label)
+                        if is_primary:
+                            save_cursor(label, max_live_seq, cdir)
+                        carry_live_seq = 0
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if getattr(exc, "_fatal_node_crash", False):
+                        raise
+                    is_auth_err, auth_detail = _extract_ws_auth_error(exc)
+                    if is_auth_err:
+                        print(
+                            f"[auth-error:{ws_url}: {auth_detail}] retry in {delay:.1f}s",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"[disconnected:{ws_url}: {type(exc).__name__}] retry in {delay:.1f}s",
+                            flush=True,
+                        )
+                finally:
+                    h_state.pop("ws", None)
+                    h_state.pop("send_lock", None)
+                    h_state.pop("inflight", None)
+                    h_state.pop("current_mid", None)
+                    for fut in list(inflight.values()):
+                        if not fut.done():
+                            fut.set_exception(ConnectionError("websocket disconnected"))
+                    inflight.clear()
+                    if pump_task is not None:
+                        pump_tasks.discard(pump_task)
+                        pump_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                            await pump_task
+                    if ws is not None:
+                        with contextlib.suppress(Exception):
+                            await ws.close()
+
+                if fatal_crash_flag[0]:
+                    break
+                if reconnect_immediately:
+                    continue
+                await asyncio.sleep(delay * (0.5 + random.random()))
+                delay = min(delay * 2, MAX_RECONNECT_BACKOFF)
+
+        worker_task = asyncio.create_task(worker())
+        worker_task_ref[0] = worker_task
+        fleet_task = asyncio.create_task(_fleet_converge_loop())
+        fleet_task_ref[0] = fleet_task
+
+        def _on_child_done(t: asyncio.Task[None]) -> None:
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                if fatal_exc_slot[0] is None:
+                    fatal_exc_slot[0] = exc
+                _cancel_all_siblings(t)
+
+        worker_task.add_done_callback(_on_child_done)
+        fleet_task.add_done_callback(_on_child_done)
+        for idx, st in enumerate(hub_states):
+            ht = asyncio.create_task(_run_hub_loop(idx, st))
+            ht.add_done_callback(_on_child_done)
+            hub_tasks.append(ht)
+
+        sigterm_stop_flag: list[bool] = [False]
+        sigterm_installed = False
+        sigterm_num = getattr(signal, "SIGTERM", None)
+
+        def _on_sigterm() -> None:
+            sigterm_stop_flag[0] = True
+            _cancel_all_siblings(None)
+
+        if os.name != "nt" and sigterm_num is not None and hasattr(loop, "add_signal_handler"):
+            with contextlib.suppress(NotImplementedError, RuntimeError, ValueError, OSError):
+                loop.add_signal_handler(sigterm_num, _on_sigterm)
+                sigterm_installed = True
+
+        try:
+            await asyncio.gather(worker_task, fleet_task, *hub_tasks)
+        except asyncio.CancelledError:
+            if fatal_exc_slot[0] is not None:
+                raise fatal_exc_slot[0]
+            if not sigterm_stop_flag[0] and fleet_execv_doc_slot[0] is None:
+                raise
+            if main_task is not None and hasattr(main_task, "cancelling") and hasattr(main_task, "uncancel"):
+                while main_task.cancelling() > 0:
+                    main_task.uncancel()
+        finally:
+            if sigterm_installed and sigterm_num is not None and hasattr(loop, "remove_signal_handler"):
+                with contextlib.suppress(NotImplementedError, RuntimeError, ValueError, OSError):
+                    loop.remove_signal_handler(sigterm_num)
+            for bt in list(bg_tasks):
+                bt.cancel()
+            for pt in list(pump_tasks):
+                pt.cancel()
+            for ht in hub_tasks:
+                ht.cancel()
+            fleet_task.cancel()
+            worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await asyncio.gather(
+                    worker_task,
+                    fleet_task,
+                    *hub_tasks,
+                    *pump_tasks,
+                    *bg_tasks,
+                    return_exceptions=True,
+                )
+            worker_session.close()
+            journal.close()
+            await asyncio.sleep(0)
+
+        execv_doc = fleet_execv_doc_slot[0]
+        if execv_doc is None or sigterm_stop_flag[0]:
             return
-        exc = t.exception()
-        if exc is not None:
-            if fatal_exc_slot[0] is None:
-                fatal_exc_slot[0] = exc
-            _cancel_all_siblings(t)
 
-    worker_task.add_done_callback(_on_child_done)
-    for idx, st in enumerate(hub_states):
-        ht = asyncio.create_task(_run_hub_loop(idx, st))
-        ht.add_done_callback(_on_child_done)
-        hub_tasks.append(ht)
-
-    sigterm_stop_flag: list[bool] = [False]
-    sigterm_installed = False
-
-    def _on_sigterm() -> None:
-        sigterm_stop_flag[0] = True
-        _cancel_all_siblings(None)
-
-    with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
-        loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
-        sigterm_installed = True
-
-    try:
-        await asyncio.gather(worker_task, *hub_tasks)
-    except asyncio.CancelledError:
-        if fatal_exc_slot[0] is not None:
-            raise fatal_exc_slot[0]
-        if not sigterm_stop_flag[0]:
-            raise
-    finally:
-        if sigterm_installed:
-            with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
-                loop.remove_signal_handler(signal.SIGTERM)
-        for bt in list(bg_tasks):
-            bt.cancel()
-        for pt in list(pump_tasks):
-            pt.cancel()
-        for ht in hub_tasks:
-            ht.cancel()
-        worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await asyncio.gather(worker_task, *hub_tasks, *pump_tasks, *bg_tasks, return_exceptions=True)
-        worker_session.close()
-        journal.close()
+        print(
+            f"[fleet] converged rev={execv_doc.get('rev')}; re-executing in-place via os.execv "
+            f"(pid={os.getpid()})",
+            flush=True,
+        )
+        try:
+            _exec_self_in_place(initial_cwd=initial_cwd)
+        except OSError as exc:
+            err_tag = f"{type(exc).__name__}"
+            failed_doc = record_fleet_execv_failure(
+                cdir,
+                repo_dir=my_repo_dir,
+                base_doc=execv_doc,
+                error_detail=err_tag,
+            )
+            print(
+                f"[fleet-error] os.execv failed ({type(exc).__name__}: {exc}); "
+                f"recorded {failed_doc['result']} and keeping current process alive",
+                file=sys.stderr,
+                flush=True,
+            )
+            continue
 
 
 def _exit_code_for_rpc_status(status: str) -> int:
@@ -2022,31 +2419,69 @@ def run_supervise(a: argparse.Namespace) -> int:
     env["PYTHONIOENCODING"] = "utf-8"
 
     delay = 1.0
-    while True:
-        logger.info("starting child: %s", " ".join(cmd))
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=env,
-        )
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            clean = line.rstrip("\r\n")
-            logger.info("%s", clean)
-            print(clean, flush=True)
-        rc = proc.wait()
-        logger.info("child exited with code=%s", rc)
-        if rc == 42:
-            delay = 1.0
-            continue
-        if rc == 0 and getattr(a, "once", False):
-            return 0
-        time.sleep(delay)
-        delay = min(delay * 2, 30.0)
+    stop_requested: list[bool] = [False]
+    active_proc: list[subprocess.Popen[str] | None] = [None]
+    sigterm_num = getattr(signal, "SIGTERM", None)
+    prev_sigterm: Any = None
+
+    def _handle_sup_stop(_signum: int, _frame: Any) -> None:
+        stop_requested[0] = True
+        cur_p = active_proc[0]
+        if cur_p is not None and cur_p.poll() is None:
+            with contextlib.suppress(Exception):
+                cur_p.terminate()
+
+    if os.name != "nt" and sigterm_num is not None:
+        with contextlib.suppress(ValueError, OSError):
+            prev_sigterm = signal.signal(sigterm_num, _handle_sup_stop)
+
+    try:
+        while not stop_requested[0]:
+            logger.info("starting child: %s", " ".join(cmd))
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+            )
+            active_proc[0] = proc
+            try:
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    clean = line.rstrip("\r\n")
+                    logger.info("%s", clean)
+                    print(clean, flush=True)
+                rc = proc.wait()
+            except BaseException:
+                if proc.poll() is None:
+                    with contextlib.suppress(Exception):
+                        proc.terminate()
+                        proc.wait(timeout=3.0)
+                raise
+            finally:
+                active_proc[0] = None
+
+            logger.info("child exited with code=%s", rc)
+            if stop_requested[0]:
+                return 0
+            if rc in (42, FLEET_EXIT_CODE):
+                delay = 1.0
+                continue
+            if rc == 0 and getattr(a, "once", False):
+                return 0
+            time.sleep(delay)
+            delay = min(delay * 2, 30.0)
+        return 0
+    finally:
+        if prev_sigterm is not None and sigterm_num is not None:
+            with contextlib.suppress(ValueError, OSError):
+                signal.signal(sigterm_num, prev_sigterm)
+        logger.removeHandler(handler)
+        with contextlib.suppress(Exception):
+            handler.close()
 
 
 def run_doctor(a: argparse.Namespace) -> dict[str, Any]:
@@ -2204,6 +2639,265 @@ def run_doctor(a: argparse.Namespace) -> dict[str, Any]:
         report["gh_error"] = "gh binary not found"
 
     return report
+
+
+def fetch_fleet_status(a: argparse.Namespace) -> dict[str, Any]:
+    """Query `GET /v1/health` or WS `op: 'health'` across configured/explicit hub URLs."""
+    raw_cdir = getattr(a, "config_dir", None)
+    cdir = pathlib.Path(raw_cdir).expanduser() if raw_cdir else cfg_dir()
+    cfg = load_config(cdir)
+    urls = get_bus_urls(cfg, explicit_url=getattr(a, "url", None))
+    dial_t = get_dial_timeout(getattr(a, "dial_timeout", None), cfg)
+    hello_t = get_hello_timeout(getattr(a, "hello_timeout", None), cfg)
+    banner_t = get_banner_timeout(getattr(a, "banner_timeout", None), cfg)
+    ack_t = get_ack_timeout(getattr(a, "ack_timeout", None), cfg)
+
+    async def _query_one(u: str) -> dict[str, Any]:
+        item: dict[str, Any] = {
+            "url": u,
+            "ok": False,
+            "hub_id": None,
+            "auth_mode": None,
+            "auth_generation": None,
+            "fleet": None,
+            "fleet_nodes": {},
+        }
+        try:
+            if is_http_url(u):
+                code, data = await asyncio.to_thread(
+                    http_request_json,
+                    u,
+                    "/v1/health",
+                    method="GET",
+                    timeout=max(1.0, dial_t + banner_t),
+                )
+                if code != 200 or not data.get("ok"):
+                    item["error"] = str(data.get("error") or f"http_{code}")
+                    return item
+            else:
+                ws_url = to_ws_url(u)
+                ws, _ = await _open_ws_with_deadlines(
+                    ws_url,
+                    build_ws_hello(
+                        f"cli-flt-{uuid.uuid4().hex[:6]}",
+                        10**9,
+                        accept_inbox=False,
+                        no_replay=True,
+                    ),
+                    dial_timeout=dial_t,
+                    hello_timeout=hello_t,
+                    banner_timeout=banner_t,
+                )
+                try:
+                    await asyncio.wait_for(ws.send(json.dumps({"op": "health"})), timeout=hello_t)
+                    deadline_m = time.monotonic() + ack_t
+                    data = {}
+                    while True:
+                        rem = max(0.05, deadline_m - time.monotonic())
+                        frame = json.loads(await asyncio.wait_for(ws.recv(), timeout=rem))
+                        if isinstance(frame, dict) and frame.get("op") == "health":
+                            data = frame
+                            break
+                finally:
+                    with contextlib.suppress(Exception):
+                        await ws.close()
+
+            item["ok"] = True
+            item["hub_id"] = data.get("hub_id")
+            item["auth_mode"] = data.get("auth_mode")
+            item["auth_generation"] = data.get("auth_generation")
+            item["fleet"] = data.get("fleet")
+            raw_fn = data.get("fleet_nodes")
+            item["fleet_nodes"] = raw_fn if isinstance(raw_fn, dict) else {}
+            return item
+        except Exception as exc:
+            item["error"] = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+            return item
+
+    async def _query_all() -> list[dict[str, Any]]:
+        return list(await asyncio.gather(*(_query_one(u) for u in urls)))
+
+    try:
+        asyncio.get_running_loop()
+        in_running_loop = True
+    except RuntimeError:
+        in_running_loop = False
+
+    if in_running_loop:
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            hubs_res = ex.submit(lambda: asyncio.run(_query_all())).result()
+    else:
+        hubs_res = asyncio.run(_query_all())
+
+    any_ok = any(bool(h.get("ok")) for h in hubs_res)
+    target_fleet: dict[str, Any] | None = None
+    for h in hubs_res:
+        if not h.get("ok"):
+            continue
+        fl = h.get("fleet")
+        if isinstance(fl, dict) and isinstance(fl.get("rev"), int):
+            if target_fleet is None or int(fl["rev"]) > int(target_fleet["rev"]):
+                target_fleet = fl
+
+    merged_nodes: dict[str, dict[str, Any]] = {}
+    merged_checkouts: dict[str, dict[str, dict[str, Any]]] = {}
+    for h in hubs_res:
+        if not h.get("ok"):
+            continue
+        fn = h.get("fleet_nodes") or {}
+        if not isinstance(fn, dict):
+            continue
+        for node_name, st in fn.items():
+            if not isinstance(st, dict):
+                continue
+            node_cks = merged_checkouts.setdefault(node_name, {})
+            raw_cks = st.get("checkouts")
+            if isinstance(raw_cks, dict):
+                for ck_k, ck_v in raw_cks.items():
+                    if not isinstance(ck_v, dict):
+                        continue
+                    ck_p = str(ck_v.get("checkout") or ck_k or "").strip()
+                    if not ck_p:
+                        continue
+                    prev_ck = node_cks.get(ck_p)
+                    ck_key = (int(ck_v.get("rev") or 0), float(ck_v.get("updated_at") or 0.0))
+                    prev_ck_key = (
+                        (int(prev_ck.get("rev") or 0), float(prev_ck.get("updated_at") or 0.0))
+                        if prev_ck is not None
+                        else (-1, -1.0)
+                    )
+                    if ck_key >= prev_ck_key:
+                        node_cks[ck_p] = dict(ck_v)
+            top_ck_p = str(st.get("checkout") or "").strip()
+            if top_ck_p and top_ck_p not in node_cks:
+                node_cks[top_ck_p] = {
+                    "checkout": top_ck_p,
+                    "rev": int(st.get("rev") or 0),
+                    "commit": str(st.get("commit") or ""),
+                    "target_commit": str(st.get("target_commit") or ""),
+                    "result": str(st.get("result") or ""),
+                    "config_changed": bool(st.get("config_changed", False)),
+                    "code_changed": bool(st.get("code_changed", False)),
+                    "attempts": int(st.get("attempts") or 1),
+                    "updated_at": float(st.get("updated_at") or 0.0),
+                }
+
+            cur = merged_nodes.get(node_name)
+            cand_key = (int(st.get("rev") or 0), float(st.get("updated_at") or 0.0))
+            cur_key = (
+                (int(cur.get("rev") or 0), float(cur.get("updated_at") or 0.0))
+                if cur is not None
+                else (-1, -1.0)
+            )
+            if cand_key >= cur_key:
+                merged_nodes[node_name] = dict(st)
+
+    sorted_nodes: dict[str, dict[str, Any]] = {}
+    for node_name in sorted(merged_nodes):
+        entry = dict(merged_nodes[node_name])
+        if merged_checkouts.get(node_name):
+            entry["checkouts"] = dict(merged_checkouts[node_name])
+        sorted_nodes[node_name] = evaluate_node_fleet_status(target_fleet, entry)
+
+    conv_cnt = sum(1 for v in sorted_nodes.values() if v.get("converged"))
+    mismatch_cnt = sum(
+        1
+        for v in sorted_nodes.values()
+        if v.get("target_mismatch") or v.get("checkout_mismatch")
+    )
+    total_cnt = len(sorted_nodes)
+    all_conv = bool(
+        (target_fleet is None and mismatch_cnt == 0)
+        or (target_fleet is not None and all(v.get("converged") for v in sorted_nodes.values()))
+    )
+    out: dict[str, Any] = {
+        "ok": any_ok,
+        "fleet": target_fleet,
+        "nodes": sorted_nodes,
+        "converged_count": conv_cnt,
+        "mismatch_count": mismatch_cnt,
+        "total_nodes": total_cnt,
+        "all_converged": all_conv,
+        "hubs": hubs_res,
+    }
+    if not any_ok:
+        out["error"] = "; ".join(f"{h['url']}: {h.get('error', 'unreachable')}" for h in hubs_res)
+    return out
+
+
+def _fmt_utc_ts(ts_val: Any) -> str:
+    if isinstance(ts_val, (int, float)) and ts_val > 0:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(ts_val)))
+    return "-"
+
+
+def format_fleet_status_table(report: dict[str, Any]) -> str:
+    """Format `fetch_fleet_status` output into a human-readable CLI summary and table."""
+    if not report.get("ok"):
+        return f"[error] {report.get('error') or 'no reachable hub'}"
+    lines: list[str] = []
+    fl = report.get("fleet")
+    if not isinstance(fl, dict):
+        lines.append("Target Fleet: (disabled - no active fleet.json)")
+    else:
+        urls_s = ",".join(str(u) for u in (fl.get("urls") or []))
+        peers_s = ",".join(str(p) for p in (fl.get("hub_peers") or [])) or "-"
+        commit_s = str(fl.get("commit") or "-")
+        lines.append(
+            f"Target Fleet: rev={fl.get('rev')} commit={commit_s} urls={urls_s} hub_peers={peers_s}"
+        )
+
+    nodes = report.get("nodes") or {}
+    if not nodes:
+        lines.append("Reported Nodes: (none)")
+        return "\n".join(lines)
+
+    lines.append(
+        f"{'NODE':<18} {'REV':>5}  {'COMMIT':<12}  {'RESULT':<28}  {'MATCH':<5}  {'CHECKOUT':<38}  {'UPDATED_AT'}"
+    )
+    mismatch_notes: list[str] = []
+    for node_name, st in nodes.items():
+        rev_s = str(st.get("rev", "-"))
+        c_full = str(st.get("commit") or "-")
+        c_short = c_full[:12] if len(c_full) > 12 else c_full
+        res_s = str(st.get("result") or "-")
+        cks = st.get("checkouts") if isinstance(st.get("checkouts"), dict) else {}
+        if st.get("checkout_mismatch"):
+            res_s = f"{res_s} [MISMATCH]"
+        match_s = "yes" if st.get("converged") else "no"
+        ck_path = str(st.get("checkout") or "-")
+        ts_s = _fmt_utc_ts(st.get("updated_at"))
+        lines.append(
+            f"{node_name:<18} {rev_s:>5}  {c_short:<12}  {res_s:<28}  {match_s:<5}  {ck_path:<38}  {ts_s}"
+        )
+        if isinstance(cks, dict) and len(cks) > 1:
+            for idx, (sub_path, sub_st) in enumerate(sorted(cks.items()), 1):
+                s_rev = str(sub_st.get("rev", "-"))
+                sc_full = str(sub_st.get("commit") or "-")
+                sc_short = sc_full[:12] if len(sc_full) > 12 else sc_full
+                s_res = str(sub_st.get("result") or "-")
+                s_match = "yes" if sub_st.get("converged") else "no"
+                s_ts = _fmt_utc_ts(sub_st.get("updated_at"))
+                sub_label = f"  checkout[{idx}]"
+                lines.append(
+                    f"{sub_label:<18} {s_rev:>5}  {sc_short:<12}  {s_res:<28}  {s_match:<5}  {sub_path:<38}  {s_ts}"
+                )
+        rsns = st.get("mismatch_reasons")
+        if isinstance(rsns, list) and rsns:
+            mismatch_notes.append(f"  - {node_name}: {'; '.join(str(r) for r in rsns)}")
+
+    if mismatch_notes:
+        lines.append("Mismatches:")
+        lines.extend(mismatch_notes)
+
+    lines.append(
+        f"Summary: converged={report.get('converged_count', 0)}/{report.get('total_nodes', 0)} "
+        f"all_converged={bool(report.get('all_converged'))} "
+        f"mismatches={report.get('mismatch_count', len(mismatch_notes))}"
+    )
+    return "\n".join(lines)
 
 
 def main_legacy(argv: list[str] | None = None) -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import time
 from typing import Any
@@ -142,18 +143,23 @@ def deliver_to_inbox(
                 env["ACC_RUNTIME"] = str(rt)
                 env["SESSION_NAME"] = session
                 summary = f"bus from {msg.get('from', '?')}: {_sanitize_summary(str(msg.get('text', '')))}"
+                emit_args = [
+                    str(emit_sh),
+                    "external",
+                    "done",
+                    f"bus-{seq}",
+                    summary,
+                    str(detail_path),
+                    f"bus-{seq}-{safe_mid}",
+                    "bus_msg",
+                ]
+                if os.name == "nt":
+                    bash_bin = shutil.which("bash")
+                    if bash_bin:
+                        emit_args = [bash_bin, *emit_args]
                 try:
                     res = subprocess.run(
-                        [
-                            str(emit_sh),
-                            "external",
-                            "done",
-                            f"bus-{seq}",
-                            summary,
-                            str(detail_path),
-                            f"bus-{seq}-{safe_mid}",
-                            "bus_msg",
-                        ],
+                        emit_args,
                         env=env,
                         capture_output=True,
                         text=True,

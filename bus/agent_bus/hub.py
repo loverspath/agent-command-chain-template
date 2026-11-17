@@ -66,6 +66,14 @@ from .config import (
     load_config,
     log_dir,
 )
+from .fleet import (
+    build_banner_fleet,
+    build_health_fleet,
+    canonical_fleet_sha256,
+    evaluate_node_fleet_status,
+    load_active_fleet_manifest,
+    parse_fleet_ack_payload,
+)
 from .store import VALID_RKINDS, BusStore, IdConflictError
 
 
@@ -79,6 +87,7 @@ class PeerConn:
     send_text: Callable[[str], Coroutine[Any, Any, None]]
     close_conn: Callable[[int, str], Coroutine[Any, Any, None]]
     token_id: str | None = None
+    fleet_notify: bool = False
 
 
 def resolve_target(to: str | None) -> str:
@@ -179,8 +188,37 @@ class BusHub:
         self.store = BusStore(self.db_path)
         self.peers: dict[str, PeerConn] = {}
         self.rate: dict[str, list[float]] = collections.defaultdict(list)
+        init_fleet = self.current_fleet_manifest()
+        self._last_pushed_fleet_sig: str = (
+            canonical_fleet_sha256(init_fleet) if init_fleet is not None else ""
+        )
         # Seed SQLite sequence & unexpired messages from legacy messages.jsonl on first upgrade.
         self.store.import_jsonl_if_empty(self.logs_dir / "messages.jsonl", ttl=QUEUE_TTL)
+
+    def current_fleet_manifest(self) -> dict[str, Any] | None:
+        return load_active_fleet_manifest(self.cfg_dir, explicit_auth_source=self.auth_source)
+
+    async def push_fleet_update_if_changed(self) -> int:
+        """Push `{"op": "fleet", "fleet": ...}` to opted-in `run_node` sessions when `fleet` changes."""
+        manifest = self.current_fleet_manifest()
+        sig = canonical_fleet_sha256(manifest) if manifest is not None else ""
+        if sig == self._last_pushed_fleet_sig:
+            return 0
+        self._last_pushed_fleet_sig = sig
+        banner_fleet = build_banner_fleet(manifest)
+        if banner_fleet is None:
+            return 0
+        frame = json.dumps({"op": "fleet", "fleet": banner_fleet}, ensure_ascii=False)
+        pushed = 0
+        for peer in list(self.peers.values()):
+            if not peer.fleet_notify:
+                continue
+            try:
+                await peer.send_text(frame)
+                pushed += 1
+            except Exception:
+                pass
+        return pushed
 
     @property
     def hub_id(self) -> str:
@@ -428,6 +466,7 @@ class BusHub:
                     await ws.close()
 
             await self.enforce_active_sessions()
+            await self.push_fleet_update_if_changed()
             return apply_res
 
     def start_auth_task(self, interval: float | None = None) -> asyncio.Task[None]:
@@ -488,6 +527,7 @@ class BusHub:
                     await asyncio.sleep(eff_watch)
                     if self.refresh_source_auth():
                         await self.enforce_active_sessions()
+                    await self.push_fleet_update_if_changed()
             except asyncio.CancelledError:
                 raise
 
@@ -570,6 +610,11 @@ class BusHub:
         q = self.store.get_queue_metrics(now=wall_now)
         auth_gen = int(self.auth_generation or 0)
         auth_age_s = self.current_auth_age_s(now=wall_now if now is not None else None)
+        fleet_target = build_health_fleet(self.current_fleet_manifest())
+        raw_fleet_nodes = self.store.list_fleet_status()
+        fleet_nodes: dict[str, dict[str, Any]] = {}
+        for node_name, node_st in raw_fleet_nodes.items():
+            fleet_nodes[node_name] = evaluate_node_fleet_status(fleet_target, node_st)
         return {
             "ok": True,
             "hub_id": self.hub_id,
@@ -596,6 +641,8 @@ class BusHub:
                 "generation": auth_gen,
                 "age_s": auth_age_s,
             },
+            "fleet": fleet_target,
+            "fleet_nodes": fleet_nodes,
         }
 
     def append_audit_log(self, msg: dict[str, Any]) -> None:
@@ -720,8 +767,14 @@ class BusHub:
             if not ok:
                 return {"ok": False, "error": "forbidden", "detail": reason, "code": 403}
 
+        fleet_ack_info = (
+            parse_fleet_ack_payload(payload, text=text)
+            if (auth.trust == "internal" and kind == "event" and auth.node)
+            else None
+        )
+
         err = self._check_rate_and_limits(node=auth.node, text=text, hop=hop)
-        if err == "rate":
+        if err == "rate" and fleet_ack_info is None:
             return {"ok": False, "error": "rate", "detail": "rate limit exceeded", "code": 429}
         if err == "size":
             return {"ok": False, "error": "size", "detail": "text too large", "code": 413}
@@ -761,6 +814,10 @@ class BusHub:
                 "detail": str(exc),
                 "code": 409,
             }
+
+        if fleet_ack_info is not None:
+            self.store.upsert_fleet_status(node=auth.node, **fleet_ack_info)
+
         if is_dup:
             return {
                 "ok": True,
@@ -772,7 +829,8 @@ class BusHub:
                 "delivered": [],
             }
 
-        self.rate[auth.node].append(time.time())
+        if fleet_ack_info is None:
+            self.rate[auth.node].append(time.time())
         self.append_audit_log(msg)
 
         out = json.dumps(msg, ensure_ascii=False)
@@ -982,6 +1040,7 @@ class BusHub:
                 send_text=send_text,
                 close_conn=close_conn,
                 token_id=auth.token_id,
+                fleet_notify=bool(hello.get("fleet_notify", False)),
             )
             self.peers[key] = peer
 
@@ -1004,6 +1063,9 @@ class BusHub:
             }
             if auth.trust == "internal":
                 banner_kw["rules"] = BUS_RULES
+            banner_fleet = build_banner_fleet(self.current_fleet_manifest())
+            if banner_fleet is not None:
+                banner_kw["fleet"] = banner_fleet
             await send_text(sysmsg(f"connected as {key}; peers={banner_kw['peers']}", **banner_kw))
 
             # Replay undelivered/pending messages with lease protection (unless suppressed).

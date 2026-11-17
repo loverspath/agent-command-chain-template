@@ -21,7 +21,8 @@ import threading
 import time
 from typing import Any, Callable, Iterable
 
-from .config import get_auth_source
+from .config import fleet_file_path, get_auth_source
+from .fleet import FleetValidationError, load_fleet_manifest_file, validate_fleet_manifest
 from .store import BusStore
 
 REPLAY_WINDOW_SECONDS = 300
@@ -64,6 +65,7 @@ class SourceAuthState:
     tombstones: list[str]
     updated_at: float
     changed: bool
+    fleet: dict[str, Any] | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -105,14 +107,16 @@ def _fire_auth_pointer_crash_hook(generation: int, cfg_dir: pathlib.Path) -> Non
             fd = os.open(str(marker), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             try:
                 os.write(fd, f"{generation}\n".encode("utf-8"))
-                os.fsync(fd)
+                if hasattr(os, "fsync"):
+                    with contextlib.suppress(OSError):
+                        os.fsync(fd)
             finally:
                 os.close(fd)
             os._exit(91)
 
 
 def _fsync_dir(dir_path: pathlib.Path) -> None:
-    if not hasattr(os, "O_RDONLY"):
+    if os.name == "nt" or not hasattr(os, "O_RDONLY") or not hasattr(os, "fsync"):
         return
     fd: int | None = None
     try:
@@ -138,11 +142,14 @@ def _atomic_write_bytes(path: pathlib.Path, data: bytes, *, mode: int = 0o600) -
         written = 0
         while written < len(view):
             written += os.write(fd, view[written:])
-        os.fsync(fd)
+        if hasattr(os, "fsync"):
+            with contextlib.suppress(OSError):
+                os.fsync(fd)
         os.close(fd)
         fd = None
-        with contextlib.suppress(OSError):
-            os.chmod(tmp_path, mode)
+        if os.name != "nt" and hasattr(os, "chmod"):
+            with contextlib.suppress(OSError):
+                os.chmod(tmp_path, mode)
         os.replace(tmp_path, path)
         _fsync_dir(path.parent)
     finally:
@@ -541,7 +548,11 @@ def sync_source_auth_state(
         else:
             tok_sha = "missing"
 
-        fingerprint = f"allow:{allow_sha}|tokens:{tok_sha}"
+        fleet_manifest, fleet_sha = load_fleet_manifest_file(fleet_file_path(cdir))
+        if fleet_manifest is not None:
+            fingerprint = f"allow:{allow_sha}|tokens:{tok_sha}|fleet:{fleet_sha}"
+        else:
+            fingerprint = f"allow:{allow_sha}|tokens:{tok_sha}"
 
         gen_file = auth_generation_path(cdir)
         state_file = auth_source_state_path(cdir)
@@ -614,13 +625,19 @@ def sync_source_auth_state(
             updated_at = prev_updated_at
 
         if changed or not has_gen_file or not has_state_file or disk_gen != new_gen:
-            new_state_obj = {
+            max_fleet_rev = max(
+                int(prev_state.get("max_fleet_rev") or 0),
+                int(fleet_manifest["rev"]) if fleet_manifest is not None else 0,
+            )
+            new_state_obj: dict[str, Any] = {
                 "generation": new_gen,
                 "fingerprint": fingerprint,
                 "known_token_ids": known_ids_list,
                 "tombstones": tombstones_list,
                 "updated_at": updated_at,
             }
+            if max_fleet_rev > 0:
+                new_state_obj["max_fleet_rev"] = max_fleet_rev
             _atomic_write_text(
                 state_file,
                 json.dumps(new_state_obj, indent=2, ensure_ascii=False) + "\n",
@@ -635,6 +652,7 @@ def sync_source_auth_state(
             tombstones=tombstones_list,
             updated_at=updated_at,
             changed=changed,
+            fleet=copy.deepcopy(fleet_manifest) if fleet_manifest is not None else None,
         )
 
 
@@ -644,13 +662,16 @@ def compute_manifest_sha256(
     allow: list[str],
     tokens: list[dict[str, Any]],
     tombstones: list[str],
+    fleet: dict[str, Any] | None = None,
 ) -> str:
-    canonical_payload = {
+    canonical_payload: dict[str, Any] = {
         "generation": int(generation),
         "allow": [str(a) for a in allow],
         "tokens": tokens,
         "tombstones": [str(t) for t in tombstones],
     }
+    if fleet is not None:
+        canonical_payload["fleet"] = fleet
     canonical_bytes = json.dumps(
         canonical_payload,
         sort_keys=True,
@@ -669,11 +690,13 @@ def build_auth_sync_manifest(
     """Build the authoritative `auth_sync` manifest on a source hub."""
     st = sync_source_auth_state(cfg_dir, now=now, explicit_auth_source=explicit_auth_source)
     issued_at = float(now) if now is not None else time.time()
+    fleet_obj = copy.deepcopy(st.fleet) if st.fleet is not None else None
     sha256 = compute_manifest_sha256(
         generation=st.generation,
         allow=st.allow,
         tokens=st.tokens,
         tombstones=st.tombstones,
+        fleet=fleet_obj,
     )
     return {
         "generation": st.generation,
@@ -681,6 +704,7 @@ def build_auth_sync_manifest(
         "allow": st.allow,
         "tokens": st.tokens,
         "tombstones": st.tombstones,
+        "fleet": fleet_obj,
         "issued_at": issued_at,
     }
 
@@ -718,11 +742,20 @@ def validate_auth_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     if not math.isfinite(issued_at) or issued_at <= 0:
         raise AuthSyncError("non-positive or non-finite manifest issued_at")
 
+    raw_fleet = manifest.get("fleet")
+    norm_fleet: dict[str, Any] | None = None
+    if raw_fleet is not None:
+        try:
+            norm_fleet = validate_fleet_manifest(raw_fleet, require_commit=False)
+        except FleetValidationError as exc:
+            raise AuthSyncError(f"invalid manifest fleet: {exc}") from exc
+
     expected_sha = compute_manifest_sha256(
         generation=raw_gen,
         allow=raw_allow,
         tokens=raw_tokens,
         tombstones=raw_tombstones,
+        fleet=raw_fleet,
     )
     if not hmac.compare_digest(expected_sha, raw_sha):
         raise AuthSyncError(
@@ -751,6 +784,7 @@ def validate_auth_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         "raw_allow": list(raw_allow),
         "tokens": copy.deepcopy(raw_tokens),
         "tombstones": norm_tombstones,
+        "fleet": copy.deepcopy(norm_fleet) if norm_fleet is not None else None,
         "issued_at": issued_at,
     }
 
@@ -816,8 +850,9 @@ def apply_replica_manifest(
         # New generation (`gen > cur_gen`): stage all files in `auth-gen/<gen>/` and fsync first.
         gen_dir = cdir / "auth-gen" / str(gen)
         gen_dir.mkdir(parents=True, exist_ok=True)
-        with contextlib.suppress(OSError):
-            os.chmod(gen_dir, 0o700)
+        if os.name != "nt" and hasattr(os, "chmod"):
+            with contextlib.suppress(OSError):
+                os.chmod(gen_dir, 0o700)
 
         allow_content = (
             "\n".join(validated["allow"]) + ("\n" if validated["allow"] else "")
@@ -839,12 +874,23 @@ def apply_replica_manifest(
             "allow": validated["raw_allow"],
             "tokens": validated["tokens"],
             "tombstones": validated["tombstones"],
+            "fleet": validated["fleet"],
             "issued_at": validated["issued_at"],
         }
         manifest_content = json.dumps(manifest_obj, indent=2, ensure_ascii=False) + "\n"
 
         _atomic_write_text(gen_dir / "allow.txt", allow_content, mode=0o600)
         _atomic_write_text(gen_dir / "tokens.json", tokens_content, mode=0o600)
+        fleet_gen_path = gen_dir / "fleet.json"
+        if validated["fleet"] is not None:
+            _atomic_write_text(
+                fleet_gen_path,
+                json.dumps(validated["fleet"], indent=2, ensure_ascii=False) + "\n",
+                mode=0o600,
+            )
+        elif fleet_gen_path.exists():
+            with contextlib.suppress(OSError):
+                fleet_gen_path.unlink()
         _atomic_write_text(gen_dir / "manifest.json", manifest_content, mode=0o600)
         _fsync_dir(gen_dir)
 

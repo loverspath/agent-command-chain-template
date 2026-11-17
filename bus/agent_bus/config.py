@@ -7,10 +7,12 @@ or runtime tailnet discovery.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import pathlib
 import subprocess
+import sys
 from typing import Any
 
 MAX_HOP = 3
@@ -30,7 +32,15 @@ MAX_RECONNECT_BACKOFF = 30.0
 DEFAULT_AUTH_SYNC_INTERVAL = 60.0
 DEFAULT_AUTH_MAX_STALE = 86400.0
 DEFAULT_AUTH_WATCH_INTERVAL = 0.25
+FLEET_EXIT_CODE = 75
+MAX_FLEET_ATTEMPTS = 3
+DEFAULT_FLEET_POLL_INTERVAL = 15.0
+DEFAULT_FLEET_RETRY_INTERVAL = 1.0
+DEFAULT_FLEET_GIT_TIMEOUT = 30.0
+DEFAULT_WS_PING_INTERVAL = 20.0
+DEFAULT_WS_PING_TIMEOUT = 60.0
 HUB_CAPS: tuple[str, ...] = ("v2", "journal", "rkind", "no_replay", "deadline")
+CLIENT_CAPS: tuple[str, ...] = (*HUB_CAPS, "fleet")
 
 ALIASES = {
     "pc": "cat-food",
@@ -58,8 +68,38 @@ FRAME = (
 )
 
 
+def is_windows() -> bool:
+    return os.name == "nt" or sys.platform.startswith("win")
+
+
+def is_termux() -> bool:
+    return bool((os.environ.get("TERMUX_VERSION") or "").strip()) or (
+        "/com.termux/" in (os.environ.get("PREFIX") or "")
+    )
+
+
 def home_dir() -> pathlib.Path:
-    return pathlib.Path.home()
+    if is_windows():
+        drive = os.environ.get("HOMEDRIVE") or ""
+        hpath = os.environ.get("HOMEPATH") or ""
+        win_combo = f"{drive}{hpath}" if (drive and hpath) else ""
+        env_home = (
+            os.environ.get("USERPROFILE")
+            or os.environ.get("HOME")
+            or win_combo
+        )
+    else:
+        env_home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+        if not env_home and is_termux():
+            prefix = (os.environ.get("PREFIX") or "").strip()
+            if prefix:
+                env_home = str(pathlib.Path(prefix).parent / "home")
+    if env_home and env_home.strip():
+        return pathlib.Path(env_home.strip())
+    try:
+        return pathlib.Path.home()
+    except Exception:
+        return pathlib.Path(os.path.expanduser("~"))
 
 
 def cfg_dir() -> pathlib.Path:
@@ -98,6 +138,21 @@ def mode_file_path() -> pathlib.Path:
 def config_file_path(config_dir: pathlib.Path | None = None) -> pathlib.Path:
     base = pathlib.Path(config_dir).expanduser() if config_dir is not None else cfg_dir()
     return base / "config.json"
+
+
+def fleet_file_path(config_dir: pathlib.Path | None = None) -> pathlib.Path:
+    base = pathlib.Path(config_dir).expanduser() if config_dir is not None else cfg_dir()
+    return base / "fleet.json"
+
+
+def fleet_applied_path(config_dir: pathlib.Path | None = None) -> pathlib.Path:
+    base = pathlib.Path(config_dir).expanduser() if config_dir is not None else cfg_dir()
+    return base / "fleet-applied.json"
+
+
+def fleet_attempts_path(config_dir: pathlib.Path | None = None) -> pathlib.Path:
+    base = pathlib.Path(config_dir).expanduser() if config_dir is not None else cfg_dir()
+    return base / "fleet-attempts.json"
 
 
 def load_config(config_dir: pathlib.Path | None = None) -> dict[str, Any]:
@@ -163,10 +218,9 @@ def save_config(cfg: dict[str, Any], config_dir: pathlib.Path | None = None) -> 
     p = config_file_path(config_dir)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    try:
-        os.chmod(p, 0o600)
-    except Exception:
-        pass
+    if os.name != "nt" and hasattr(os, "chmod"):
+        with contextlib.suppress(OSError):
+            os.chmod(p, 0o600)
     return p
 
 
@@ -405,3 +459,75 @@ def get_auth_watch_interval(
     if eff_cfg.get("auth_watch_interval") is not None:
         return max(0.02, float(eff_cfg["auth_watch_interval"]))
     return float(DEFAULT_AUTH_WATCH_INTERVAL)
+
+
+def get_fleet_poll_interval(
+    explicit: float | None = None,
+    cfg: dict[str, Any] | None = None,
+    *,
+    config_dir: pathlib.Path | None = None,
+) -> float:
+    """Resolve connected node periodic `op: 'health'` fleet check interval (default 15.0s)."""
+    if explicit is not None:
+        return max(0.05, float(explicit))
+    raw = os.environ.get("BUS_FLEET_POLL_INTERVAL")
+    if raw is not None and raw.strip() != "":
+        return max(0.05, float(raw.strip()))
+    eff_cfg = cfg if cfg is not None else load_config(config_dir)
+    if eff_cfg.get("fleet_poll_interval") is not None:
+        return max(0.05, float(eff_cfg["fleet_poll_interval"]))
+    return float(DEFAULT_FLEET_POLL_INTERVAL)
+
+
+def get_fleet_retry_interval(
+    explicit: float | None = None,
+    cfg: dict[str, Any] | None = None,
+    *,
+    config_dir: pathlib.Path | None = None,
+) -> float:
+    """Resolve node convergence retry interval on transient failure before 3-attempt block (default 1.0s)."""
+    if explicit is not None:
+        return max(0.02, float(explicit))
+    raw = os.environ.get("BUS_FLEET_RETRY_INTERVAL")
+    if raw is not None and raw.strip() != "":
+        return max(0.02, float(raw.strip()))
+    eff_cfg = cfg if cfg is not None else load_config(config_dir)
+    if eff_cfg.get("fleet_retry_interval") is not None:
+        return max(0.02, float(eff_cfg["fleet_retry_interval"]))
+    return float(DEFAULT_FLEET_RETRY_INTERVAL)
+
+
+def get_fleet_git_timeout(
+    explicit: float | None = None,
+    cfg: dict[str, Any] | None = None,
+    *,
+    config_dir: pathlib.Path | None = None,
+) -> float:
+    """Resolve `git fetch`/`git merge` subprocess timeout in seconds (default 30.0s)."""
+    if explicit is not None:
+        return max(0.2, float(explicit))
+    raw = os.environ.get("BUS_FLEET_GIT_TIMEOUT")
+    if raw is not None and raw.strip() != "":
+        return max(0.2, float(raw.strip()))
+    eff_cfg = cfg if cfg is not None else load_config(config_dir)
+    if eff_cfg.get("fleet_git_timeout") is not None:
+        return max(0.2, float(eff_cfg["fleet_git_timeout"]))
+    return float(DEFAULT_FLEET_GIT_TIMEOUT)
+
+
+def get_ws_ping_interval(
+    explicit: float | None = None,
+    cfg: dict[str, Any] | None = None,
+) -> float:
+    return _resolve_positive_timeout(
+        explicit, "BUS_WS_PING_INTERVAL", cfg, "ws_ping_interval", DEFAULT_WS_PING_INTERVAL
+    )
+
+
+def get_ws_ping_timeout(
+    explicit: float | None = None,
+    cfg: dict[str, Any] | None = None,
+) -> float:
+    return _resolve_positive_timeout(
+        explicit, "BUS_WS_PING_TIMEOUT", cfg, "ws_ping_timeout", DEFAULT_WS_PING_TIMEOUT
+    )
