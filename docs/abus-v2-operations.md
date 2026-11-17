@@ -14,6 +14,7 @@
 3. 모드: `!ask`에 응답하려면 `--mode hybrid`(또는 agent). `watch`는 ack만 보내고 실행하지 않는다(z-fold5 사례).
 4. 기동: Windows는 작업 스케줄러, Termux는 `~/.termux/boot/*.sh`(termux-wake-lock + tmux). 감독자가 없는 노드가 있다.
 5. 확인: `abus doctor --json`의 hubs 두 개 ok, `abus journal status`.
+6. 뷰어/KB 반영: Abus-Viewer(`http://100.124.66.37:8770/`)의 🖥️ Devices 바와 문서 노드 칩은 mother-goose replica의 `auth-gen/<gen>/allow.txt` + `tailscale status --json`에서 자동 생성(15초 캐시). 1단계 allow 추가만으로 반영되며 오프라인 기기는 last_seen 표시. 확인: `curl -s http://100.124.66.37:8770/v1/viewer/devices`에서 새 기기 `registered=true`. tailnet에 있으나 allow에 없는 기기는 "(미등록)"으로 표시. 등록한 사람이 `abus-kb record "<기기> 추가" --category infra --tags device,<기기>`로 IP·OS·역할·모드를 기록.
 
 ## 운영
 - 백업: cat-food `~/abus-backups/backup.sh` 매시 07분(24개 보관, bus.db 온라인 백업+allow/tokens/config).
@@ -26,3 +27,4 @@
 - 게임데이(M6): 허브 PID 종료, msi 절전, mother-goose 재부팅, Doze 시험.
 - mother-goose 허브는 로그온 트리거만(로그온 전 재부팅 직후 미기동).
 - Codex Cloud `urls`에 두 번째 Funnel 추가.
+- 뷰어 Devices는 tailnet 존재/온라인만 보여주고 abus 버스 접속 여부(허브 peers)는 아직 표시하지 않음. 뷰어는 작업 스케줄러 `Abus-Viewer`(로그온 트리거, 2026-11-17 등록).
