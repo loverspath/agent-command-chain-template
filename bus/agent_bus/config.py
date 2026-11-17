@@ -30,7 +30,13 @@ MAX_RECONNECT_BACKOFF = 30.0
 DEFAULT_AUTH_SYNC_INTERVAL = 60.0
 DEFAULT_AUTH_MAX_STALE = 86400.0
 DEFAULT_AUTH_WATCH_INTERVAL = 0.25
+FLEET_EXIT_CODE = 75
+MAX_FLEET_ATTEMPTS = 3
+DEFAULT_FLEET_POLL_INTERVAL = 15.0
+DEFAULT_FLEET_RETRY_INTERVAL = 1.0
+DEFAULT_FLEET_GIT_TIMEOUT = 30.0
 HUB_CAPS: tuple[str, ...] = ("v2", "journal", "rkind", "no_replay", "deadline")
+CLIENT_CAPS: tuple[str, ...] = (*HUB_CAPS, "fleet")
 
 ALIASES = {
     "pc": "cat-food",
@@ -98,6 +104,21 @@ def mode_file_path() -> pathlib.Path:
 def config_file_path(config_dir: pathlib.Path | None = None) -> pathlib.Path:
     base = pathlib.Path(config_dir).expanduser() if config_dir is not None else cfg_dir()
     return base / "config.json"
+
+
+def fleet_file_path(config_dir: pathlib.Path | None = None) -> pathlib.Path:
+    base = pathlib.Path(config_dir).expanduser() if config_dir is not None else cfg_dir()
+    return base / "fleet.json"
+
+
+def fleet_applied_path(config_dir: pathlib.Path | None = None) -> pathlib.Path:
+    base = pathlib.Path(config_dir).expanduser() if config_dir is not None else cfg_dir()
+    return base / "fleet-applied.json"
+
+
+def fleet_attempts_path(config_dir: pathlib.Path | None = None) -> pathlib.Path:
+    base = pathlib.Path(config_dir).expanduser() if config_dir is not None else cfg_dir()
+    return base / "fleet-attempts.json"
 
 
 def load_config(config_dir: pathlib.Path | None = None) -> dict[str, Any]:
@@ -405,3 +426,57 @@ def get_auth_watch_interval(
     if eff_cfg.get("auth_watch_interval") is not None:
         return max(0.02, float(eff_cfg["auth_watch_interval"]))
     return float(DEFAULT_AUTH_WATCH_INTERVAL)
+
+
+def get_fleet_poll_interval(
+    explicit: float | None = None,
+    cfg: dict[str, Any] | None = None,
+    *,
+    config_dir: pathlib.Path | None = None,
+) -> float:
+    """Resolve connected node periodic `op: 'health'` fleet check interval (default 15.0s)."""
+    if explicit is not None:
+        return max(0.05, float(explicit))
+    raw = os.environ.get("BUS_FLEET_POLL_INTERVAL")
+    if raw is not None and raw.strip() != "":
+        return max(0.05, float(raw.strip()))
+    eff_cfg = cfg if cfg is not None else load_config(config_dir)
+    if eff_cfg.get("fleet_poll_interval") is not None:
+        return max(0.05, float(eff_cfg["fleet_poll_interval"]))
+    return float(DEFAULT_FLEET_POLL_INTERVAL)
+
+
+def get_fleet_retry_interval(
+    explicit: float | None = None,
+    cfg: dict[str, Any] | None = None,
+    *,
+    config_dir: pathlib.Path | None = None,
+) -> float:
+    """Resolve node convergence retry interval on transient failure before 3-attempt block (default 1.0s)."""
+    if explicit is not None:
+        return max(0.02, float(explicit))
+    raw = os.environ.get("BUS_FLEET_RETRY_INTERVAL")
+    if raw is not None and raw.strip() != "":
+        return max(0.02, float(raw.strip()))
+    eff_cfg = cfg if cfg is not None else load_config(config_dir)
+    if eff_cfg.get("fleet_retry_interval") is not None:
+        return max(0.02, float(eff_cfg["fleet_retry_interval"]))
+    return float(DEFAULT_FLEET_RETRY_INTERVAL)
+
+
+def get_fleet_git_timeout(
+    explicit: float | None = None,
+    cfg: dict[str, Any] | None = None,
+    *,
+    config_dir: pathlib.Path | None = None,
+) -> float:
+    """Resolve `git fetch`/`git merge` subprocess timeout in seconds (default 30.0s)."""
+    if explicit is not None:
+        return max(0.2, float(explicit))
+    raw = os.environ.get("BUS_FLEET_GIT_TIMEOUT")
+    if raw is not None and raw.strip() != "":
+        return max(0.2, float(raw.strip()))
+    eff_cfg = cfg if cfg is not None else load_config(config_dir)
+    if eff_cfg.get("fleet_git_timeout") is not None:
+        return max(0.2, float(eff_cfg["fleet_git_timeout"]))
+    return float(DEFAULT_FLEET_GIT_TIMEOUT)

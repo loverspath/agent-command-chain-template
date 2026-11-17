@@ -12,13 +12,16 @@ from .auth import ReplicaReadOnlyError, create_token, load_tokens, revoke_token
 from .bridge import ack_inbox, read_inbox
 from .client import (
     drain_outbox,
+    fetch_fleet_status,
+    format_fleet_status_table,
     oneshot,
     run_doctor,
     run_node,
     run_supervise,
     update_repo,
 )
-from .config import cfg_dir, load_config, parse_peer_list, parse_url_list, save_config
+from .config import cfg_dir, fleet_file_path, load_config, parse_peer_list, parse_url_list, save_config
+from .fleet import FleetValidationError, set_fleet_manifest
 from .hub import serve_all
 from .journal import NodeJournal
 
@@ -180,6 +183,49 @@ def _cmd_journal(a: argparse.Namespace) -> int:
     return 1
 
 
+def _cmd_fleet(a: argparse.Namespace) -> int:
+    cdir = cfg_dir()
+    if a.fcmd == "set":
+        try:
+            manifest, auth_gen = set_fleet_manifest(
+                cdir,
+                commit=a.commit,
+                urls=a.urls,
+                hub_peers=a.hub_peers,
+                min_caps=a.min_caps,
+                explicit_rev=a.rev,
+            )
+        except (ReplicaReadOnlyError, FleetValidationError) as exc:
+            print(f"[error] {exc}", file=sys.stderr)
+            return 1
+        out_doc = {
+            "ok": True,
+            "path": str(fleet_file_path(cdir)),
+            "auth_generation": auth_gen,
+            "fleet": manifest,
+        }
+        if getattr(a, "json", False):
+            print(json.dumps(out_doc, indent=2, ensure_ascii=False))
+        else:
+            print(
+                f"saved {out_doc['path']}: rev={manifest['rev']} commit={manifest['commit']} "
+                f"urls={','.join(manifest['urls'])} auth_generation={auth_gen}"
+            )
+        return 0
+
+    if a.fcmd == "status":
+        rep = fetch_fleet_status(a)
+        if getattr(a, "json", False):
+            print(json.dumps(rep, indent=2, ensure_ascii=False))
+        else:
+            txt = format_fleet_status_table(rep)
+            stream = sys.stdout if rep.get("ok") else sys.stderr
+            print(txt, file=stream)
+        return 0 if rep.get("ok") else 1
+
+    return 1
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="abus", description="Durable Cross-Environment Agent Bus CLI")
     sp = p.add_subparsers(dest="cmd", required=True)
@@ -285,6 +331,19 @@ def main(argv: list[str] | None = None) -> None:
 
     sp.add_parser("update", help="Pull latest repo commits via git pull --ff-only")
 
+    flt_p = sp.add_parser("fleet", help="Manage centralized fleet manifest and node convergence")
+    flt_sp = flt_p.add_subparsers(dest="fcmd", required=True)
+    fs_set = flt_sp.add_parser("set", help="Atomically write <cfg_dir>/fleet.json on source hub")
+    fs_set.add_argument("--commit", required=True, help="Target Git commit SHA")
+    fs_set.add_argument("--urls", required=True, help="Comma-separated ws:// or wss:// hub URLs")
+    fs_set.add_argument("--hub-peers", default=None, help="Comma-separated replica peer node names")
+    fs_set.add_argument("--min-caps", default=None, help="Comma-separated required client capabilities")
+    fs_set.add_argument("--rev", type=int, default=None, help="Explicit monotonic revision (> current rev)")
+    fs_set.add_argument("--json", action="store_true")
+    fs_st = flt_sp.add_parser("status", help="Query target fleet manifest and node convergence status")
+    fs_st.add_argument("--url", default=None, help="Hub WS or Gateway HTTP URL(s)")
+    fs_st.add_argument("--json", action="store_true")
+
     a = p.parse_args(argv)
     if getattr(a, "agent", False) and not getattr(a, "mode", None):
         a.mode = "agent"
@@ -300,6 +359,8 @@ def main(argv: list[str] | None = None) -> None:
             sys.exit(_cmd_token(a))
         elif a.cmd == "journal":
             sys.exit(_cmd_journal(a))
+        elif a.cmd == "fleet":
+            sys.exit(_cmd_fleet(a))
         elif a.cmd == "update":
             changed = update_repo()
             print("updated" if changed else "already up to date")

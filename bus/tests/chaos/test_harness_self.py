@@ -35,9 +35,12 @@ def test_worktree_pythonpath_isolation_and_claude_double_guard(
     tmp_path: pathlib.Path,
     sandbox_env: dict[str, pathlib.Path],
 ) -> None:
-    """Verify worktree PYTHONPATH (`abus-wt/bus`), port guards, and double `claude` block."""
+    """Verify worktree PYTHONPATH isolation, port guards, and double `claude` block."""
     client_file = pathlib.Path(bus_client.__file__).resolve()
-    assert BUS_ROOT == pathlib.Path("/home/rerun/abus-wt/bus").resolve()
+    expected_bus_root = pathlib.Path(__file__).resolve().parents[2]
+    prod_bus_root = pathlib.Path("/home/rerun/agent-command-chain-template/bus").resolve()
+    assert BUS_ROOT == expected_bus_root
+    assert BUS_ROOT != prod_bus_root
     assert str(client_file).startswith(str(BUS_ROOT)), f"Imported from wrong checkout: {client_file}"
 
     # Verify HOME and BUS_* are strictly confined inside pytest tmp_path

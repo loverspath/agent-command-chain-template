@@ -67,6 +67,18 @@ CREATE TABLE IF NOT EXISTS nonces (
     expires_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_nonces_expires ON nonces(expires_at);
+
+CREATE TABLE IF NOT EXISTS fleet_status (
+    node TEXT PRIMARY KEY,
+    rev INTEGER NOT NULL,
+    commit_sha TEXT NOT NULL DEFAULT '',
+    target_commit TEXT NOT NULL DEFAULT '',
+    result TEXT NOT NULL,
+    config_changed INTEGER NOT NULL DEFAULT 0,
+    code_changed INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 1,
+    updated_at REAL NOT NULL
+);
 """
 
 NON_TERMINAL_RPC_STATUSES = frozenset({"", "pending", "running"})
@@ -873,3 +885,103 @@ class BusStore:
             )
             self._conn.commit()
             return int(cur.rowcount or 0)
+
+    def upsert_fleet_status(
+        self,
+        *,
+        node: str,
+        rev: int,
+        commit: str,
+        result: str,
+        updated_at: float | None = None,
+        target_commit: str = "",
+        config_changed: bool = False,
+        code_changed: bool = False,
+        attempts: int = 1,
+    ) -> dict[str, Any]:
+        """Persist monotonic per-node `fleet-ack` convergence status across hub restarts."""
+        clean_node = str(node or "").strip().lower()
+        if not clean_node:
+            raise ValueError("node must be non-empty")
+        ts = float(updated_at) if updated_at is not None else time.time()
+        rev_int = int(rev)
+        att_int = max(1, int(attempts))
+        cfg_int = 1 if config_changed else 0
+        code_int = 1 if code_changed else 0
+        clean_commit = str(commit or "").strip()
+        clean_target = str(target_commit or "").strip()
+        clean_result = str(result or "ok").strip()
+
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT * FROM fleet_status WHERE node = ?",
+                (clean_node,),
+            ).fetchone()
+            if existing is not None and int(existing["rev"]) > rev_int:
+                row = existing
+            else:
+                self._conn.execute(
+                    """
+                    INSERT INTO fleet_status
+                        (node, rev, commit_sha, target_commit, result, config_changed, code_changed, attempts, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(node) DO UPDATE SET
+                        rev = excluded.rev,
+                        commit_sha = excluded.commit_sha,
+                        target_commit = excluded.target_commit,
+                        result = excluded.result,
+                        config_changed = excluded.config_changed,
+                        code_changed = excluded.code_changed,
+                        attempts = excluded.attempts,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        clean_node,
+                        rev_int,
+                        clean_commit,
+                        clean_target,
+                        clean_result,
+                        cfg_int,
+                        code_int,
+                        att_int,
+                        ts,
+                    ),
+                )
+                self._conn.commit()
+                row = self._conn.execute(
+                    "SELECT * FROM fleet_status WHERE node = ?",
+                    (clean_node,),
+                ).fetchone()
+
+            assert row is not None
+            return {
+                "node": str(row["node"]),
+                "rev": int(row["rev"]),
+                "commit": str(row["commit_sha"]),
+                "target_commit": str(row["target_commit"]),
+                "result": str(row["result"]),
+                "config_changed": bool(row["config_changed"]),
+                "code_changed": bool(row["code_changed"]),
+                "attempts": int(row["attempts"]),
+                "updated_at": float(row["updated_at"]),
+            }
+
+    def list_fleet_status(self) -> dict[str, dict[str, Any]]:
+        """Return `{node: status_dict}` for all reported fleet nodes."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM fleet_status ORDER BY node ASC"
+            ).fetchall()
+            out: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                out[str(row["node"])] = {
+                    "rev": int(row["rev"]),
+                    "commit": str(row["commit_sha"]),
+                    "target_commit": str(row["target_commit"]),
+                    "result": str(row["result"]),
+                    "config_changed": bool(row["config_changed"]),
+                    "code_changed": bool(row["code_changed"]),
+                    "attempts": int(row["attempts"]),
+                    "updated_at": float(row["updated_at"]),
+                }
+            return out

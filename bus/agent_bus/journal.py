@@ -1109,6 +1109,14 @@ class NodeJournal:
 
         return _with_sqlite_retry(_op)
 
+    def count_inbox_running(self) -> int:
+        """Return count of `inbox` items currently in `state = 'running'`."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS cnt FROM inbox WHERE state = 'running'"
+            ).fetchone()
+            return int(row["cnt"] or 0) if row is not None else 0
+
     # ------------------------------------------------------------------
     # Cursors & CLI diagnostics
     # ------------------------------------------------------------------

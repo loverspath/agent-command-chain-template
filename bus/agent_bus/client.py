@@ -29,10 +29,13 @@ import websockets
 from .auth import build_hmac_headers, get_test_local_node_header
 from .bridge import ack_inbox, deliver_to_inbox, read_inbox
 from .config import (
+    FLEET_EXIT_CODE,
     FRAME,
     MAX_HOP,
     MAX_RECONNECT_BACKOFF,
     cfg_dir,
+    fleet_applied_path,
+    fleet_file_path,
     get_ack_timeout,
     get_auth_credentials,
     get_banner_timeout,
@@ -40,12 +43,25 @@ from .config import (
     get_bus_urls,
     get_configured_multi_urls,
     get_dial_timeout,
+    get_fleet_poll_interval,
+    get_fleet_retry_interval,
     get_hello_timeout,
     home_dir,
     load_config,
     mode_file_path,
     parse_url_list,
     save_config,
+)
+from .fleet import (
+    FleetConvergeExit,
+    FleetValidationError,
+    build_fleet_ack_payload,
+    converge_fleet_once,
+    is_node_converged,
+    load_fleet_applied,
+    record_fleet_applied_acked_hub,
+    should_attempt_convergence,
+    validate_fleet_manifest,
 )
 from .journal import (
     NodeJournal,
@@ -166,6 +182,7 @@ def build_ws_hello(
     *,
     no_replay: bool = False,
     hub_id: str | None = None,
+    fleet_notify: bool = False,
 ) -> dict[str, Any]:
     hello: dict[str, Any] = {
         "v": 2,
@@ -177,6 +194,8 @@ def build_ws_hello(
         hello["no_replay"] = True
     if hub_id:
         hello["hub_id"] = str(hub_id)
+    if fleet_notify:
+        hello["fleet_notify"] = True
     token_id, secret = get_auth_credentials()
     if token_id and secret:
         hdrs = build_hmac_headers(token_id, secret, token_id.encode("utf-8"))
@@ -294,6 +313,9 @@ def ask_claude(text: str, frm: str, cwd: pathlib.Path | None = None) -> tuple[st
 
 
 def _git_repo_root() -> str:
+    env_override = (os.environ.get("BUS_FLEET_REPO_DIR") or "").strip()
+    if env_override:
+        return str(pathlib.Path(env_override).expanduser().resolve())
     here = pathlib.Path(__file__).resolve().parent
     try:
         r = subprocess.run(
@@ -683,10 +705,20 @@ async def run_node(a: argparse.Namespace) -> None:
     hello_timeout = get_hello_timeout(getattr(a, "hello_timeout", None), cfg)
     banner_timeout = get_banner_timeout(getattr(a, "banner_timeout", None), cfg)
     ack_timeout = get_ack_timeout(getattr(a, "ack_timeout", None), cfg)
+    fleet_poll_interval = get_fleet_poll_interval(cfg=cfg, config_dir=cdir)
+    fleet_retry_interval = get_fleet_retry_interval(cfg=cfg, config_dir=cdir)
+    auto_update = not bool(getattr(a, "no_auto_update", False))
     work_cwd = pathlib.Path(a.cwd).expanduser() if getattr(a, "cwd", None) else home_dir()
     ack_events: dict[str, asyncio.Event] = {}
 
-    if not getattr(a, "no_auto_update", False) and update_repo():
+    skip_startup_pull = bool(
+        (os.environ.get("BUS_FLEET_REPO_DIR") or "").strip()
+        or os.environ.get("BUS_TEST_ALLOW_LOCALHOST") == "1"
+        or os.environ.get("BUS_DISABLE_STARTUP_PULL") == "1"
+        or fleet_applied_path(cdir).is_file()
+        or fleet_file_path(cdir).is_file()
+    )
+    if auto_update and not skip_startup_pull and update_repo():
         restart_self()
 
     loop = asyncio.get_running_loop()
@@ -696,6 +728,15 @@ async def run_node(a: argparse.Namespace) -> None:
 
     inbox_wakeup = asyncio.Event()
     inbox_wakeup.set()
+    fleet_wakeup = asyncio.Event()
+    worker_idle_event = asyncio.Event()
+    worker_idle_event.set()
+    worker_busy_count: list[int] = [0]
+    active_reply_mid_slot: list[str | None] = [None]
+    fleet_drain_requested: list[bool] = [False]
+    fleet_exit_code_slot: list[int | None] = [None]
+    pending_fleet_manifest: list[dict[str, Any] | None] = [None]
+    pending_ack_hub_keys: set[str] = set()
 
     # Startup recovery: transition any orphaned `running` items (from dead workers) to
     # `uncertain` (`exec_uncertain`) and enqueue `status='exec_uncertain'` into `outbox`.
@@ -703,6 +744,7 @@ async def run_node(a: argparse.Namespace) -> None:
 
     main_task = asyncio.current_task()
     worker_task_ref: list[asyncio.Task[None] | None] = [None]
+    fleet_task_ref: list[asyncio.Task[None] | None] = [None]
     hub_tasks: list[asyncio.Task[None]] = []
     pump_tasks: set[asyncio.Task[None]] = set()
     bg_tasks: set[asyncio.Task[Any]] = set()
@@ -739,11 +781,38 @@ async def run_node(a: argparse.Namespace) -> None:
         for ht in list(hub_tasks):
             if ht is not cur and not ht.done():
                 ht.cancel()
+        ft = fleet_task_ref[0]
+        if ft is not None and ft is not cur and not ft.done():
+            ft.cancel()
         wt = worker_task_ref[0]
         if wt is not None and wt is not cur and not wt.done():
             wt.cancel()
         if main_task is not None and main_task is not cur and not main_task.done():
             main_task.cancel()
+
+    def _submit_fleet_manifest(raw_fleet: Any, *, hub_key: str = "") -> None:
+        try:
+            validated = validate_fleet_manifest(raw_fleet, require_commit=False)
+        except FleetValidationError as exc:
+            print(
+                f"[fleet-warn] ignoring invalid fleet manifest: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+        applied = load_fleet_applied(cdir)
+        local_rev = int(applied.get("rev") or 0) if applied is not None else 0
+        if validated["rev"] <= local_rev:
+            if hub_key and applied is not None:
+                acked_list = applied.get("acked_hubs")
+                if not isinstance(acked_list, list) or hub_key not in acked_list:
+                    pending_ack_hub_keys.add(hub_key)
+                    fleet_wakeup.set()
+            return
+        cur_pending = pending_fleet_manifest[0]
+        if cur_pending is None or int(validated["rev"]) >= int(cur_pending["rev"]):
+            pending_fleet_manifest[0] = validated
+            fleet_wakeup.set()
 
     def _fire_test_crash_hook(stage: str, info: dict[str, Any]) -> Any:
         hook = _TEST_CRASH_HOOK
@@ -877,6 +946,48 @@ async def run_node(a: argparse.Namespace) -> None:
             bg_tasks.add(t)
             t.add_done_callback(bg_tasks.discard)
 
+    async def _wait_outbox_mid_acked_on_connected_hubs(mid: str, *, timeout: float = 3.0) -> list[str]:
+        _notify_all_pumps()
+        deadline_m = time.monotonic() + max(0.05, float(timeout))
+        acked_set: set[str] = set()
+        while time.monotonic() < deadline_m and not fatal_crash_flag[0]:
+            row = await loop.run_in_executor(None, journal.get_outbox_row, mid)
+            if row is None:
+                return sorted(acked_set)
+            try:
+                parsed_acked = json.loads(row.get("acked_hubs") or "[]")
+                if isinstance(parsed_acked, list):
+                    acked_set = {str(x) for x in parsed_acked if str(x)}
+            except Exception:
+                pass
+            connected_keys = [
+                str(st["hub_key"])
+                for st in hub_states
+                if st.get("ws") is not None and st.get("hub_key")
+            ]
+            if row.get("state") in ("done", "expired", "rejected"):
+                return sorted(acked_set)
+            if connected_keys and all(hk in acked_set for hk in connected_keys):
+                return sorted(acked_set)
+            _notify_all_pumps()
+            await asyncio.sleep(0.02)
+        return sorted(acked_set)
+
+    async def _is_node_completely_idle() -> bool:
+        if worker_busy_count[0] > 0:
+            return False
+        running_cnt = await loop.run_in_executor(None, journal.count_inbox_running)
+        if running_cnt > 0:
+            return False
+        rep_mid = active_reply_mid_slot[0]
+        if rep_mid:
+            await _wait_outbox_mid_acked_on_connected_hubs(rep_mid, timeout=3.0)
+            if active_reply_mid_slot[0] == rep_mid:
+                active_reply_mid_slot[0] = None
+        if worker_busy_count[0] > 0:
+            return False
+        return (await loop.run_in_executor(None, journal.count_inbox_running)) == 0
+
     async def worker() -> None:
         while not fatal_crash_flag[0]:
             inbox_wakeup.clear()
@@ -888,7 +999,11 @@ async def run_node(a: argparse.Namespace) -> None:
 
             # 2. Claim 1 unexpired `queued` item atomically if this node label is an active worker.
             claimed: dict[str, Any] | None = None
-            allow_claim = get_mode(a.mode) != "watch" and not fatal_crash_flag[0]
+            allow_claim = (
+                get_mode(a.mode) != "watch"
+                and not fatal_crash_flag[0]
+                and not fleet_drain_requested[0]
+            )
             if allow_claim and _TEST_CRASH_HOOK is not None:
                 if _fire_test_crash_hook("before_claim", {"label": label}) is False:
                     allow_claim = False
@@ -908,40 +1023,184 @@ async def run_node(a: argparse.Namespace) -> None:
                     pass
                 continue
 
-            mid = str(claimed["id"])
-            corr_id = str(claimed.get("corr_id") or mid)
-            sender = str(claimed["from"])
-
-            _broadcast_progress_best_effort(corr_id, sender)
-
-            if _TEST_CRASH_HOOK is not None:
-                _fire_test_crash_hook("after_claim_before_exec", claimed)
-
+            worker_busy_count[0] += 1
+            worker_idle_event.clear()
             try:
-                ans, status = await loop.run_in_executor(
-                    None, ask_claude, str(claimed["text"]), sender, work_cwd
+                mid = str(claimed["id"])
+                corr_id = str(claimed.get("corr_id") or mid)
+                sender = str(claimed["from"])
+
+                _broadcast_progress_best_effort(corr_id, sender)
+
+                if _TEST_CRASH_HOOK is not None:
+                    _fire_test_crash_hook("after_claim_before_exec", claimed)
+
+                try:
+                    ans, status = await loop.run_in_executor(
+                        None, ask_claude, str(claimed["text"]), sender, work_cwd
+                    )
+                except Exception as exc:
+                    ans, status = f"[agent error] {exc}", "exec_error"
+
+                if _TEST_CRASH_HOOK is not None:
+                    _fire_test_crash_hook("after_exec_before_save", claimed)
+
+                reply_payload = await loop.run_in_executor(
+                    None,
+                    lambda: journal.complete_inbox_and_enqueue_reply(
+                        mid,
+                        result_status=status,
+                        result_text=ans,
+                    ),
                 )
-            except Exception as exc:
-                ans, status = f"[agent error] {exc}", "exec_error"
 
-            if _TEST_CRASH_HOOK is not None:
-                _fire_test_crash_hook("after_exec_before_save", claimed)
+                if _TEST_CRASH_HOOK is not None:
+                    _fire_test_crash_hook("after_save_before_send", claimed)
 
-            reply_payload = await loop.run_in_executor(
+                if reply_payload is not None:
+                    active_reply_mid_slot[0] = str(reply_payload["id"])
+                    _notify_all_pumps()
+                    await asyncio.sleep(0)
+            finally:
+                worker_busy_count[0] = max(0, worker_busy_count[0] - 1)
+                if worker_busy_count[0] == 0:
+                    worker_idle_event.set()
+                    fleet_wakeup.set()
+
+    async def _fleet_converge_loop() -> None:
+        while not fatal_crash_flag[0]:
+            fleet_wakeup.clear()
+
+            if pending_ack_hub_keys and pending_fleet_manifest[0] is None:
+                applied_now = await loop.run_in_executor(None, load_fleet_applied, cdir)
+                if applied_now is not None:
+                    pending_ack_hub_keys.clear()
+                    ack_msg = build_fleet_ack_payload(applied_now)
+                    saved_ack = await loop.run_in_executor(None, journal.enqueue_outbox, ack_msg)
+                    acked_hks = await _wait_outbox_mid_acked_on_connected_hubs(
+                        str(saved_ack["id"]),
+                        timeout=2.5,
+                    )
+                    for hk in acked_hks:
+                        await loop.run_in_executor(
+                            None,
+                            record_fleet_applied_acked_hub,
+                            cdir,
+                            int(applied_now["rev"]),
+                            hk,
+                        )
+                else:
+                    pending_ack_hub_keys.clear()
+
+            candidate = pending_fleet_manifest[0]
+            if candidate is None:
+                try:
+                    await asyncio.wait_for(fleet_wakeup.wait(), timeout=fleet_poll_interval)
+                except asyncio.TimeoutError:
+                    for st in hub_states:
+                        ws_cur = st.get("ws")
+                        slock: asyncio.Lock | None = st.get("send_lock")
+                        if ws_cur is not None and slock is not None:
+                            with contextlib.suppress(Exception):
+                                async with slock:
+                                    await asyncio.wait_for(
+                                        ws_cur.send(json.dumps({"op": "health"})),
+                                        timeout=1.5,
+                                    )
+                continue
+
+            still_needed = await loop.run_in_executor(
+                None, should_attempt_convergence, cdir, candidate
+            )
+            if still_needed is None:
+                if pending_fleet_manifest[0] is candidate:
+                    pending_fleet_manifest[0] = None
+                fleet_drain_requested[0] = False
+                inbox_wakeup.set()
+                continue
+
+            if not await _is_node_completely_idle():
+                if not fleet_drain_requested[0]:
+                    fleet_drain_requested[0] = True
+                    print(
+                        f"[fleet] rev={still_needed['rev']} detected while worker busy; "
+                        "draining active execution before convergence",
+                        flush=True,
+                    )
+                try:
+                    await asyncio.wait_for(worker_idle_event.wait(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+
+            fleet_drain_requested[0] = True
+            if not await _is_node_completely_idle():
+                continue
+
+            outcome = await loop.run_in_executor(
                 None,
-                lambda: journal.complete_inbox_and_enqueue_reply(
-                    mid,
-                    result_status=status,
-                    result_text=ans,
+                lambda cand=still_needed: converge_fleet_once(
+                    cdir,
+                    cand,
+                    auto_update=auto_update,
                 ),
             )
 
-            if _TEST_CRASH_HOOK is not None:
-                _fire_test_crash_hook("after_save_before_send", claimed)
+            if outcome.action == "retry_later":
+                fleet_drain_requested[0] = False
+                inbox_wakeup.set()
+                print(
+                    f"[fleet] rev={still_needed['rev']} transient failure ({outcome.reason}) "
+                    f"attempt={outcome.attempts}; retrying in {fleet_retry_interval:.2f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                try:
+                    await asyncio.wait_for(fleet_wakeup.wait(), timeout=fleet_retry_interval)
+                except asyncio.TimeoutError:
+                    pass
+                continue
 
-            if reply_payload is not None:
-                _notify_all_pumps()
-                await asyncio.sleep(0)
+            if pending_fleet_manifest[0] is candidate:
+                pending_fleet_manifest[0] = None
+            pending_ack_hub_keys.clear()
+
+            if outcome.applied_doc is not None:
+                ack_payload = build_fleet_ack_payload(outcome.applied_doc)
+                saved_ack = await loop.run_in_executor(None, journal.enqueue_outbox, ack_payload)
+                acked_hks = await _wait_outbox_mid_acked_on_connected_hubs(
+                    str(saved_ack["id"]),
+                    timeout=3.0,
+                )
+                for hk in acked_hks:
+                    await loop.run_in_executor(
+                        None,
+                        record_fleet_applied_acked_hub,
+                        cdir,
+                        int(outcome.applied_doc["rev"]),
+                        hk,
+                    )
+                print(
+                    f"[fleet] rev={outcome.applied_doc['rev']} result={outcome.applied_doc['result']} "
+                    f"config_changed={outcome.applied_doc['config_changed']} "
+                    f"code_changed={outcome.applied_doc['code_changed']} "
+                    f"attempts={outcome.applied_doc['attempts']}",
+                    flush=True,
+                )
+
+            if outcome.needs_restart:
+                while not await _is_node_completely_idle():
+                    await asyncio.sleep(0.03)
+                print(
+                    f"[fleet] converged rev={still_needed['rev']}; exiting with code {FLEET_EXIT_CODE}",
+                    flush=True,
+                )
+                fleet_exit_code_slot[0] = FLEET_EXIT_CODE
+                _cancel_all_siblings(asyncio.current_task())
+                return
+
+            fleet_drain_requested[0] = False
+            inbox_wakeup.set()
 
     async def _run_hub_loop(hub_idx: int, h_state: dict[str, Any]) -> None:
         raw_url = h_state["raw_url"]
@@ -977,6 +1236,7 @@ async def run_node(a: argparse.Namespace) -> None:
                         hello_since,
                         accept_inbox=(label == "main"),
                         hub_id=known_hub_id,
+                        fleet_notify=True,
                     ),
                     dial_timeout=dial_timeout,
                     hello_timeout=hello_timeout,
@@ -1031,6 +1291,16 @@ async def run_node(a: argparse.Namespace) -> None:
                 pump_task = asyncio.create_task(_outbox_pump(h_state, ws))
                 pump_tasks.add(pump_task)
 
+                if "fleet" in banner and banner["fleet"] is not None:
+                    _submit_fleet_manifest(banner["fleet"], hub_key=active_hub_key)
+                else:
+                    applied_cur = load_fleet_applied(cdir)
+                    if applied_cur is not None:
+                        acked_cur = applied_cur.get("acked_hubs")
+                        if not isinstance(acked_cur, list) or active_hub_key not in acked_cur:
+                            pending_ack_hub_keys.add(active_hub_key)
+                            fleet_wakeup.set()
+
                 async for raw in ws:
                     m = json.loads(raw)
                     op = m.get("op")
@@ -1053,6 +1323,13 @@ async def run_node(a: argparse.Namespace) -> None:
                         print(f"[hub:{ws_url}] {m.get('text')}", flush=True)
                         if m.get("rules"):
                             print(m["rules"], flush=True)
+                        if "fleet" in m and m["fleet"] is not None:
+                            _submit_fleet_manifest(m["fleet"], hub_key=active_hub_key)
+                        continue
+
+                    if op in ("fleet", "health"):
+                        if "fleet" in m and m["fleet"] is not None:
+                            _submit_fleet_manifest(m["fleet"], hub_key=active_hub_key)
                         continue
 
                     if op != "msg":
@@ -1268,6 +1545,8 @@ async def run_node(a: argparse.Namespace) -> None:
 
     worker_task = asyncio.create_task(worker())
     worker_task_ref[0] = worker_task
+    fleet_task = asyncio.create_task(_fleet_converge_loop())
+    fleet_task_ref[0] = fleet_task
 
     def _on_child_done(t: asyncio.Task[None]) -> None:
         if t.cancelled():
@@ -1279,6 +1558,7 @@ async def run_node(a: argparse.Namespace) -> None:
             _cancel_all_siblings(t)
 
     worker_task.add_done_callback(_on_child_done)
+    fleet_task.add_done_callback(_on_child_done)
     for idx, st in enumerate(hub_states):
         ht = asyncio.create_task(_run_hub_loop(idx, st))
         ht.add_done_callback(_on_child_done)
@@ -1296,11 +1576,11 @@ async def run_node(a: argparse.Namespace) -> None:
         sigterm_installed = True
 
     try:
-        await asyncio.gather(worker_task, *hub_tasks)
+        await asyncio.gather(worker_task, fleet_task, *hub_tasks)
     except asyncio.CancelledError:
         if fatal_exc_slot[0] is not None:
             raise fatal_exc_slot[0]
-        if not sigterm_stop_flag[0]:
+        if not sigterm_stop_flag[0] and fleet_exit_code_slot[0] is None:
             raise
     finally:
         if sigterm_installed:
@@ -1312,11 +1592,22 @@ async def run_node(a: argparse.Namespace) -> None:
             pt.cancel()
         for ht in hub_tasks:
             ht.cancel()
+        fleet_task.cancel()
         worker_task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
-            await asyncio.gather(worker_task, *hub_tasks, *pump_tasks, *bg_tasks, return_exceptions=True)
+            await asyncio.gather(
+                worker_task,
+                fleet_task,
+                *hub_tasks,
+                *pump_tasks,
+                *bg_tasks,
+                return_exceptions=True,
+            )
         worker_session.close()
         journal.close()
+
+    if fleet_exit_code_slot[0] is not None:
+        raise FleetConvergeExit(fleet_exit_code_slot[0])
 
 
 def _exit_code_for_rpc_status(status: str) -> int:
@@ -2040,7 +2331,7 @@ def run_supervise(a: argparse.Namespace) -> int:
             print(clean, flush=True)
         rc = proc.wait()
         logger.info("child exited with code=%s", rc)
-        if rc == 42:
+        if rc in (42, FLEET_EXIT_CODE):
             delay = 1.0
             continue
         if rc == 0 and getattr(a, "once", False):
@@ -2204,6 +2495,194 @@ def run_doctor(a: argparse.Namespace) -> dict[str, Any]:
         report["gh_error"] = "gh binary not found"
 
     return report
+
+
+def fetch_fleet_status(a: argparse.Namespace) -> dict[str, Any]:
+    """Query `GET /v1/health` or WS `op: 'health'` across configured/explicit hub URLs."""
+    raw_cdir = getattr(a, "config_dir", None)
+    cdir = pathlib.Path(raw_cdir).expanduser() if raw_cdir else cfg_dir()
+    cfg = load_config(cdir)
+    urls = get_bus_urls(cfg, explicit_url=getattr(a, "url", None))
+    dial_t = get_dial_timeout(getattr(a, "dial_timeout", None), cfg)
+    hello_t = get_hello_timeout(getattr(a, "hello_timeout", None), cfg)
+    banner_t = get_banner_timeout(getattr(a, "banner_timeout", None), cfg)
+    ack_t = get_ack_timeout(getattr(a, "ack_timeout", None), cfg)
+
+    async def _query_one(u: str) -> dict[str, Any]:
+        item: dict[str, Any] = {
+            "url": u,
+            "ok": False,
+            "hub_id": None,
+            "auth_mode": None,
+            "auth_generation": None,
+            "fleet": None,
+            "fleet_nodes": {},
+        }
+        try:
+            if is_http_url(u):
+                code, data = await asyncio.to_thread(
+                    http_request_json,
+                    u,
+                    "/v1/health",
+                    method="GET",
+                    timeout=max(1.0, dial_t + banner_t),
+                )
+                if code != 200 or not data.get("ok"):
+                    item["error"] = str(data.get("error") or f"http_{code}")
+                    return item
+            else:
+                ws_url = to_ws_url(u)
+                ws, _ = await _open_ws_with_deadlines(
+                    ws_url,
+                    build_ws_hello(
+                        f"cli-flt-{uuid.uuid4().hex[:6]}",
+                        10**9,
+                        accept_inbox=False,
+                        no_replay=True,
+                    ),
+                    dial_timeout=dial_t,
+                    hello_timeout=hello_t,
+                    banner_timeout=banner_t,
+                )
+                try:
+                    await asyncio.wait_for(ws.send(json.dumps({"op": "health"})), timeout=hello_t)
+                    deadline_m = time.monotonic() + ack_t
+                    data = {}
+                    while True:
+                        rem = max(0.05, deadline_m - time.monotonic())
+                        frame = json.loads(await asyncio.wait_for(ws.recv(), timeout=rem))
+                        if isinstance(frame, dict) and frame.get("op") == "health":
+                            data = frame
+                            break
+                finally:
+                    with contextlib.suppress(Exception):
+                        await ws.close()
+
+            item["ok"] = True
+            item["hub_id"] = data.get("hub_id")
+            item["auth_mode"] = data.get("auth_mode")
+            item["auth_generation"] = data.get("auth_generation")
+            item["fleet"] = data.get("fleet")
+            raw_fn = data.get("fleet_nodes")
+            item["fleet_nodes"] = raw_fn if isinstance(raw_fn, dict) else {}
+            return item
+        except Exception as exc:
+            item["error"] = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+            return item
+
+    async def _query_all() -> list[dict[str, Any]]:
+        return list(await asyncio.gather(*(_query_one(u) for u in urls)))
+
+    try:
+        asyncio.get_running_loop()
+        in_running_loop = True
+    except RuntimeError:
+        in_running_loop = False
+
+    if in_running_loop:
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            hubs_res = ex.submit(lambda: asyncio.run(_query_all())).result()
+    else:
+        hubs_res = asyncio.run(_query_all())
+
+    any_ok = any(bool(h.get("ok")) for h in hubs_res)
+    target_fleet: dict[str, Any] | None = None
+    for h in hubs_res:
+        if not h.get("ok"):
+            continue
+        fl = h.get("fleet")
+        if isinstance(fl, dict) and isinstance(fl.get("rev"), int):
+            if target_fleet is None or int(fl["rev"]) > int(target_fleet["rev"]):
+                target_fleet = fl
+
+    merged_nodes: dict[str, dict[str, Any]] = {}
+    for h in hubs_res:
+        if not h.get("ok"):
+            continue
+        fn = h.get("fleet_nodes") or {}
+        if not isinstance(fn, dict):
+            continue
+        for node_name, st in fn.items():
+            if not isinstance(st, dict):
+                continue
+            cur = merged_nodes.get(node_name)
+            cand_key = (int(st.get("rev") or 0), float(st.get("updated_at") or 0.0))
+            cur_key = (
+                (int(cur.get("rev") or 0), float(cur.get("updated_at") or 0.0))
+                if cur is not None
+                else (-1, -1.0)
+            )
+            if cand_key >= cur_key:
+                merged_nodes[node_name] = dict(st)
+
+    sorted_nodes: dict[str, dict[str, Any]] = {}
+    for node_name in sorted(merged_nodes):
+        entry = dict(merged_nodes[node_name])
+        entry["converged"] = is_node_converged(target_fleet, entry)
+        sorted_nodes[node_name] = entry
+
+    conv_cnt = sum(1 for v in sorted_nodes.values() if v.get("converged"))
+    total_cnt = len(sorted_nodes)
+    all_conv = bool(target_fleet is None or all(v.get("converged") for v in sorted_nodes.values()))
+    out: dict[str, Any] = {
+        "ok": any_ok,
+        "fleet": target_fleet,
+        "nodes": sorted_nodes,
+        "converged_count": conv_cnt,
+        "total_nodes": total_cnt,
+        "all_converged": all_conv,
+        "hubs": hubs_res,
+    }
+    if not any_ok:
+        out["error"] = "; ".join(f"{h['url']}: {h.get('error', 'unreachable')}" for h in hubs_res)
+    return out
+
+
+def format_fleet_status_table(report: dict[str, Any]) -> str:
+    """Format `fetch_fleet_status` output into a human-readable CLI summary and table."""
+    if not report.get("ok"):
+        return f"[error] {report.get('error') or 'no reachable hub'}"
+    lines: list[str] = []
+    fl = report.get("fleet")
+    if not isinstance(fl, dict):
+        lines.append("Target Fleet: (disabled - no active fleet.json)")
+    else:
+        urls_s = ",".join(str(u) for u in (fl.get("urls") or []))
+        peers_s = ",".join(str(p) for p in (fl.get("hub_peers") or [])) or "-"
+        commit_s = str(fl.get("commit") or "-")
+        lines.append(
+            f"Target Fleet: rev={fl.get('rev')} commit={commit_s} urls={urls_s} hub_peers={peers_s}"
+        )
+
+    nodes = report.get("nodes") or {}
+    if not nodes:
+        lines.append("Reported Nodes: (none)")
+        return "\n".join(lines)
+
+    lines.append(
+        f"{'NODE':<16} {'REV':>5}  {'COMMIT':<12}  {'RESULT':<26}  {'MATCH':<5}  {'UPDATED_AT'}"
+    )
+    for node_name, st in nodes.items():
+        rev_s = str(st.get("rev", "-"))
+        c_full = str(st.get("commit") or "-")
+        c_short = c_full[:12] if len(c_full) > 12 else c_full
+        res_s = str(st.get("result") or "-")
+        match_s = "yes" if st.get("converged") else "no"
+        ts_val = st.get("updated_at")
+        if isinstance(ts_val, (int, float)) and ts_val > 0:
+            ts_s = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(ts_val)))
+        else:
+            ts_s = "-"
+        lines.append(
+            f"{node_name:<16} {rev_s:>5}  {c_short:<12}  {res_s:<26}  {match_s:<5}  {ts_s}"
+        )
+    lines.append(
+        f"Summary: converged={report.get('converged_count', 0)}/{report.get('total_nodes', 0)} "
+        f"all_converged={bool(report.get('all_converged'))}"
+    )
+    return "\n".join(lines)
 
 
 def main_legacy(argv: list[str] | None = None) -> None:

@@ -56,6 +56,7 @@ _RESERVED_SANDBOX_PORTS = frozenset(
         18791,
         18792,
         18799,
+        *range(18900, 19000),
     }
 )
 _RECENT_PICKED_PORTS: list[int] = []
